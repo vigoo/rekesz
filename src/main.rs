@@ -1,118 +1,144 @@
-use std::{
-    collections::HashSet,
-    env,
-    path::{Path, PathBuf},
-};
+use std::{collections::HashSet, env, ffi::OsString, ops::Range, path::PathBuf};
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::Result;
 use gpui::{
-    App, Application, Bounds, Context, MouseButton, Render, SharedString, Window, WindowBounds,
-    WindowOptions, div, img, prelude::*, px, rgb, size,
+    App, AppContext as _, Application, Bounds, Context, ListSizingBehavior, MouseButton, Render,
+    SharedString, UniformListScrollHandle, Window, WindowBounds, WindowOptions, div, img,
+    prelude::*, px, rgb, size, uniform_list,
 };
 
 mod discovery;
 mod preview;
 
-use discovery::Catalog;
-use preview::{Preview, PreviewCache};
+use discovery::{DirectoryContents, DirectoryModel, NodeId, scan_directory};
+use preview::{PreviewCache, PreviewState, decode_first};
 
-#[derive(Clone)]
-struct DirectoryRow {
-    path: PathBuf,
-    name: SharedString,
+#[derive(Clone, Copy)]
+struct VisibleRow {
+    node: NodeId,
     depth: usize,
-    has_children: bool,
 }
 
 struct PictureBrowser {
-    catalog: Catalog,
-    selected: PathBuf,
-    preview: Preview,
+    model: DirectoryModel,
+    visible: Vec<VisibleRow>,
+    expanded: HashSet<NodeId>,
+    selected: NodeId,
     previews: PreviewCache,
-    expanded: HashSet<PathBuf>,
+    scroll: UniformListScrollHandle,
 }
 
 impl PictureBrowser {
-    fn new(root: PathBuf) -> Self {
-        let catalog = Catalog::scan(root.clone());
-        let mut expanded = HashSet::new();
-        expanded.insert(root.clone());
-        let mut previews = PreviewCache::default();
-        let preview = previews.get(&root, &catalog);
-        Self {
+    fn new(root: PathBuf, image_cache_size: usize, cx: &mut Context<Self>) -> Self {
+        let model = DirectoryModel::new(root);
+        let root = model.root();
+        let mut this = Self {
+            model,
+            visible: vec![VisibleRow {
+                node: root,
+                depth: 0,
+            }],
+            expanded: HashSet::from([root]),
             selected: root,
-            preview,
-            previews,
-            catalog,
-            expanded,
-        }
+            previews: PreviewCache::new(image_cache_size),
+            scroll: UniformListScrollHandle::new(),
+        };
+        this.ensure_directory_loaded(root, cx);
+        this
     }
 
-    fn rows(&self) -> Vec<DirectoryRow> {
-        let mut rows = Vec::new();
-        self.collect_rows(self.catalog.root(), 0, &mut rows);
-        rows
-    }
-
-    fn collect_rows(&self, path: &Path, depth: usize, rows: &mut Vec<DirectoryRow>) {
-        let Some(directory) = self.catalog.directory(path) else {
+    fn ensure_directory_loaded(&mut self, node: NodeId, cx: &mut Context<Self>) {
+        let Some((request, path)) = self.model.begin_load(node) else {
+            if self.selected == node {
+                self.ensure_preview(node, cx);
+            }
             return;
         };
-        let name = if depth == 0 {
-            path.to_string_lossy().into_owned()
-        } else {
-            path.file_name()
-                .unwrap_or(path.as_os_str())
-                .to_string_lossy()
-                .into_owned()
+        cx.notify();
+        let scan = cx.background_spawn(async move { scan_directory(&path) });
+        cx.spawn(async move |this, cx| {
+            let result = scan.await;
+            this.update(cx, |this, cx| {
+                if this.model.finish_load(node, request, result) {
+                    this.rebuild_visible();
+                    if this.selected == node {
+                        this.ensure_preview(node, cx);
+                    }
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn ensure_preview(&mut self, node: NodeId, cx: &mut Context<Self>) {
+        let Some(contents) = self.model.loaded(node) else {
+            return;
         };
-        rows.push(DirectoryRow {
-            path: path.to_path_buf(),
-            name: name.into(),
-            depth,
-            has_children: !directory.children.is_empty(),
-        });
-
-        if self.expanded.contains(path) {
-            for child in &directory.children {
-                self.collect_rows(child, depth + 1, rows);
-            }
-        }
+        let Some(request) = self.previews.begin(node) else {
+            return;
+        };
+        let images = contents.images.clone();
+        cx.notify();
+        let decode = cx.background_spawn(async move { decode_first(images) });
+        cx.spawn(async move |this, cx| {
+            let result = decode.await;
+            this.update(cx, |this, cx| {
+                if this.previews.finish(node, request, result) {
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
-    fn select(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        self.selected = path.clone();
-        self.preview = self.previews.get(&path, &self.catalog);
+    fn select(&mut self, node: NodeId, cx: &mut Context<Self>) {
+        self.selected = node;
+        self.previews.mark_used(node);
+        self.ensure_directory_loaded(node, cx);
+        self.ensure_preview(node, cx);
         cx.notify();
     }
 
-    fn toggle(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if !self.expanded.remove(&path) {
-            self.expanded.insert(path);
+    fn toggle(&mut self, node: NodeId, cx: &mut Context<Self>) {
+        if !self.expanded.remove(&node) {
+            self.expanded.insert(node);
+            self.ensure_directory_loaded(node, cx);
         }
+        self.rebuild_visible();
         cx.notify();
     }
-}
 
-impl Render for PictureBrowser {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let rows = self.rows();
-        let selected = self.selected.clone();
+    /// Recreates only the flat rows that are actually exposed by expanded
+    /// branches. Collapsed descendants have no row or GPUI element state.
+    fn rebuild_visible(&mut self) {
+        self.visible = visible_rows(&self.model, &self.expanded);
+    }
 
-        let tree = div()
-            .id("directory-tree")
-            .w(px(300.0))
-            .h_full()
-            .flex_none()
-            .overflow_y_scroll()
-            .bg(rgb(0x181a20))
-            .border_r_1()
-            .border_color(rgb(0x30343d))
-            .py_2()
-            .children(rows.into_iter().enumerate().map(|(row_ix, row)| {
-                let select_path = row.path.clone();
-                let toggle_path = row.path.clone();
-                let is_selected = row.path == selected;
+    fn render_rows(
+        &mut self,
+        range: Range<usize>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        range
+            .map(|row_ix| {
+                let row = self.visible[row_ix];
+                let node = self.model.node(row.node);
+                let selected = row.node == self.selected;
+                let expanded = self.expanded.contains(&row.node);
+                let indicator = match &node.contents {
+                    DirectoryContents::Loading(_) => "…",
+                    DirectoryContents::Error(_) => "!",
+                    DirectoryContents::Loaded(contents) if contents.children.is_empty() => "",
+                    _ if expanded => "▾",
+                    _ => "▸",
+                };
+                let name: SharedString = node.name.to_string().into();
+                let select_node = row.node;
+                let toggle_node = row.node;
                 div()
                     .id(("directory", row_ix))
                     .flex()
@@ -122,7 +148,7 @@ impl Render for PictureBrowser {
                     .pr_2()
                     .text_sm()
                     .text_color(rgb(0xd7dae0))
-                    .when(is_selected, |this| this.bg(rgb(0x334b6e)))
+                    .when(selected, |this| this.bg(rgb(0x334b6e)))
                     .hover(|this| this.bg(rgb(0x292d36)))
                     .child(
                         div()
@@ -130,29 +156,90 @@ impl Render for PictureBrowser {
                             .w(px(20.0))
                             .flex_none()
                             .text_color(rgb(0x8d96a5))
-                            .child(if row.has_children {
-                                if self.expanded.contains(&row.path) {
-                                    "▾"
-                                } else {
-                                    "▸"
-                                }
-                            } else {
-                                ""
-                            })
+                            .child(indicator)
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _, cx| {
-                                    this.toggle(toggle_path.clone(), cx);
+                                    this.toggle(toggle_node, cx);
                                 }),
                             ),
                     )
-                    .child(div().min_w_0().truncate().child(row.name))
+                    .child(div().min_w_0().truncate().child(name))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.select(select_path.clone(), cx);
+                        this.select(select_node, cx);
                     }))
-            }));
+                    .into_any_element()
+            })
+            .collect()
+    }
+}
 
-        let title = self.selected.to_string_lossy().into_owned();
+fn visible_rows(model: &DirectoryModel, expanded: &HashSet<NodeId>) -> Vec<VisibleRow> {
+    fn append(
+        model: &DirectoryModel,
+        expanded: &HashSet<NodeId>,
+        node: NodeId,
+        depth: usize,
+        rows: &mut Vec<VisibleRow>,
+    ) {
+        rows.push(VisibleRow { node, depth });
+        if let Some(contents) = expanded
+            .contains(&node)
+            .then(|| model.loaded(node))
+            .flatten()
+        {
+            for child in &contents.children {
+                append(model, expanded, *child, depth + 1, rows);
+            }
+        }
+    }
+
+    let mut rows = Vec::new();
+    append(model, expanded, model.root(), 0, &mut rows);
+    rows
+}
+
+impl Render for PictureBrowser {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let tree = div()
+            .id("directory-tree")
+            .w(px(300.0))
+            .h_full()
+            .flex_none()
+            .bg(rgb(0x181a20))
+            .border_r_1()
+            .border_color(rgb(0x30343d))
+            .py_2()
+            .child(
+                uniform_list(
+                    "directory-rows",
+                    self.visible.len(),
+                    cx.processor(Self::render_rows),
+                )
+                .size_full()
+                .track_scroll(self.scroll.clone())
+                .with_sizing_behavior(ListSizingBehavior::Auto),
+            );
+
+        let selected_node = self.model.node(self.selected);
+        let title = selected_node.path.to_string_lossy().into_owned();
+        let preview_state = match &selected_node.contents {
+            DirectoryContents::Error(error) => PreviewState::Error(error.clone()),
+            DirectoryContents::Unloaded | DirectoryContents::Loading(_) => PreviewState::Loading(0),
+            DirectoryContents::Loaded(_) => self.previews.state(self.selected),
+        };
+        let preview_content = match preview_state {
+            PreviewState::Loaded(image) => img(image).max_w_full().max_h_full().into_any_element(),
+            PreviewState::Loading(_) => div().text_sm().child("Loading…").into_any_element(),
+            PreviewState::Error(error) => {
+                div().text_sm().child(error.to_string()).into_any_element()
+            }
+            PreviewState::Missing => div()
+                .text_sm()
+                .child("No image in this directory")
+                .into_any_element(),
+            PreviewState::Unloaded => div().text_sm().child("Loading…").into_any_element(),
+        };
         let preview = div()
             .flex_1()
             .min_w_0()
@@ -182,41 +269,56 @@ impl Render for PictureBrowser {
                     .justify_center()
                     .p_6()
                     .text_color(rgb(0x8d96a5))
-                    .child(if let Some(image) = self.preview.image.clone() {
-                        img(image).max_w_full().max_h_full().into_any_element()
-                    } else {
-                        div()
-                            .text_sm()
-                            .child(
-                                self.preview
-                                    .error
-                                    .clone()
-                                    .unwrap_or_else(|| "No image in this directory".into()),
-                            )
-                            .into_any_element()
-                    }),
+                    .child(preview_content),
             );
-
         div().size_full().flex().child(tree).child(preview)
     }
 }
 
-fn root_from_args() -> Result<PathBuf> {
-    let requested = env::args_os()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or(env::current_dir()?);
-    let root = requested
-        .canonicalize()
-        .with_context(|| format!("cannot open {}", requested.display()))?;
-    if !root.is_dir() {
-        bail!("{} is not a directory", root.display());
+const DEFAULT_IMAGE_CACHE_SIZE: usize = 8;
+
+struct Config {
+    root: PathBuf,
+    image_cache_size: usize,
+}
+
+fn config_from_args(args: impl IntoIterator<Item = OsString>) -> Result<Config> {
+    let mut args = args.into_iter();
+    let _program = args.next();
+    let mut requested_root = None;
+    let mut image_cache_size = DEFAULT_IMAGE_CACHE_SIZE;
+    while let Some(argument) = args.next() {
+        if argument == "--image-cache-size" {
+            let value = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("--image-cache-size requires a value"))?;
+            image_cache_size = value
+                .to_string_lossy()
+                .parse::<usize>()
+                .map_err(|_| anyhow::anyhow!("image cache size must be a positive integer"))?;
+            if image_cache_size == 0 {
+                anyhow::bail!("image cache size must be at least 1");
+            }
+        } else if requested_root.is_none() {
+            requested_root = Some(PathBuf::from(argument));
+        } else {
+            anyhow::bail!("unexpected argument: {}", argument.to_string_lossy());
+        }
     }
-    Ok(root)
+    let requested = requested_root.unwrap_or(env::current_dir()?);
+    let root = if requested.is_absolute() {
+        requested
+    } else {
+        env::current_dir()?.join(requested)
+    };
+    Ok(Config {
+        root,
+        image_cache_size,
+    })
 }
 
 fn main() -> Result<()> {
-    let root = root_from_args()?;
+    let config = config_from_args(env::args_os())?;
     Application::new().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1100.0), px(720.0)), cx);
         cx.open_window(
@@ -224,10 +326,62 @@ fn main() -> Result<()> {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(|_| PictureBrowser::new(root.clone())),
+            |_, cx| {
+                cx.new(|cx| PictureBrowser::new(config.root.clone(), config.image_cache_size, cx))
+            },
         )
         .expect("failed to open window");
         cx.activate(true);
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use discovery::DirectoryScan;
+
+    #[test]
+    fn collapsing_a_branch_removes_all_descendant_rows() {
+        let mut model = DirectoryModel::new(PathBuf::from("/pictures"));
+        let root = model.root();
+        let (request, _) = model.begin_load(root).unwrap();
+        model.finish_load(
+            root,
+            request,
+            Ok(DirectoryScan {
+                directories: vec![PathBuf::from("/pictures/a")],
+                images: Vec::new(),
+            }),
+        );
+        let child = model.loaded(root).unwrap().children[0];
+        let (request, _) = model.begin_load(child).unwrap();
+        model.finish_load(
+            child,
+            request,
+            Ok(DirectoryScan {
+                directories: vec![PathBuf::from("/pictures/a/b")],
+                images: Vec::new(),
+            }),
+        );
+
+        let mut expanded = HashSet::from([root, child]);
+        assert_eq!(visible_rows(&model, &expanded).len(), 3);
+        expanded.remove(&child);
+        assert_eq!(visible_rows(&model, &expanded).len(), 2);
+        assert_eq!(model.loaded(child).unwrap().children.len(), 1);
+    }
+
+    #[test]
+    fn parses_image_cache_size() {
+        let config = config_from_args([
+            OsString::from("pics"),
+            OsString::from("--image-cache-size"),
+            OsString::from("3"),
+            OsString::from("/pictures"),
+        ])
+        .unwrap();
+        assert_eq!(config.image_cache_size, 3);
+        assert_eq!(config.root, PathBuf::from("/pictures"));
+    }
 }

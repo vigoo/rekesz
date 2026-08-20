@@ -4,7 +4,7 @@ A small GPUI directory image browser. The left panel contains directories only;
 selecting one displays its first decodable image (sorted by filename).
 
 ```sh
-cargo run --release -- /path/to/pictures
+cargo run --release -- --image-cache-size 8 /path/to/pictures
 ```
 
 When the path is omitted, `pics` uses the current directory. Directory symlinks
@@ -15,7 +15,12 @@ the platform renderer's support).
 EXIF orientation metadata is applied before the image is handed to GPUI, including
 rotated and mirrored orientations supported by the underlying decoder.
 
-The filesystem is indexed eagerly at startup with one `read_dir` call per
-directory. The UI renders from that immutable catalog, and decoded previews are
-cached after first use, so expanding, collapsing, and revisiting directories do
-not rescan the filesystem or decode the same preview again.
+Directories are discovered lazily and cached after their first request. All
+directory reads and image decoding run on GPUI's background executor. The tree
+uses GPUI's virtual `uniform_list`, and collapsing a branch removes all of its
+descendants from the visible row projection. Revisiting a directory does not
+rescan it or decode the same preview again.
+
+Successfully decoded images use a bounded least-recently-used cache. The
+default holds 8 images and can be changed with `--image-cache-size N`. Evicted
+images are decoded again if revisited; cheap missing/error results remain cached.
