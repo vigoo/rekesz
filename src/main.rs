@@ -1,28 +1,116 @@
-use std::{collections::HashSet, env, ffi::OsString, ops::Range, path::PathBuf};
+use std::{
+    collections::{BTreeSet, HashSet},
+    env,
+    ffi::OsString,
+    ops::Range,
+    path::PathBuf,
+};
 
 use anyhow::Result;
 use gpui::{
     App, AppContext as _, Application, Bounds, ClickEvent, Context, CursorStyle, FocusHandle,
     KeyBinding, ListSizingBehavior, MouseButton, MouseMoveEvent, Render, ScrollStrategy,
     SharedString, UniformListScrollHandle, Window, WindowBounds, WindowOptions, actions, div, img,
-    prelude::*, px, rgb, size, uniform_list,
+    prelude::*, px, relative, rgb, size, uniform_list,
 };
 
 mod discovery;
+mod formats;
 mod preview;
+mod rendering;
 
-use discovery::{DirectoryContents, DirectoryModel, NodeId, scan_directory};
-use preview::{PreviewCache, PreviewState, decode_first};
+use discovery::{DirectoryContents, DirectoryModel, NodeId, RawJpegPreference, scan_directory};
+use preview::{PreviewCache, PreviewState, decode_path};
 
 actions!(
     directory_tree,
     [TreeUp, TreeDown, TreeLeft, TreeRight, TreeConfirm]
 );
+actions!(
+    main_view,
+    [
+        OpenImage,
+        CloseImage,
+        GridLeft,
+        GridRight,
+        GridUp,
+        GridDown,
+        GridExtendLeft,
+        GridExtendRight,
+        GridExtendUp,
+        GridExtendDown
+    ]
+);
+
+const DEFAULT_THUMBNAIL_WIDTH: u32 = 300;
+const THUMBNAIL_GAP: f32 = 12.0;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ImageSelection {
+    indices: BTreeSet<usize>,
+    anchor: Option<usize>,
+    focused: Option<usize>,
+}
+
+impl ImageSelection {
+    fn select(&mut self, index: usize, extend: bool, toggle: bool) {
+        if extend {
+            let anchor = self.anchor.unwrap_or(index);
+            self.indices = (anchor.min(index)..=anchor.max(index)).collect();
+        } else if toggle {
+            if !self.indices.remove(&index) {
+                self.indices.insert(index);
+            }
+            self.anchor = Some(index);
+        } else {
+            self.indices.clear();
+            self.indices.insert(index);
+            self.anchor = Some(index);
+        }
+        self.focused = Some(index);
+    }
+}
+
+enum MainView {
+    Image(PathBuf),
+    Dir(PathBuf, ImageSelection),
+}
 
 #[derive(Clone, Copy)]
 struct VisibleRow {
     node: NodeId,
     depth: usize,
+}
+
+#[derive(Default)]
+struct WorkProgress {
+    active: usize,
+    completed: usize,
+    total: usize,
+}
+
+impl WorkProgress {
+    fn start(&mut self) {
+        if self.active == 0 {
+            self.completed = 0;
+            self.total = 0;
+        }
+        self.active += 1;
+        self.total += 1;
+    }
+
+    fn finish(&mut self) {
+        self.active = self.active.saturating_sub(1);
+        self.completed = (self.completed + 1).min(self.total);
+    }
+
+    fn fraction(&self) -> f32 {
+        if self.total == 0 {
+            0.0
+        } else {
+            self.completed as f32 / self.total as f32
+        }
+    }
 }
 
 struct PictureBrowser {
@@ -31,16 +119,31 @@ struct PictureBrowser {
     expanded: HashSet<NodeId>,
     selected: NodeId,
     previews: PreviewCache,
+    thumbnails: PreviewCache,
+    main_view: MainView,
+    saved_selection: ImageSelection,
+    thumbnail_width: u32,
+    grid_columns: usize,
     scroll: UniformListScrollHandle,
+    thumbnail_scroll: UniformListScrollHandle,
     tree_focus: FocusHandle,
+    main_focus: FocusHandle,
     sidebar_width: f32,
     resizing_sidebar: bool,
+    pair_preference: RawJpegPreference,
+    work: WorkProgress,
 }
 
 impl PictureBrowser {
-    fn new(root: PathBuf, image_cache_size: usize, cx: &mut Context<Self>) -> Self {
+    fn new(
+        root: PathBuf,
+        image_cache_size: usize,
+        pair_preference: RawJpegPreference,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let model = DirectoryModel::new(root);
         let root = model.root();
+        let root_path = model.node(root).path.to_path_buf();
         let mut this = Self {
             model,
             visible: vec![VisibleRow {
@@ -50,10 +153,19 @@ impl PictureBrowser {
             expanded: HashSet::from([root]),
             selected: root,
             previews: PreviewCache::new(image_cache_size),
+            thumbnails: PreviewCache::new(image_cache_size.saturating_mul(16).max(64)),
+            main_view: MainView::Dir(root_path, ImageSelection::default()),
+            saved_selection: ImageSelection::default(),
+            thumbnail_width: DEFAULT_THUMBNAIL_WIDTH,
+            grid_columns: 1,
             scroll: UniformListScrollHandle::new(),
+            thumbnail_scroll: UniformListScrollHandle::new(),
             tree_focus: cx.focus_handle(),
+            main_focus: cx.focus_handle(),
             sidebar_width: 300.0,
             resizing_sidebar: false,
+            pair_preference,
+            work: WorkProgress::default(),
         };
         this.ensure_directory_loaded(root, cx);
         this
@@ -61,16 +173,16 @@ impl PictureBrowser {
 
     fn ensure_directory_loaded(&mut self, node: NodeId, cx: &mut Context<Self>) {
         let Some((request, path)) = self.model.begin_load(node) else {
-            if self.selected == node {
-                self.ensure_preview(node, cx);
-            }
             return;
         };
+        self.work.start();
         cx.notify();
-        let scan = cx.background_spawn(async move { scan_directory(&path) });
+        let pair_preference = self.pair_preference;
+        let scan = cx.background_spawn(async move { scan_directory(&path, pair_preference) });
         cx.spawn(async move |this, cx| {
             let result = scan.await;
             this.update(cx, |this, cx| {
+                this.work.finish();
                 if this.model.finish_load(node, request, result) {
                     if this
                         .model
@@ -80,9 +192,6 @@ impl PictureBrowser {
                         this.expanded.remove(&node);
                     }
                     this.rebuild_visible();
-                    if this.selected == node {
-                        this.ensure_preview(node, cx);
-                    }
                     cx.notify();
                 }
             })
@@ -91,20 +200,38 @@ impl PictureBrowser {
         .detach();
     }
 
-    fn ensure_preview(&mut self, node: NodeId, cx: &mut Context<Self>) {
-        let Some(contents) = self.model.loaded(node) else {
+    fn ensure_image(
+        &mut self,
+        path: PathBuf,
+        thumbnail_width: Option<u32>,
+        cx: &mut Context<Self>,
+    ) {
+        let cache = if thumbnail_width.is_some() {
+            &mut self.thumbnails
+        } else {
+            &mut self.previews
+        };
+        let Some(request) = cache.begin(&path) else {
             return;
         };
-        let Some(request) = self.previews.begin(node) else {
-            return;
-        };
-        let images = contents.images.clone();
+        self.work.start();
         cx.notify();
-        let decode = cx.background_spawn(async move { decode_first(images) });
+        let source_path = path.clone();
+        let decode = cx.background_spawn(async move { decode_path(source_path, thumbnail_width) });
         cx.spawn(async move |this, cx| {
             let result = decode.await;
             this.update(cx, |this, cx| {
-                if this.previews.finish(node, request, result) {
+                this.work.finish();
+                if let PreviewState::Loaded(preview) = &result {
+                    this.model
+                        .record_render_metadata(path.clone(), preview.metadata);
+                }
+                let cache = if thumbnail_width.is_some() {
+                    &mut this.thumbnails
+                } else {
+                    &mut this.previews
+                };
+                if cache.finish(&path, request, result) {
                     cx.notify();
                 }
             })
@@ -115,9 +242,12 @@ impl PictureBrowser {
 
     fn select(&mut self, node: NodeId, cx: &mut Context<Self>) {
         self.selected = node;
-        self.previews.mark_used(node);
+        self.main_view = MainView::Dir(
+            self.model.node(node).path.to_path_buf(),
+            ImageSelection::default(),
+        );
+        self.saved_selection = ImageSelection::default();
         self.ensure_directory_loaded(node, cx);
-        self.ensure_preview(node, cx);
         cx.notify();
     }
 
@@ -208,6 +338,192 @@ impl PictureBrowser {
             self.rebuild_visible();
             cx.notify();
         }
+    }
+
+    fn select_thumbnail(&mut self, index: usize, extend: bool, toggle: bool) {
+        let MainView::Dir(_, selection) = &mut self.main_view else {
+            return;
+        };
+        selection.select(index, extend, toggle);
+        self.saved_selection = selection.clone();
+    }
+
+    fn show_image(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if let MainView::Dir(_, selection) = &self.main_view {
+            self.saved_selection = selection.clone();
+        }
+        self.main_view = MainView::Image(path.clone());
+        self.previews.mark_used(&path);
+        self.ensure_image(path, None, cx);
+        cx.notify();
+    }
+
+    fn open_selected_image(&mut self, _: &OpenImage, _: &mut Window, cx: &mut Context<Self>) {
+        let index = match &self.main_view {
+            MainView::Dir(_, selection) => selection.focused,
+            MainView::Image(_) => None,
+        };
+        if let Some(path) = index.and_then(|index| self.selected_images().get(index).cloned()) {
+            self.show_image(path, cx);
+        }
+    }
+
+    fn move_thumbnail_selection(&mut self, delta: isize, extend: bool, cx: &mut Context<Self>) {
+        let image_count = self.selected_images().len();
+        if image_count == 0 {
+            return;
+        }
+        let current = match &self.main_view {
+            MainView::Dir(_, selection) => selection.focused.unwrap_or(0),
+            MainView::Image(_) => return,
+        };
+        let target = current
+            .saturating_add_signed(delta)
+            .min(image_count.saturating_sub(1));
+        self.select_thumbnail(target, extend, false);
+        self.thumbnail_scroll
+            .scroll_to_item(target / self.grid_columns, ScrollStrategy::Center);
+        cx.notify();
+    }
+
+    fn grid_left(&mut self, _: &GridLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_thumbnail_selection(-1, false, cx);
+    }
+
+    fn grid_right(&mut self, _: &GridRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_thumbnail_selection(1, false, cx);
+    }
+
+    fn grid_up(&mut self, _: &GridUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_thumbnail_selection(-(self.grid_columns as isize), false, cx);
+    }
+
+    fn grid_down(&mut self, _: &GridDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_thumbnail_selection(self.grid_columns as isize, false, cx);
+    }
+
+    fn grid_extend_left(&mut self, _: &GridExtendLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_thumbnail_selection(-1, true, cx);
+    }
+
+    fn grid_extend_right(&mut self, _: &GridExtendRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_thumbnail_selection(1, true, cx);
+    }
+
+    fn grid_extend_up(&mut self, _: &GridExtendUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_thumbnail_selection(-(self.grid_columns as isize), true, cx);
+    }
+
+    fn grid_extend_down(&mut self, _: &GridExtendDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_thumbnail_selection(self.grid_columns as isize, true, cx);
+    }
+
+    fn close_image(&mut self, _: &CloseImage, _: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.main_view, MainView::Image(_)) {
+            self.main_view = MainView::Dir(
+                self.model.node(self.selected).path.to_path_buf(),
+                self.saved_selection.clone(),
+            );
+            cx.notify();
+        }
+    }
+
+    fn selected_images(&self) -> &[PathBuf] {
+        self.model
+            .loaded(self.selected)
+            .map_or(&[], |contents| contents.images.as_slice())
+    }
+
+    fn render_thumbnail_rows(
+        &mut self,
+        range: Range<usize>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        let images = self.selected_images().to_vec();
+        let selected = match &self.main_view {
+            MainView::Dir(_, selection) => selection.indices.clone(),
+            MainView::Image(_) => BTreeSet::new(),
+        };
+        range
+            .map(|row| {
+                let tile_height = self.thumbnail_width as f32 + 48.0;
+                let mut row_element = div()
+                    .h(px(tile_height + THUMBNAIL_GAP))
+                    .flex()
+                    .gap(px(THUMBNAIL_GAP))
+                    .px_3()
+                    .pt_3();
+                for (index, path) in images
+                    .iter()
+                    .enumerate()
+                    .skip(row * self.grid_columns)
+                    .take(self.grid_columns)
+                {
+                    let path = path.clone();
+                    self.ensure_image(path.clone(), Some(self.thumbnail_width), cx);
+                    let image_content = match self.thumbnails.state(&path) {
+                        PreviewState::Loaded(preview) => img(preview.image.clone())
+                            .max_w_full()
+                            .max_h_full()
+                            .into_any_element(),
+                        PreviewState::Error(_) => {
+                            div().text_xs().child("Cannot decode").into_any_element()
+                        }
+                        _ => div().text_xs().child("Loading…").into_any_element(),
+                    };
+                    let name: SharedString = path
+                        .file_name()
+                        .unwrap_or(path.as_os_str())
+                        .to_string_lossy()
+                        .into_owned()
+                        .into();
+                    let open_path = path.clone();
+                    row_element = row_element.child(
+                        div()
+                            .id(("thumbnail", index))
+                            .w(px(self.thumbnail_width as f32))
+                            .h(px(tile_height))
+                            .flex_none()
+                            .flex()
+                            .flex_col()
+                            .p_2()
+                            .rounded_md()
+                            .when(selected.contains(&index), |this| {
+                                this.bg(rgb(0x334b6e))
+                                    .border_1()
+                                    .border_color(rgb(0x6f9ddd))
+                            })
+                            .hover(|this| this.bg(rgb(0x292d36)))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .h(px(self.thumbnail_width as f32))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(image_content),
+                            )
+                            .child(div().mt_2().truncate().text_xs().child(name))
+                            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                                let modifiers = window.modifiers();
+                                window.focus(&this.main_focus);
+                                this.select_thumbnail(
+                                    index,
+                                    modifiers.shift,
+                                    modifiers.secondary(),
+                                );
+                                if event.click_count() >= 2 {
+                                    this.show_image(open_path.clone(), cx);
+                                }
+                                cx.notify();
+                            })),
+                    );
+                }
+                row_element.into_any_element()
+            })
+            .collect()
     }
 
     /// Recreates only the flat rows that are actually exposed by expanded
@@ -303,7 +619,13 @@ fn visible_rows(model: &DirectoryModel, expanded: &HashSet<NodeId>) -> Vec<Visib
 }
 
 impl Render for PictureBrowser {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let main_width = (f32::from(window.viewport_size().width) - self.sidebar_width - 29.0)
+            .max(self.thumbnail_width as f32);
+        self.grid_columns = ((main_width + THUMBNAIL_GAP)
+            / (self.thumbnail_width as f32 + THUMBNAIL_GAP))
+            .floor()
+            .max(1.0) as usize;
         let tree = div()
             .id("directory-tree")
             .w(px(self.sidebar_width))
@@ -329,49 +651,89 @@ impl Render for PictureBrowser {
                 .with_sizing_behavior(ListSizingBehavior::Auto),
             );
 
-        let selected_node = self.model.node(self.selected);
-        let preview_state = match &selected_node.contents {
-            DirectoryContents::Error(error) => PreviewState::Error(error.clone()),
-            DirectoryContents::Unloaded | DirectoryContents::Loading(_) => PreviewState::Loading(0),
-            DirectoryContents::Loaded(_) => self.previews.state(self.selected),
-        };
-        let (file_name, preview_content) = match preview_state {
-            PreviewState::Loaded(preview) => (
-                preview.file_name.to_string(),
-                img(preview.image.clone())
-                    .max_w_full()
-                    .max_h_full()
-                    .into_any_element(),
-            ),
-            PreviewState::Loading(_) => (
-                "Loading…".into(),
-                div().text_sm().child("Loading…").into_any_element(),
-            ),
-            PreviewState::Error(error) => {
-                let message = error.to_string();
+        let (title, show_back, main_content) = match &self.main_view {
+            MainView::Image(path) => {
+                let path = path.clone();
+                self.ensure_image(path.clone(), None, cx);
+                let content = match self.previews.state(&path) {
+                    PreviewState::Loaded(preview) => img(preview.image.clone())
+                        .max_w_full()
+                        .max_h_full()
+                        .into_any_element(),
+                    PreviewState::Error(error) => {
+                        div().text_sm().child(error.to_string()).into_any_element()
+                    }
+                    _ => div().text_sm().child("Loading…").into_any_element(),
+                };
                 (
-                    "Image error".into(),
-                    div().text_sm().child(message).into_any_element(),
+                    path.file_name()
+                        .unwrap_or(path.as_os_str())
+                        .to_string_lossy()
+                        .into_owned(),
+                    true,
+                    div()
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .p_6()
+                        .child(content)
+                        .into_any_element(),
                 )
             }
-            PreviewState::Missing => (
-                "No image".into(),
-                div()
-                    .text_sm()
-                    .child("No image in this directory")
+            MainView::Dir(path, selection) => {
+                let count = self.selected_images().len();
+                let content = match &self.model.node(self.selected).contents {
+                    DirectoryContents::Error(error) => div()
+                        .p_6()
+                        .text_sm()
+                        .child(error.to_string())
+                        .into_any_element(),
+                    DirectoryContents::Unloaded | DirectoryContents::Loading(_) => div()
+                        .p_6()
+                        .text_sm()
+                        .child("Loading directory…")
+                        .into_any_element(),
+                    DirectoryContents::Loaded(_) if count == 0 => div()
+                        .p_6()
+                        .text_sm()
+                        .child("No images in this directory")
+                        .into_any_element(),
+                    DirectoryContents::Loaded(_) => uniform_list(
+                        "thumbnail-rows",
+                        count.div_ceil(self.grid_columns),
+                        cx.processor(Self::render_thumbnail_rows),
+                    )
+                    .size_full()
+                    .track_scroll(self.thumbnail_scroll.clone())
+                    .with_sizing_behavior(ListSizingBehavior::Auto)
                     .into_any_element(),
-            ),
-            PreviewState::Unloaded => (
-                "Loading…".into(),
-                div().text_sm().child("Loading…").into_any_element(),
-            ),
+                };
+                (
+                    format!("{} — {} selected", path.display(), selection.indices.len()),
+                    false,
+                    content,
+                )
+            }
         };
-        let preview = div()
+        let main_view = div()
             .flex_1()
             .min_w_0()
             .h_full()
             .flex()
             .flex_col()
+            .track_focus(&self.main_focus)
+            .key_context("MainView")
+            .on_action(cx.listener(Self::open_selected_image))
+            .on_action(cx.listener(Self::close_image))
+            .on_action(cx.listener(Self::grid_left))
+            .on_action(cx.listener(Self::grid_right))
+            .on_action(cx.listener(Self::grid_up))
+            .on_action(cx.listener(Self::grid_down))
+            .on_action(cx.listener(Self::grid_extend_left))
+            .on_action(cx.listener(Self::grid_extend_right))
+            .on_action(cx.listener(Self::grid_extend_up))
+            .on_action(cx.listener(Self::grid_extend_down))
             .bg(rgb(0x101217))
             .child(
                 div()
@@ -384,18 +746,30 @@ impl Render for PictureBrowser {
                     .border_color(rgb(0x30343d))
                     .text_sm()
                     .text_color(rgb(0xaeb4bf))
-                    .child(file_name),
+                    .when(show_back, |this| {
+                        this.child(
+                            div()
+                                .id("back-to-directory")
+                                .mr_3()
+                                .px_2()
+                                .py_1()
+                                .rounded_sm()
+                                .bg(rgb(0x30343d))
+                                .hover(|this| this.bg(rgb(0x445066)))
+                                .child("← Back")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.close_image(&CloseImage, window, cx);
+                                })),
+                        )
+                    })
+                    .child(title),
             )
             .child(
                 div()
                     .flex_1()
                     .min_h_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .p_6()
                     .text_color(rgb(0x8d96a5))
-                    .child(preview_content),
+                    .child(main_content),
             );
         let splitter = div()
             .id("sidebar-splitter")
@@ -412,8 +786,10 @@ impl Render for PictureBrowser {
                     cx.notify();
                 }),
             );
-        div()
-            .size_full()
+        let workspace = div()
+            .w_full()
+            .flex_1()
+            .min_h_0()
             .flex()
             .on_mouse_move(cx.listener(|this, event, _, cx| {
                 this.resize_sidebar(event, cx);
@@ -427,7 +803,48 @@ impl Render for PictureBrowser {
             )
             .child(tree)
             .child(splitter)
-            .child(preview)
+            .child(main_view);
+        let progress = self.work.fraction();
+        let progress_label = format!(
+            "Working… {} of {} tasks complete",
+            self.work.completed, self.work.total
+        );
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(workspace)
+            .when(self.work.active > 0, |this| {
+                this.child(
+                    div()
+                        .h(px(22.0))
+                        .flex_none()
+                        .relative()
+                        .bg(rgb(0x181a20))
+                        .border_t_1()
+                        .border_color(rgb(0x30343d))
+                        .child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .top_0()
+                                .bottom_0()
+                                .w(relative(progress))
+                                .bg(rgb(0x315b8f)),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_xs()
+                                .text_color(rgb(0xd8dde7))
+                                .child(progress_label),
+                        ),
+                )
+            })
     }
 }
 
@@ -436,6 +853,7 @@ const DEFAULT_IMAGE_CACHE_SIZE: usize = 8;
 struct Config {
     root: PathBuf,
     image_cache_size: usize,
+    pair_preference: RawJpegPreference,
 }
 
 fn config_from_args(args: impl IntoIterator<Item = OsString>) -> Result<Config> {
@@ -443,6 +861,7 @@ fn config_from_args(args: impl IntoIterator<Item = OsString>) -> Result<Config> 
     let _program = args.next();
     let mut requested_root = None;
     let mut image_cache_size = DEFAULT_IMAGE_CACHE_SIZE;
+    let mut pair_preference = RawJpegPreference::Raw;
     while let Some(argument) = args.next() {
         if argument == "--image-cache-size" {
             let value = args
@@ -455,6 +874,15 @@ fn config_from_args(args: impl IntoIterator<Item = OsString>) -> Result<Config> 
             if image_cache_size == 0 {
                 anyhow::bail!("image cache size must be at least 1");
             }
+        } else if argument == "--cr3-jpeg-preference" {
+            let value = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("--cr3-jpeg-preference requires cr3 or jpeg"))?;
+            pair_preference = match value.to_string_lossy().to_ascii_lowercase().as_str() {
+                "cr3" | "raw" => RawJpegPreference::Raw,
+                "jpg" | "jpeg" => RawJpegPreference::Jpeg,
+                _ => anyhow::bail!("--cr3-jpeg-preference must be cr3 or jpeg"),
+            };
         } else if requested_root.is_none() {
             requested_root = Some(PathBuf::from(argument));
         } else {
@@ -470,6 +898,7 @@ fn config_from_args(args: impl IntoIterator<Item = OsString>) -> Result<Config> 
     Ok(Config {
         root,
         image_cache_size,
+        pair_preference,
     })
 }
 
@@ -482,6 +911,16 @@ fn main() -> Result<()> {
             KeyBinding::new("left", TreeLeft, Some("DirectoryTree")),
             KeyBinding::new("right", TreeRight, Some("DirectoryTree")),
             KeyBinding::new("enter", TreeConfirm, Some("DirectoryTree")),
+            KeyBinding::new("enter", OpenImage, Some("MainView")),
+            KeyBinding::new("escape", CloseImage, Some("MainView")),
+            KeyBinding::new("left", GridLeft, Some("MainView")),
+            KeyBinding::new("right", GridRight, Some("MainView")),
+            KeyBinding::new("up", GridUp, Some("MainView")),
+            KeyBinding::new("down", GridDown, Some("MainView")),
+            KeyBinding::new("shift-left", GridExtendLeft, Some("MainView")),
+            KeyBinding::new("shift-right", GridExtendRight, Some("MainView")),
+            KeyBinding::new("shift-up", GridExtendUp, Some("MainView")),
+            KeyBinding::new("shift-down", GridExtendDown, Some("MainView")),
         ]);
         let bounds = Bounds::centered(None, size(px(1100.0), px(720.0)), cx);
         cx.open_window(
@@ -490,7 +929,14 @@ fn main() -> Result<()> {
                 ..Default::default()
             },
             |_, cx| {
-                cx.new(|cx| PictureBrowser::new(config.root.clone(), config.image_cache_size, cx))
+                cx.new(|cx| {
+                    PictureBrowser::new(
+                        config.root.clone(),
+                        config.image_cache_size,
+                        config.pair_preference,
+                        cx,
+                    )
+                })
             },
         )
         .expect("failed to open window");
@@ -546,5 +992,46 @@ mod tests {
         .unwrap();
         assert_eq!(config.image_cache_size, 3);
         assert_eq!(config.root, PathBuf::from("/pictures"));
+        assert_eq!(config.pair_preference, RawJpegPreference::Raw);
+    }
+
+    #[test]
+    fn parses_jpeg_pair_preference() {
+        let config = config_from_args([
+            OsString::from("pics"),
+            OsString::from("--cr3-jpeg-preference"),
+            OsString::from("jpeg"),
+        ])
+        .unwrap();
+        assert_eq!(config.pair_preference, RawJpegPreference::Jpeg);
+    }
+
+    #[test]
+    fn thumbnail_selection_supports_replace_toggle_and_ranges() {
+        let mut selection = ImageSelection::default();
+        selection.select(2, false, false);
+        assert_eq!(selection.indices, BTreeSet::from([2]));
+
+        selection.select(4, false, true);
+        assert_eq!(selection.indices, BTreeSet::from([2, 4]));
+
+        selection.select(6, true, false);
+        assert_eq!(selection.indices, BTreeSet::from([4, 5, 6]));
+        assert_eq!(selection.focused, Some(6));
+    }
+
+    #[test]
+    fn work_progress_tracks_overlapping_tasks_and_resets_batches() {
+        let mut work = WorkProgress::default();
+        work.start();
+        work.start();
+        work.finish();
+        assert_eq!(work.active, 1);
+        assert_eq!(work.fraction(), 0.5);
+        work.finish();
+        work.start();
+        assert_eq!(work.active, 1);
+        assert_eq!(work.completed, 0);
+        assert_eq!(work.total, 1);
     }
 }
