@@ -2,9 +2,10 @@ use std::{collections::HashSet, env, ffi::OsString, ops::Range, path::PathBuf};
 
 use anyhow::Result;
 use gpui::{
-    App, AppContext as _, Application, Bounds, Context, ListSizingBehavior, MouseButton, Render,
-    SharedString, UniformListScrollHandle, Window, WindowBounds, WindowOptions, div, img,
-    prelude::*, px, rgb, size, uniform_list,
+    App, AppContext as _, Application, Bounds, Context, CursorStyle, FocusHandle, KeyBinding,
+    ListSizingBehavior, MouseButton, MouseMoveEvent, Render, ScrollStrategy, SharedString,
+    UniformListScrollHandle, Window, WindowBounds, WindowOptions, actions, div, img, prelude::*,
+    px, rgb, size, uniform_list,
 };
 
 mod discovery;
@@ -12,6 +13,11 @@ mod preview;
 
 use discovery::{DirectoryContents, DirectoryModel, NodeId, scan_directory};
 use preview::{PreviewCache, PreviewState, decode_first};
+
+actions!(
+    directory_tree,
+    [TreeUp, TreeDown, TreeLeft, TreeRight, TreeConfirm]
+);
 
 #[derive(Clone, Copy)]
 struct VisibleRow {
@@ -26,6 +32,9 @@ struct PictureBrowser {
     selected: NodeId,
     previews: PreviewCache,
     scroll: UniformListScrollHandle,
+    tree_focus: FocusHandle,
+    sidebar_width: f32,
+    resizing_sidebar: bool,
 }
 
 impl PictureBrowser {
@@ -42,6 +51,9 @@ impl PictureBrowser {
             selected: root,
             previews: PreviewCache::new(image_cache_size),
             scroll: UniformListScrollHandle::new(),
+            tree_focus: cx.focus_handle(),
+            sidebar_width: 300.0,
+            resizing_sidebar: false,
         };
         this.ensure_directory_loaded(root, cx);
         this
@@ -100,6 +112,71 @@ impl PictureBrowser {
         self.ensure_directory_loaded(node, cx);
         self.ensure_preview(node, cx);
         cx.notify();
+    }
+
+    fn select_row(&mut self, index: usize, strategy: ScrollStrategy, cx: &mut Context<Self>) {
+        if let Some(row) = self.visible.get(index) {
+            self.scroll.scroll_to_item(index, strategy);
+            self.select(row.node, cx);
+        }
+    }
+
+    fn selected_row(&self) -> usize {
+        self.visible
+            .iter()
+            .position(|row| row.node == self.selected)
+            .unwrap_or(0)
+    }
+
+    fn tree_up(&mut self, _: &TreeUp, _: &mut Window, cx: &mut Context<Self>) {
+        let index = self.selected_row().saturating_sub(1);
+        self.select_row(index, ScrollStrategy::Top, cx);
+    }
+
+    fn tree_down(&mut self, _: &TreeDown, _: &mut Window, cx: &mut Context<Self>) {
+        let index = (self.selected_row() + 1).min(self.visible.len().saturating_sub(1));
+        self.select_row(index, ScrollStrategy::Bottom, cx);
+    }
+
+    fn tree_left(&mut self, _: &TreeLeft, _: &mut Window, cx: &mut Context<Self>) {
+        if self.expanded.contains(&self.selected) {
+            self.toggle(self.selected, cx);
+            return;
+        }
+        let index = self.selected_row();
+        let depth = self.visible[index].depth;
+        if let Some(parent) = self.visible[..index]
+            .iter()
+            .rposition(|row| row.depth < depth)
+        {
+            self.select_row(parent, ScrollStrategy::Top, cx);
+        }
+    }
+
+    fn tree_right(&mut self, _: &TreeRight, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.expanded.contains(&self.selected) {
+            self.toggle(self.selected, cx);
+            return;
+        }
+        let index = self.selected_row();
+        if self
+            .visible
+            .get(index + 1)
+            .is_some_and(|row| row.depth > self.visible[index].depth)
+        {
+            self.select_row(index + 1, ScrollStrategy::Bottom, cx);
+        }
+    }
+
+    fn tree_confirm(&mut self, _: &TreeConfirm, _: &mut Window, cx: &mut Context<Self>) {
+        self.select(self.selected, cx);
+    }
+
+    fn resize_sidebar(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if self.resizing_sidebar && event.dragging() {
+            self.sidebar_width = f32::from(event.position.x).clamp(160.0, 640.0);
+            cx.notify();
+        }
     }
 
     fn toggle(&mut self, node: NodeId, cx: &mut Context<Self>) {
@@ -165,7 +242,8 @@ impl PictureBrowser {
                             ),
                     )
                     .child(div().min_w_0().truncate().child(name))
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        window.focus(&this.tree_focus);
                         this.select(select_node, cx);
                     }))
                     .into_any_element()
@@ -203,12 +281,17 @@ impl Render for PictureBrowser {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tree = div()
             .id("directory-tree")
-            .w(px(300.0))
+            .w(px(self.sidebar_width))
             .h_full()
             .flex_none()
+            .track_focus(&self.tree_focus)
+            .key_context("DirectoryTree")
+            .on_action(cx.listener(Self::tree_up))
+            .on_action(cx.listener(Self::tree_down))
+            .on_action(cx.listener(Self::tree_left))
+            .on_action(cx.listener(Self::tree_right))
+            .on_action(cx.listener(Self::tree_confirm))
             .bg(rgb(0x181a20))
-            .border_r_1()
-            .border_color(rgb(0x30343d))
             .py_2()
             .child(
                 uniform_list(
@@ -222,23 +305,41 @@ impl Render for PictureBrowser {
             );
 
         let selected_node = self.model.node(self.selected);
-        let title = selected_node.path.to_string_lossy().into_owned();
         let preview_state = match &selected_node.contents {
             DirectoryContents::Error(error) => PreviewState::Error(error.clone()),
             DirectoryContents::Unloaded | DirectoryContents::Loading(_) => PreviewState::Loading(0),
             DirectoryContents::Loaded(_) => self.previews.state(self.selected),
         };
-        let preview_content = match preview_state {
-            PreviewState::Loaded(image) => img(image).max_w_full().max_h_full().into_any_element(),
-            PreviewState::Loading(_) => div().text_sm().child("Loading…").into_any_element(),
+        let (file_name, preview_content) = match preview_state {
+            PreviewState::Loaded(preview) => (
+                preview.file_name.to_string(),
+                img(preview.image.clone())
+                    .max_w_full()
+                    .max_h_full()
+                    .into_any_element(),
+            ),
+            PreviewState::Loading(_) => (
+                "Loading…".into(),
+                div().text_sm().child("Loading…").into_any_element(),
+            ),
             PreviewState::Error(error) => {
-                div().text_sm().child(error.to_string()).into_any_element()
+                let message = error.to_string();
+                (
+                    "Image error".into(),
+                    div().text_sm().child(message).into_any_element(),
+                )
             }
-            PreviewState::Missing => div()
-                .text_sm()
-                .child("No image in this directory")
-                .into_any_element(),
-            PreviewState::Unloaded => div().text_sm().child("Loading…").into_any_element(),
+            PreviewState::Missing => (
+                "No image".into(),
+                div()
+                    .text_sm()
+                    .child("No image in this directory")
+                    .into_any_element(),
+            ),
+            PreviewState::Unloaded => (
+                "Loading…".into(),
+                div().text_sm().child("Loading…").into_any_element(),
+            ),
         };
         let preview = div()
             .flex_1()
@@ -258,7 +359,7 @@ impl Render for PictureBrowser {
                     .border_color(rgb(0x30343d))
                     .text_sm()
                     .text_color(rgb(0xaeb4bf))
-                    .child(title),
+                    .child(file_name),
             )
             .child(
                 div()
@@ -271,7 +372,37 @@ impl Render for PictureBrowser {
                     .text_color(rgb(0x8d96a5))
                     .child(preview_content),
             );
-        div().size_full().flex().child(tree).child(preview)
+        let splitter = div()
+            .id("sidebar-splitter")
+            .w(px(5.0))
+            .h_full()
+            .flex_none()
+            .cursor(CursorStyle::ResizeLeftRight)
+            .bg(rgb(0x30343d))
+            .hover(|this| this.bg(rgb(0x5577aa)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.resizing_sidebar = true;
+                    cx.notify();
+                }),
+            );
+        div()
+            .size_full()
+            .flex()
+            .on_mouse_move(cx.listener(|this, event, _, cx| {
+                this.resize_sidebar(event, cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.resizing_sidebar = false;
+                    cx.notify();
+                }),
+            )
+            .child(tree)
+            .child(splitter)
+            .child(preview)
     }
 }
 
@@ -320,6 +451,13 @@ fn config_from_args(args: impl IntoIterator<Item = OsString>) -> Result<Config> 
 fn main() -> Result<()> {
     let config = config_from_args(env::args_os())?;
     Application::new().run(move |cx: &mut App| {
+        cx.bind_keys([
+            KeyBinding::new("up", TreeUp, Some("DirectoryTree")),
+            KeyBinding::new("down", TreeDown, Some("DirectoryTree")),
+            KeyBinding::new("left", TreeLeft, Some("DirectoryTree")),
+            KeyBinding::new("right", TreeRight, Some("DirectoryTree")),
+            KeyBinding::new("enter", TreeConfirm, Some("DirectoryTree")),
+        ]);
         let bounds = Bounds::centered(None, size(px(1100.0), px(720.0)), cx);
         cx.open_window(
             WindowOptions {

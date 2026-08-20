@@ -9,9 +9,14 @@ use crate::discovery::{NodeId, RequestId};
 pub enum PreviewState {
     Unloaded,
     Loading(RequestId),
-    Loaded(Arc<RenderImage>),
+    Loaded(Arc<DecodedPreview>),
     Missing,
     Error(Arc<str>),
+}
+
+pub struct DecodedPreview {
+    pub image: Arc<RenderImage>,
+    pub file_name: Arc<str>,
 }
 
 /// Independent resource cache. Future thumbnails and metadata can follow the
@@ -113,7 +118,18 @@ pub fn decode_first(paths: Vec<PathBuf>) -> PreviewState {
     let mut last_error = None;
     for path in paths {
         match oriented_render_image(&path) {
-            Ok(image) => return PreviewState::Loaded(Arc::new(image)),
+            Ok(image) => {
+                let file_name = path
+                    .file_name()
+                    .unwrap_or(path.as_os_str())
+                    .to_string_lossy()
+                    .into_owned()
+                    .into();
+                return PreviewState::Loaded(Arc::new(DecodedPreview {
+                    image: Arc::new(image),
+                    file_name,
+                }));
+            }
             Err(error) => last_error = Some(format!("Cannot decode {}: {error}", path.display())),
         }
     }
@@ -144,9 +160,10 @@ mod tests {
 
     fn image_state() -> PreviewState {
         let buffer = ImageBuffer::from_pixel(1, 1, Rgba([0, 0, 0, 255]));
-        PreviewState::Loaded(Arc::new(RenderImage::new(smallvec::smallvec![Frame::new(
-            buffer
-        )])))
+        PreviewState::Loaded(Arc::new(DecodedPreview {
+            image: Arc::new(RenderImage::new(smallvec::smallvec![Frame::new(buffer)])),
+            file_name: "test.png".into(),
+        }))
     }
 
     fn load(cache: &mut PreviewCache, id: NodeId) {

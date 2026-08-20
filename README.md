@@ -24,3 +24,8 @@ rescan it or decode the same preview again.
 Successfully decoded images use a bounded least-recently-used cache. The
 default holds 8 images and can be changed with `--image-cache-size N`. Evicted
 images are decoded again if revisited; cheap missing/error results remain cached.
+
+Drag the divider beside the directory tree to resize it. After clicking the
+tree, use Up/Down to move selection, Left/Right to collapse, expand, or enter a
+branch, and Enter to activate the current directory. The preview header shows
+the displayed image's filename.
