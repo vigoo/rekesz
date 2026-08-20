@@ -4,7 +4,7 @@ use gpui::RenderImage;
 use image::{DynamicImage, Frame};
 
 use crate::discovery::RequestId;
-use crate::rendering::{RenderBackend, RenderMetadata, RenderRequest};
+use crate::rendering::{RenderBackend, RenderMetadata, RenderRequest, RenderVariant};
 
 #[derive(Clone)]
 pub enum PreviewState {
@@ -48,10 +48,15 @@ impl PreviewCache {
             .unwrap_or(PreviewState::Unloaded)
     }
 
-    pub fn begin(&mut self, path: &std::path::Path) -> Option<RequestId> {
-        if matches!(self.state(path), PreviewState::Loaded(_)) {
+    pub fn begin(&mut self, path: &std::path::Path, variant: RenderVariant) -> Option<RequestId> {
+        if matches!(self.state(path), PreviewState::Loaded(ref preview) if variant_satisfies(preview.metadata.variant, variant))
+        {
             self.touch(path);
             return None;
+        }
+        if matches!(self.state(path), PreviewState::Loaded(_)) {
+            self.entries.remove(path);
+            self.last_used.remove(path);
         }
         if !matches!(self.state(path), PreviewState::Unloaded) {
             return None;
@@ -116,9 +121,25 @@ impl PreviewCache {
     }
 }
 
+fn variant_satisfies(cached: RenderVariant, requested: RenderVariant) -> bool {
+    match (cached, requested) {
+        (
+            RenderVariant::Preview {
+                max_width: cached_width,
+                max_height: cached_height,
+            },
+            RenderVariant::Preview {
+                max_width,
+                max_height,
+            },
+        ) => cached_width >= max_width && cached_height >= max_height,
+        _ => cached == requested,
+    }
+}
+
 /// Blocking image I/O and CPU-heavy decoding. Call only from a background executor.
-pub fn decode_path(path: PathBuf, thumbnail_width: Option<u32>) -> PreviewState {
-    let request = RenderRequest::new(path.clone(), thumbnail_width);
+pub fn decode_path(path: PathBuf, variant: RenderVariant) -> PreviewState {
+    let request = RenderRequest::new(path.clone(), variant);
     match RenderBackend::default().render(&request) {
         Ok(rendered) => PreviewState::Loaded(Arc::new(DecodedPreview {
             image: Arc::new(render_image(rendered.image)),
@@ -145,6 +166,10 @@ mod tests {
     use std::path::Path;
 
     fn image_state() -> PreviewState {
+        image_state_for(RenderVariant::Full)
+    }
+
+    fn image_state_for(variant: RenderVariant) -> PreviewState {
         let buffer = ImageBuffer::from_pixel(1, 1, Rgba([0, 0, 0, 255]));
         PreviewState::Loaded(Arc::new(DecodedPreview {
             image: Arc::new(RenderImage::new(smallvec::smallvec![Frame::new(buffer)])),
@@ -153,14 +178,49 @@ mod tests {
                 photographic: None,
                 source_dimensions: (1, 1),
                 output_dimensions: (1, 1),
-                variant: crate::rendering::RenderVariant::Full,
+                variant,
                 orientation_applied: None,
             },
         }))
     }
 
+    #[test]
+    fn a_larger_raw_preview_satisfies_a_smaller_display_request() {
+        let mut cache = PreviewCache::new(1);
+        let path = Path::new("raw.cr3");
+        let large = RenderVariant::Preview {
+            max_width: 3840,
+            max_height: 2160,
+        };
+        let request = cache.begin(path, large).unwrap();
+        cache.finish(path, request, image_state_for(large));
+
+        assert!(
+            cache
+                .begin(
+                    path,
+                    RenderVariant::Preview {
+                        max_width: 1920,
+                        max_height: 1080,
+                    }
+                )
+                .is_none()
+        );
+        assert!(
+            cache
+                .begin(
+                    path,
+                    RenderVariant::Preview {
+                        max_width: 5120,
+                        max_height: 2880,
+                    }
+                )
+                .is_some()
+        );
+    }
+
     fn load(cache: &mut PreviewCache, path: &std::path::Path) {
-        let request = cache.begin(path).unwrap();
+        let request = cache.begin(path, RenderVariant::Full).unwrap();
         assert!(cache.finish(path, request, image_state()));
     }
 
@@ -185,7 +245,7 @@ mod tests {
         let mut cache = PreviewCache::new(1);
         let missing = Path::new("missing");
         let image = Path::new("image");
-        let request = cache.begin(missing).unwrap();
+        let request = cache.begin(missing, RenderVariant::Full).unwrap();
         cache.finish(missing, request, PreviewState::Error("missing".into()));
         load(&mut cache, image);
 
@@ -198,8 +258,8 @@ mod tests {
         let mut cache = PreviewCache::new(1);
         let first = Path::new("first");
         let second = Path::new("second");
-        let first_request = cache.begin(first).unwrap();
-        let second_request = cache.begin(second).unwrap();
+        let first_request = cache.begin(first, RenderVariant::Full).unwrap();
+        let second_request = cache.begin(second, RenderVariant::Full).unwrap();
         cache.finish(second, second_request, image_state());
         cache.finish(first, first_request, image_state());
 
@@ -211,7 +271,7 @@ mod tests {
     fn decodes_the_cr3_regression_sample() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test/IMG_0052.CR3");
         if path.exists() {
-            let result = decode_path(path, Some(64));
+            let result = decode_path(path, RenderVariant::Thumbnail { width: 64 });
             if let PreviewState::Error(error) = result {
                 panic!("CR3 sample did not decode: {error}");
             }

@@ -9,9 +9,9 @@ use std::{
 use anyhow::Result;
 use gpui::{
     App, AppContext as _, Application, Bounds, ClickEvent, Context, CursorStyle, FocusHandle,
-    KeyBinding, ListSizingBehavior, MouseButton, MouseMoveEvent, Render, ScrollStrategy,
-    SharedString, UniformListScrollHandle, Window, WindowBounds, WindowOptions, actions, div, img,
-    prelude::*, px, relative, rgb, size, uniform_list,
+    KeyBinding, ListSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Render, ScrollStrategy, SharedString, UniformListScrollHandle, Window, WindowBounds,
+    WindowOptions, actions, div, img, prelude::*, px, relative, rgb, size, uniform_list,
 };
 
 mod discovery;
@@ -21,6 +21,7 @@ mod rendering;
 
 use discovery::{DirectoryContents, DirectoryModel, NodeId, RawJpegPreference, scan_directory};
 use preview::{PreviewCache, PreviewState, decode_path};
+use rendering::RenderVariant;
 
 actions!(
     directory_tree,
@@ -71,8 +72,41 @@ impl ImageSelection {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ZoomLevel {
+    FitWindow,
+    ActualSize,
+}
+
+struct ImageViewState {
+    path: PathBuf,
+    zoom: ZoomLevel,
+    pan: (f32, f32),
+    drag_last: Option<(f32, f32)>,
+}
+
+impl ImageViewState {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            zoom: ZoomLevel::FitWindow,
+            pan: (0.0, 0.0),
+            drag_last: None,
+        }
+    }
+
+    fn toggle_zoom(&mut self) {
+        self.zoom = match self.zoom {
+            ZoomLevel::FitWindow => ZoomLevel::ActualSize,
+            ZoomLevel::ActualSize => ZoomLevel::FitWindow,
+        };
+        self.pan = (0.0, 0.0);
+        self.drag_last = None;
+    }
+}
+
 enum MainView {
-    Image(PathBuf),
+    Image(ImageViewState),
     Dir(PathBuf, ImageSelection),
 }
 
@@ -119,6 +153,7 @@ struct PictureBrowser {
     expanded: HashSet<NodeId>,
     selected: NodeId,
     previews: PreviewCache,
+    raw_previews: PreviewCache,
     thumbnails: PreviewCache,
     main_view: MainView,
     saved_selection: ImageSelection,
@@ -135,6 +170,18 @@ struct PictureBrowser {
 }
 
 impl PictureBrowser {
+    fn raw_preview_variant(window: &Window, cx: &Context<Self>) -> RenderVariant {
+        let display_size = window
+            .display(cx)
+            .map(|display| display.bounds().size)
+            .unwrap_or_else(|| window.viewport_size());
+        let scale = window.scale_factor();
+        RenderVariant::Preview {
+            max_width: (f32::from(display_size.width) * scale).ceil().max(1.0) as u32,
+            max_height: (f32::from(display_size.height) * scale).ceil().max(1.0) as u32,
+        }
+    }
+
     fn new(
         root: PathBuf,
         image_cache_size: usize,
@@ -153,6 +200,7 @@ impl PictureBrowser {
             expanded: HashSet::from([root]),
             selected: root,
             previews: PreviewCache::new(image_cache_size),
+            raw_previews: PreviewCache::new(image_cache_size),
             thumbnails: PreviewCache::new(image_cache_size.saturating_mul(16).max(64)),
             main_view: MainView::Dir(root_path, ImageSelection::default()),
             saved_selection: ImageSelection::default(),
@@ -200,24 +248,19 @@ impl PictureBrowser {
         .detach();
     }
 
-    fn ensure_image(
-        &mut self,
-        path: PathBuf,
-        thumbnail_width: Option<u32>,
-        cx: &mut Context<Self>,
-    ) {
-        let cache = if thumbnail_width.is_some() {
-            &mut self.thumbnails
-        } else {
-            &mut self.previews
+    fn ensure_image(&mut self, path: PathBuf, variant: RenderVariant, cx: &mut Context<Self>) {
+        let cache = match variant {
+            RenderVariant::Full => &mut self.previews,
+            RenderVariant::Thumbnail { .. } => &mut self.thumbnails,
+            RenderVariant::Preview { .. } => &mut self.raw_previews,
         };
-        let Some(request) = cache.begin(&path) else {
+        let Some(request) = cache.begin(&path, variant) else {
             return;
         };
         self.work.start();
         cx.notify();
         let source_path = path.clone();
-        let decode = cx.background_spawn(async move { decode_path(source_path, thumbnail_width) });
+        let decode = cx.background_spawn(async move { decode_path(source_path, variant) });
         cx.spawn(async move |this, cx| {
             let result = decode.await;
             this.update(cx, |this, cx| {
@@ -226,10 +269,10 @@ impl PictureBrowser {
                     this.model
                         .record_render_metadata(path.clone(), preview.metadata);
                 }
-                let cache = if thumbnail_width.is_some() {
-                    &mut this.thumbnails
-                } else {
-                    &mut this.previews
+                let cache = match variant {
+                    RenderVariant::Full => &mut this.previews,
+                    RenderVariant::Thumbnail { .. } => &mut this.thumbnails,
+                    RenderVariant::Preview { .. } => &mut this.raw_previews,
                 };
                 if cache.finish(&path, request, result) {
                     cx.notify();
@@ -352,9 +395,8 @@ impl PictureBrowser {
         if let MainView::Dir(_, selection) = &self.main_view {
             self.saved_selection = selection.clone();
         }
-        self.main_view = MainView::Image(path.clone());
+        self.main_view = MainView::Image(ImageViewState::new(path.clone()));
         self.previews.mark_used(&path);
-        self.ensure_image(path, None, cx);
         cx.notify();
     }
 
@@ -428,6 +470,67 @@ impl PictureBrowser {
         }
     }
 
+    fn image_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let MainView::Image(state) = &mut self.main_view else {
+            return;
+        };
+        if event.click_count >= 2 {
+            state.toggle_zoom();
+        } else if state.zoom == ZoomLevel::ActualSize {
+            state.drag_last = Some((f32::from(event.position.x), f32::from(event.position.y)));
+        }
+        cx.notify();
+    }
+
+    fn image_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !event.dragging() {
+            return;
+        }
+        let MainView::Image(state) = &mut self.main_view else {
+            return;
+        };
+        if state.zoom != ZoomLevel::ActualSize {
+            return;
+        }
+        let position = (f32::from(event.position.x), f32::from(event.position.y));
+        let Some(previous) = state.drag_last.replace(position) else {
+            return;
+        };
+        state.pan.0 += position.0 - previous.0;
+        state.pan.1 += position.1 - previous.1;
+
+        if let PreviewState::Loaded(preview) = self.previews.state(&state.path) {
+            let (image_width, image_height) = preview.metadata.output_dimensions;
+            let viewport_width =
+                (f32::from(window.viewport_size().width) - self.sidebar_width - 5.0).max(0.0);
+            let progress_height = if self.work.active > 0 { 22.0 } else { 0.0 };
+            let viewport_height =
+                (f32::from(window.viewport_size().height) - 44.0 - progress_height).max(0.0);
+            let max_x = ((image_width as f32 - viewport_width) / 2.0).max(0.0);
+            let max_y = ((image_height as f32 - viewport_height) / 2.0).max(0.0);
+            state.pan.0 = state.pan.0.clamp(-max_x, max_x);
+            state.pan.1 = state.pan.1.clamp(-max_y, max_y);
+        }
+        cx.notify();
+    }
+
+    fn image_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if let MainView::Image(state) = &mut self.main_view {
+            state.drag_last = None;
+            cx.notify();
+        }
+    }
+
     fn selected_images(&self) -> &[PathBuf] {
         self.model
             .loaded(self.selected)
@@ -461,7 +564,13 @@ impl PictureBrowser {
                     .take(self.grid_columns)
                 {
                     let path = path.clone();
-                    self.ensure_image(path.clone(), Some(self.thumbnail_width), cx);
+                    self.ensure_image(
+                        path.clone(),
+                        RenderVariant::Thumbnail {
+                            width: self.thumbnail_width,
+                        },
+                        cx,
+                    );
                     let image_content = match self.thumbnails.state(&path) {
                         PreviewState::Loaded(preview) => img(preview.image.clone())
                             .max_w_full()
@@ -652,14 +761,46 @@ impl Render for PictureBrowser {
             );
 
         let (title, show_back, main_content) = match &self.main_view {
-            MainView::Image(path) => {
-                let path = path.clone();
-                self.ensure_image(path.clone(), None, cx);
-                let content = match self.previews.state(&path) {
-                    PreviewState::Loaded(preview) => img(preview.image.clone())
-                        .max_w_full()
-                        .max_h_full()
-                        .into_any_element(),
+            MainView::Image(state) => {
+                let path = state.path.clone();
+                let zoom = state.zoom;
+                let pan = state.pan;
+                let variant = if zoom == ZoomLevel::FitWindow && formats::is_raw(&path) {
+                    Self::raw_preview_variant(window, cx)
+                } else {
+                    RenderVariant::Full
+                };
+                self.ensure_image(path.clone(), variant, cx);
+                let state = match variant {
+                    RenderVariant::Preview { .. } => self.raw_previews.state(&path),
+                    RenderVariant::Full => self.previews.state(&path),
+                    RenderVariant::Thumbnail { .. } => unreachable!(),
+                };
+                let content = match state {
+                    PreviewState::Loaded(preview) => match zoom {
+                        ZoomLevel::FitWindow => img(preview.image.clone())
+                            .max_w_full()
+                            .max_h_full()
+                            .into_any_element(),
+                        ZoomLevel::ActualSize => {
+                            let (width, height) = preview.metadata.output_dimensions;
+                            let viewport_width = (f32::from(window.viewport_size().width)
+                                - self.sidebar_width
+                                - 5.0)
+                                .max(0.0);
+                            let progress_height = if self.work.active > 0 { 22.0 } else { 0.0 };
+                            let viewport_height =
+                                (f32::from(window.viewport_size().height) - 44.0 - progress_height)
+                                    .max(0.0);
+                            img(preview.image.clone())
+                                .absolute()
+                                .left(px((viewport_width - width as f32) / 2.0 + pan.0))
+                                .top(px((viewport_height - height as f32) / 2.0 + pan.1))
+                                .w(px(width as f32))
+                                .h(px(height as f32))
+                                .into_any_element()
+                        }
+                    },
                     PreviewState::Error(error) => {
                         div().text_sm().child(error.to_string()).into_any_element()
                     }
@@ -672,11 +813,21 @@ impl Render for PictureBrowser {
                         .into_owned(),
                     true,
                     div()
+                        .id("image-viewport")
                         .size_full()
+                        .relative()
+                        .overflow_hidden()
                         .flex()
                         .items_center()
                         .justify_center()
-                        .p_6()
+                        .when(zoom == ZoomLevel::FitWindow, |this| this.p_6())
+                        .cursor(match zoom {
+                            ZoomLevel::FitWindow => CursorStyle::Arrow,
+                            ZoomLevel::ActualSize => CursorStyle::OpenHand,
+                        })
+                        .on_mouse_down(MouseButton::Left, cx.listener(Self::image_mouse_down))
+                        .on_mouse_move(cx.listener(Self::image_mouse_move))
+                        .on_mouse_up(MouseButton::Left, cx.listener(Self::image_mouse_up))
                         .child(content)
                         .into_any_element(),
                 )
@@ -1033,5 +1184,17 @@ mod tests {
         assert_eq!(work.active, 1);
         assert_eq!(work.completed, 0);
         assert_eq!(work.total, 1);
+    }
+
+    #[test]
+    fn image_zoom_starts_fitted_and_toggle_resets_pan() {
+        let mut state = ImageViewState::new(PathBuf::from("photo.jpg"));
+        assert_eq!(state.zoom, ZoomLevel::FitWindow);
+        state.toggle_zoom();
+        assert_eq!(state.zoom, ZoomLevel::ActualSize);
+        state.pan = (100.0, -50.0);
+        state.toggle_zoom();
+        assert_eq!(state.zoom, ZoomLevel::FitWindow);
+        assert_eq!(state.pan, (0.0, 0.0));
     }
 }

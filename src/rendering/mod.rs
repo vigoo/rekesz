@@ -17,22 +17,12 @@ pub use photographic::{AutoExposure, PhotographicSettings, ToneMapper};
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RenderRequest {
     pub path: PathBuf,
-    pub thumbnail_width: Option<u32>,
+    pub variant: RenderVariant,
 }
 
 impl RenderRequest {
-    pub fn new(path: PathBuf, thumbnail_width: Option<u32>) -> Self {
-        Self {
-            path,
-            thumbnail_width,
-        }
-    }
-
-    pub fn variant(&self) -> RenderVariant {
-        match self.thumbnail_width {
-            Some(width) => RenderVariant::Thumbnail { width },
-            None => RenderVariant::Full,
-        }
+    pub fn new(path: PathBuf, variant: RenderVariant) -> Self {
+        Self { path, variant }
     }
 }
 
@@ -40,6 +30,7 @@ impl RenderRequest {
 pub enum RenderVariant {
     Full,
     Thumbnail { width: u32 },
+    Preview { max_width: u32, max_height: u32 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -97,9 +88,13 @@ impl RenderBackend {
     pub fn render(&self, request: &RenderRequest) -> image::ImageResult<RenderedImage> {
         let decoded = source::decode(&request.path, &self.raw)?;
         let source_dimensions = (decoded.image.width(), decoded.image.height());
-        let image = match request.thumbnail_width {
-            Some(width) => decoded.image.thumbnail(width, width),
-            None => decoded.image,
+        let image = match request.variant {
+            RenderVariant::Full => decoded.image,
+            RenderVariant::Thumbnail { width } => decoded.image.thumbnail(width, width),
+            RenderVariant::Preview {
+                max_width,
+                max_height,
+            } => decoded.image.thumbnail(max_width, max_height),
         };
         let output_dimensions = (image.width(), image.height());
         Ok(RenderedImage {
@@ -109,7 +104,7 @@ impl RenderBackend {
                 photographic: decoded.photographic,
                 source_dimensions,
                 output_dimensions,
-                variant: request.variant(),
+                variant: request.variant,
                 orientation_applied: decoded.orientation_applied,
             },
         })

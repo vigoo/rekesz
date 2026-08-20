@@ -22,6 +22,15 @@ histogram-based auto-exposure and filmic tone-mapping stage. Rendering settings
 are isolated from decoding and UI state so they can later be included in
 thumbnail and filesystem-cache keys.
 
+Images open fitted to the available window. Double-click the image to switch to
+1:1 pixels, then drag with the left mouse button to pan; double-click again to
+return to fit-window mode.
+
+Fit-window mode uses a separate on-demand RAW preview cache. Preview dimensions
+come from the current display bounds multiplied by its scale factor, so resizing
+the window does not trigger regeneration. Moving to a larger or higher-DPI
+display upgrades the cached preview; smaller displays reuse the larger result.
+
 EXIF orientation metadata is applied before the image is handed to GPUI, including
 rotated and mirrored orientations supported by the underlying decoder. RAW
 orientation is read from rawler's EXIF metadata and applied before resizing.
