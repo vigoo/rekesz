@@ -147,7 +147,7 @@ pub fn scan_directory(path: &Path) -> Result<DirectoryScan, io::Error> {
         let path = entry.path();
         if file_type.is_dir() {
             directories.push(path);
-        } else if file_type.is_file() && image::ImageFormat::from_path(&path).is_ok() {
+        } else if file_type.is_file() && is_supported_image(&path) {
             images.push(path);
         }
     }
@@ -157,6 +157,16 @@ pub fn scan_directory(path: &Path) -> Result<DirectoryScan, io::Error> {
         directories,
         images,
     })
+}
+
+fn is_supported_image(path: &Path) -> bool {
+    image::ImageFormat::from_path(path).is_ok()
+        || path.extension().is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("nef")
+                || extension.eq_ignore_ascii_case("cr3")
+                || extension.eq_ignore_ascii_case("heic")
+                || extension.eq_ignore_ascii_case("heif")
+        })
 }
 
 fn sort_key(path: &Path) -> String {
@@ -169,6 +179,20 @@ fn sort_key(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recognizes_raw_and_heif_extensions_case_insensitively() {
+        for name in [
+            "photo.nef",
+            "photo.NEF",
+            "photo.cr3",
+            "photo.HEIC",
+            "photo.heif",
+        ] {
+            assert!(is_supported_image(Path::new(name)), "{name}");
+        }
+        assert!(!is_supported_image(Path::new("notes.txt")));
+    }
 
     #[test]
     fn a_node_can_only_start_one_load() {

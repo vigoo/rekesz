@@ -2,10 +2,10 @@ use std::{collections::HashSet, env, ffi::OsString, ops::Range, path::PathBuf};
 
 use anyhow::Result;
 use gpui::{
-    App, AppContext as _, Application, Bounds, Context, CursorStyle, FocusHandle, KeyBinding,
-    ListSizingBehavior, MouseButton, MouseMoveEvent, Render, ScrollStrategy, SharedString,
-    UniformListScrollHandle, Window, WindowBounds, WindowOptions, actions, div, img, prelude::*,
-    px, rgb, size, uniform_list,
+    App, AppContext as _, Application, Bounds, ClickEvent, Context, CursorStyle, FocusHandle,
+    KeyBinding, ListSizingBehavior, MouseButton, MouseMoveEvent, Render, ScrollStrategy,
+    SharedString, UniformListScrollHandle, Window, WindowBounds, WindowOptions, actions, div, img,
+    prelude::*, px, rgb, size, uniform_list,
 };
 
 mod discovery;
@@ -72,6 +72,13 @@ impl PictureBrowser {
             let result = scan.await;
             this.update(cx, |this, cx| {
                 if this.model.finish_load(node, request, result) {
+                    if this
+                        .model
+                        .loaded(node)
+                        .is_some_and(|contents| contents.children.is_empty())
+                    {
+                        this.expanded.remove(&node);
+                    }
                     this.rebuild_visible();
                     if this.selected == node {
                         this.ensure_preview(node, cx);
@@ -188,6 +195,21 @@ impl PictureBrowser {
         cx.notify();
     }
 
+    fn open(&mut self, node: NodeId, cx: &mut Context<Self>) {
+        if self
+            .model
+            .loaded(node)
+            .is_some_and(|contents| contents.children.is_empty())
+        {
+            return;
+        }
+        if self.expanded.insert(node) {
+            self.ensure_directory_loaded(node, cx);
+            self.rebuild_visible();
+            cx.notify();
+        }
+    }
+
     /// Recreates only the flat rows that are actually exposed by expanded
     /// branches. Collapsed descendants have no row or GPUI element state.
     fn rebuild_visible(&mut self) {
@@ -242,9 +264,12 @@ impl PictureBrowser {
                             ),
                     )
                     .child(div().min_w_0().truncate().child(name))
-                    .on_click(cx.listener(move |this, _, window, cx| {
+                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                         window.focus(&this.tree_focus);
                         this.select(select_node, cx);
+                        if event.click_count() >= 2 {
+                            this.open(select_node, cx);
+                        }
                     }))
                     .into_any_element()
             })

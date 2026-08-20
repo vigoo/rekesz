@@ -10,7 +10,8 @@ cargo run --release -- --image-cache-size 8 /path/to/pictures
 When the path is omitted, `pics` uses the current directory. Directory symlinks
 are intentionally not traversed. Supported formats include AVIF, BMP, DDS, EXR,
 Farbfeld, GIF, HDR, ICO, JPEG, PNG, PNM, QOI, TGA, TIFF, and WebP (subject to
-the platform renderer's support).
+the platform renderer's support), plus Nikon NEF and Canon CR3 RAW files and
+iPhone HEIC/HEIF images.
 
 EXIF orientation metadata is applied before the image is handed to GPUI, including
 rotated and mirrored orientations supported by the underlying decoder.

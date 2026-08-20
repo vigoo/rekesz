@@ -141,12 +141,63 @@ pub fn decode_first(paths: Vec<PathBuf>) -> PreviewState {
 }
 
 fn oriented_render_image(path: &std::path::Path) -> image::ImageResult<RenderImage> {
+    if path.extension().is_some_and(|extension| {
+        extension.eq_ignore_ascii_case("heic") || extension.eq_ignore_ascii_case("heif")
+    }) {
+        return heic_render_image(path).map_err(|error| {
+            image::ImageError::Decoding(image::error::DecodingError::new(
+                image::error::ImageFormatHint::Unknown,
+                error,
+            ))
+        });
+    }
+    if path.extension().is_some_and(|extension| {
+        extension.eq_ignore_ascii_case("nef") || extension.eq_ignore_ascii_case("cr3")
+    }) {
+        return raw_render_image(path).map_err(|error| {
+            image::ImageError::Decoding(image::error::DecodingError::new(
+                image::error::ImageFormatHint::Unknown,
+                error,
+            ))
+        });
+    }
     let reader = image::ImageReader::open(path)?.with_guessed_format()?;
     let mut decoder = reader.into_decoder()?;
     let orientation = decoder.orientation()?;
     let mut decoded = DynamicImage::from_decoder(decoder)?;
     decoded.apply_orientation(orientation);
     let mut buffer = decoded.into_rgba8();
+    for pixel in buffer.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    Ok(RenderImage::new(smallvec::smallvec![Frame::new(buffer)]))
+}
+
+fn heic_render_image(path: &std::path::Path) -> Result<RenderImage, String> {
+    let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
+    let mut buffer = heif::decode(&bytes)
+        .map_err(|error| error.to_string())?
+        .into_rgba8();
+    for pixel in buffer.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    Ok(RenderImage::new(smallvec::smallvec![Frame::new(buffer)]))
+}
+
+fn raw_render_image(path: &std::path::Path) -> Result<RenderImage, String> {
+    use rawler::{
+        analyze::extract_full_pixels, decoders::RawDecodeParams, imgop::develop::RawDevelop,
+    };
+
+    let params = RawDecodeParams::default();
+    let decoded = extract_full_pixels(path, &params).or_else(|_| {
+        let raw = rawler::decode_file(path)?;
+        RawDevelop::default()
+            .develop_intermediate(&raw)?
+            .to_dynamic_image()
+            .ok_or_else(|| rawler::RawlerError::DecoderFailed("RAW development failed".into()))
+    });
+    let mut buffer = decoded.map_err(|error| error.to_string())?.into_rgba8();
     for pixel in buffer.chunks_exact_mut(4) {
         pixel.swap(0, 2);
     }
