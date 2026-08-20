@@ -4,12 +4,14 @@
 //! types so they can later become stable memory/disk-cache keys, while callers
 //! remain free to schedule work on any executor.
 
+mod disk_cache;
 mod photographic;
 mod source;
 
 use std::path::PathBuf;
 
 use image::DynamicImage;
+use serde::{Deserialize, Serialize};
 
 #[allow(unused_imports)]
 pub use photographic::{AutoExposure, PhotographicSettings, ToneMapper};
@@ -26,26 +28,26 @@ impl RenderRequest {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RenderVariant {
     Full,
     Thumbnail { width: u32 },
     Preview { max_width: u32, max_height: u32 },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum SourcePipeline {
     Standard,
     Heif,
     Raw,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum OutputEncoding {
     Srgb,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AppliedPhotographicTransform {
     pub settings: PhotographicSettings,
     pub automatic_exposure_stops: f32,
@@ -54,7 +56,7 @@ pub struct AppliedPhotographicTransform {
     pub orientation_applied: Option<u8>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RenderMetadata {
     pub source_pipeline: SourcePipeline,
     pub photographic: Option<AppliedPhotographicTransform>,
@@ -73,19 +75,24 @@ pub struct RenderedImage {
 #[derive(Clone, Debug)]
 pub struct RenderBackend {
     pub raw: PhotographicSettings,
-}
-
-impl Default for RenderBackend {
-    fn default() -> Self {
-        Self {
-            raw: PhotographicSettings::default(),
-        }
-    }
+    disk_cache: disk_cache::DiskRenderCache,
 }
 
 impl RenderBackend {
+    pub fn new(cache_root: PathBuf) -> Self {
+        Self {
+            raw: PhotographicSettings::default(),
+            disk_cache: disk_cache::DiskRenderCache::new(cache_root),
+        }
+    }
+
     /// Performs file I/O and CPU-heavy decoding. Run this on a background worker.
     pub fn render(&self, request: &RenderRequest) -> image::ImageResult<RenderedImage> {
+        if request.variant != RenderVariant::Full
+            && let Ok(Some(cached)) = self.disk_cache.load(request, &self.raw)
+        {
+            return Ok(cached);
+        }
         let decoded = source::decode(&request.path, &self.raw)?;
         let source_dimensions = (decoded.image.width(), decoded.image.height());
         let image = match request.variant {
@@ -97,7 +104,7 @@ impl RenderBackend {
             } => decoded.image.thumbnail(max_width, max_height),
         };
         let output_dimensions = (image.width(), image.height());
-        Ok(RenderedImage {
+        let rendered = RenderedImage {
             image,
             metadata: RenderMetadata {
                 source_pipeline: decoded.source_pipeline,
@@ -107,6 +114,12 @@ impl RenderBackend {
                 variant: request.variant,
                 orientation_applied: decoded.orientation_applied,
             },
-        })
+        };
+        if request.variant != RenderVariant::Full {
+            // A cache write failure must not make an otherwise valid image
+            // unavailable to the UI.
+            let _ = self.disk_cache.store(request, &self.raw, &rendered);
+        }
+        Ok(rendered)
     }
 }

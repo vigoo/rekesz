@@ -4,6 +4,7 @@ use std::path::Path;
 
 use image::{DynamicImage, Rgb, RgbImage};
 use rawler::imgop::develop::{Intermediate, ProcessingStep, RawDevelop};
+use serde::{Deserialize, Serialize};
 
 use super::{AppliedPhotographicTransform, OutputEncoding};
 
@@ -11,7 +12,7 @@ const HISTOGRAM_BINS: usize = 4096;
 const MIN_LOG2_LUMINANCE: f32 = -16.0;
 const MAX_LOG2_LUMINANCE: f32 = 8.0;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AutoExposure {
     /// Scene-luminance percentile used as the exposure anchor.
     pub percentile: f32,
@@ -31,13 +32,13 @@ impl Default for AutoExposure {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub enum ToneMapper {
     #[default]
     AcesFitted,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PhotographicSettings {
     pub auto_exposure: AutoExposure,
     pub exposure_compensation_stops: f32,

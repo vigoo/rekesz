@@ -138,9 +138,9 @@ fn variant_satisfies(cached: RenderVariant, requested: RenderVariant) -> bool {
 }
 
 /// Blocking image I/O and CPU-heavy decoding. Call only from a background executor.
-pub fn decode_path(path: PathBuf, variant: RenderVariant) -> PreviewState {
+pub fn decode_path(path: PathBuf, variant: RenderVariant, cache_root: PathBuf) -> PreviewState {
     let request = RenderRequest::new(path.clone(), variant);
-    match RenderBackend::default().render(&request) {
+    match RenderBackend::new(cache_root).render(&request) {
         Ok(rendered) => PreviewState::Loaded(Arc::new(DecodedPreview {
             image: Arc::new(render_image(rendered.image)),
             metadata: rendered.metadata,
@@ -271,7 +271,12 @@ mod tests {
     fn decodes_the_cr3_regression_sample() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test/IMG_0052.CR3");
         if path.exists() {
-            let result = decode_path(path, RenderVariant::Thumbnail { width: 64 });
+            let cache_root = tempfile::tempdir().unwrap();
+            let result = decode_path(
+                path,
+                RenderVariant::Thumbnail { width: 64 },
+                cache_root.path().to_path_buf(),
+            );
             if let PreviewState::Error(error) = result {
                 panic!("CR3 sample did not decode: {error}");
             }

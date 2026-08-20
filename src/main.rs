@@ -167,6 +167,7 @@ struct PictureBrowser {
     resizing_sidebar: bool,
     pair_preference: RawJpegPreference,
     work: WorkProgress,
+    cache_root: PathBuf,
 }
 
 impl PictureBrowser {
@@ -186,6 +187,7 @@ impl PictureBrowser {
         root: PathBuf,
         image_cache_size: usize,
         pair_preference: RawJpegPreference,
+        cache_root: PathBuf,
         cx: &mut Context<Self>,
     ) -> Self {
         let model = DirectoryModel::new(root);
@@ -214,6 +216,7 @@ impl PictureBrowser {
             resizing_sidebar: false,
             pair_preference,
             work: WorkProgress::default(),
+            cache_root,
         };
         this.ensure_directory_loaded(root, cx);
         this
@@ -260,7 +263,9 @@ impl PictureBrowser {
         self.work.start();
         cx.notify();
         let source_path = path.clone();
-        let decode = cx.background_spawn(async move { decode_path(source_path, variant) });
+        let cache_root = self.cache_root.clone();
+        let decode =
+            cx.background_spawn(async move { decode_path(source_path, variant, cache_root) });
         cx.spawn(async move |this, cx| {
             let result = decode.await;
             this.update(cx, |this, cx| {
@@ -1005,6 +1010,7 @@ struct Config {
     root: PathBuf,
     image_cache_size: usize,
     pair_preference: RawJpegPreference,
+    cache_root: PathBuf,
 }
 
 fn config_from_args(args: impl IntoIterator<Item = OsString>) -> Result<Config> {
@@ -1013,6 +1019,7 @@ fn config_from_args(args: impl IntoIterator<Item = OsString>) -> Result<Config> 
     let mut requested_root = None;
     let mut image_cache_size = DEFAULT_IMAGE_CACHE_SIZE;
     let mut pair_preference = RawJpegPreference::Raw;
+    let mut requested_cache_root = None;
     while let Some(argument) = args.next() {
         if argument == "--image-cache-size" {
             let value = args
@@ -1025,6 +1032,11 @@ fn config_from_args(args: impl IntoIterator<Item = OsString>) -> Result<Config> 
             if image_cache_size == 0 {
                 anyhow::bail!("image cache size must be at least 1");
             }
+        } else if argument == "--cache-root" {
+            requested_cache_root =
+                Some(PathBuf::from(args.next().ok_or_else(|| {
+                    anyhow::anyhow!("--cache-root requires a directory")
+                })?));
         } else if argument == "--cr3-jpeg-preference" {
             let value = args
                 .next()
@@ -1046,10 +1058,22 @@ fn config_from_args(args: impl IntoIterator<Item = OsString>) -> Result<Config> 
     } else {
         env::current_dir()?.join(requested)
     };
+    let cache_root = requested_cache_root.unwrap_or(
+        directories::ProjectDirs::from("", "", "pics")
+            .ok_or_else(|| anyhow::anyhow!("cannot determine the platform cache directory"))?
+            .cache_dir()
+            .to_path_buf(),
+    );
+    let cache_root = if cache_root.is_absolute() {
+        cache_root
+    } else {
+        env::current_dir()?.join(cache_root)
+    };
     Ok(Config {
         root,
         image_cache_size,
         pair_preference,
+        cache_root,
     })
 }
 
@@ -1085,6 +1109,7 @@ fn main() -> Result<()> {
                         config.root.clone(),
                         config.image_cache_size,
                         config.pair_preference,
+                        config.cache_root.clone(),
                         cx,
                     )
                 })
@@ -1155,6 +1180,18 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(config.pair_preference, RawJpegPreference::Jpeg);
+    }
+
+    #[test]
+    fn parses_custom_cache_root() {
+        let config = config_from_args([
+            OsString::from("pics"),
+            OsString::from("--cache-root"),
+            OsString::from("relative-cache"),
+        ])
+        .unwrap();
+        assert!(config.cache_root.is_absolute());
+        assert!(config.cache_root.ends_with("relative-cache"));
     }
 
     #[test]

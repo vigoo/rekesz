@@ -7,6 +7,13 @@ selecting one displays its first decodable image (sorted by filename).
 cargo run --release -- --image-cache-size 8 /path/to/pictures
 ```
 
+Thumbnails and RAW fit-window previews are persisted in the operating system's
+application cache directory (`~/.cache/pics` on Linux). Use
+`--cache-root /path/to/cache` to override it. Entries are keyed by source path,
+modification time, file size, render dimensions, and rendering recipe; cached
+pixels and their transformation metadata are written atomically as PNG/JSON
+pairs before being reused by later sessions.
+
 When a directory contains matching `name.CR3` and `name.JPG` files, the grid
 shows one item and uses CR3 by default. Pass `--cr3-jpeg-preference jpeg` to use
 the JPEG instead.
