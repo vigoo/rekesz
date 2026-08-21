@@ -20,6 +20,7 @@ use gpui::{
     prelude::*, px, relative, rgb, size, uniform_list,
 };
 
+mod catalog;
 mod discovery;
 mod formats;
 mod jobs;
@@ -34,14 +35,17 @@ use discovery::{
 };
 use jobs::JobLimiter;
 use metadata::MetadataLoader;
-use preview::{PreviewCache, PreviewState, RenderPipeline};
-use rendering::RenderVariant;
+use preview::{PreviewCache, PreviewState, RenderInvocation, RenderPipeline};
+use rendering::{RenderIdentity, RenderMode, RenderVariant};
 use scheduler::{
     DemandScopeId, JobCompletion, JobDemand, JobKey, JobPriority, JobSnapshotStatus,
     RenderScheduler, SchedulerSnapshot,
 };
 
-actions!(pics, [ToggleJobQueue]);
+actions!(
+    pics,
+    [ToggleDeveloped, ToggleJobQueue, ToggleDevelopInspector]
+);
 
 actions!(
     directory_tree,
@@ -73,6 +77,7 @@ const FOCUSED_PREFETCH_SCOPE: DemandScopeId = DemandScopeId(5);
 const IDLE_PREFETCH_DELAY: Duration = Duration::from_millis(400);
 const IDLE_PREFETCH_BATCH: usize = 64;
 const JOB_QUEUE_PANEL_WIDTH: f32 = 430.0;
+const DEVELOP_PANEL_WIDTH: f32 = 320.0;
 const SCHEDULER_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 const USE_IN_WINDOW_MENU: bool = !cfg!(target_os = "macos");
 
@@ -208,14 +213,18 @@ struct PictureBrowser {
     pending_grid_demand: Option<PendingGridDemand>,
     grid_publish_scheduled: bool,
     show_job_queue: bool,
+    show_develop_inspector: bool,
     show_view_menu: bool,
     job_queue_snapshot: SchedulerSnapshot,
     job_queue_scroll: UniformListScrollHandle,
     scheduler_refresh_scheduled: bool,
-    tree_context_menu: Option<TreeContextMenu>,
+    path_context_menu: Option<PathContextMenu>,
+    system_clipboard: Option<arboard::Clipboard>,
     metadata_loader: MetadataLoader,
     metadata_load: Option<(NodeId, discovery::RequestId, Arc<AtomicBool>)>,
     scrollbar_drag: Option<ScrollbarDrag>,
+    recipes: Option<Arc<HashMap<PathBuf, catalog::RecipeEntry>>>,
+    developed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -228,6 +237,169 @@ enum ScrollbarTarget {
 struct ScrollbarDrag {
     target: ScrollbarTarget,
     pointer_offset: gpui::Pixels,
+}
+
+fn has_develop_recipe(
+    recipes: Option<&HashMap<PathBuf, catalog::RecipeEntry>>,
+    path: &std::path::Path,
+) -> bool {
+    recipes.is_some_and(|recipes| recipes.contains_key(path))
+}
+
+fn format_develop_edits(recipe: &catalog::DevelopRecipe) -> Vec<(String, String)> {
+    let mut edits = Vec::new();
+    macro_rules! push_value {
+        ($name:literal, $value:expr) => {
+            if let Some(value) = $value {
+                edits.push(($name.to_owned(), format!("{value:.2}")));
+            }
+        };
+    }
+    push_value!("Exposure", recipe.exposure_ev);
+    push_value!("Contrast", recipe.contrast);
+    push_value!("Highlights", recipe.highlights);
+    push_value!("Shadows", recipe.shadows);
+    push_value!("Whites", recipe.whites);
+    push_value!("Blacks", recipe.blacks);
+    push_value!("Saturation", recipe.saturation);
+    push_value!("Vibrance", recipe.vibrance);
+    push_value!("Clarity", recipe.clarity);
+    push_value!("Texture", recipe.texture);
+    push_value!("Dehaze", recipe.dehaze);
+    if let Some(wb) = recipe.white_balance {
+        edits.push((
+            "White balance".into(),
+            format!("{:.0} K, tint {:.2}", wb.temperature, wb.tint),
+        ));
+    }
+    if let Some(wb) = recipe.white_balance_increment {
+        edits.push((
+            "White balance offset".into(),
+            format!("temperature {:+.2}, tint {:+.2}", wb.temperature, wb.tint),
+        ));
+    }
+    for (name, curve) in [
+        ("Tone curve", recipe.tone_curve.as_ref()),
+        ("Red tone curve", recipe.tone_curve_red.as_ref()),
+        ("Green tone curve", recipe.tone_curve_green.as_ref()),
+        ("Blue tone curve", recipe.tone_curve_blue.as_ref()),
+    ] {
+        if let Some(curve) = curve {
+            edits.push((
+                name.into(),
+                curve
+                    .iter()
+                    .map(|point| format!("({:.3}, {:.3})", point[0], point[1]))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ));
+        }
+    }
+    if let Some(crop) = recipe.crop {
+        edits.push((
+            "Crop".into(),
+            format!(
+                "L {:.3}, T {:.3}, R {:.3}, B {:.3}; angle {:.2}°{}",
+                crop.left,
+                crop.top,
+                crop.right,
+                crop.bottom,
+                crop.angle_degrees,
+                if crop.constrain_aspect {
+                    "; constrained"
+                } else {
+                    ""
+                }
+            ),
+        ));
+    }
+    if let Some(detail) = recipe.detail {
+        for (name, value) in [
+            ("Sharpening", detail.sharpening),
+            ("Sharpen radius", detail.sharpen_radius),
+            ("Sharpen detail", detail.sharpen_detail),
+            ("Edge masking", detail.edge_masking),
+            (
+                "Luminance noise reduction",
+                detail.luminance_noise_reduction,
+            ),
+            ("Luminance detail", detail.luminance_detail),
+            ("Luminance contrast", detail.luminance_contrast),
+            ("Colour noise reduction", detail.color_noise_reduction),
+            ("Colour detail", detail.color_detail),
+            ("Colour smoothness", detail.color_smoothness),
+        ] {
+            edits.push((name.into(), format!("{value:.2}")));
+        }
+    }
+    if let Some(monochrome) = recipe.monochrome {
+        for (name, value) in [
+            "Red", "Orange", "Yellow", "Green", "Aqua", "Blue", "Purple", "Magenta",
+        ]
+        .into_iter()
+        .zip(monochrome.mixer)
+        {
+            edits.push((format!("Monochrome {name}"), format!("{value:.2}")));
+        }
+    }
+    if let Some(vignette) = recipe.vignette {
+        edits.extend([
+            ("Vignette amount".into(), format!("{:.2}", vignette.amount)),
+            (
+                "Vignette midpoint".into(),
+                format!("{:.2}", vignette.midpoint),
+            ),
+            (
+                "Vignette feather".into(),
+                format!("{:.2}", vignette.feather),
+            ),
+            (
+                "Vignette roundness".into(),
+                format!("{:.2}", vignette.roundness),
+            ),
+        ]);
+    }
+    if let Some(curve) = recipe.parametric_curve {
+        edits.push((
+            "Parametric curve".into(),
+            format!(
+                "H {:.2}, L {:.2}, D {:.2}, S {:.2}",
+                curve[0], curve[1], curve[2], curve[3]
+            ),
+        ));
+    }
+    if let Some(matrix) = recipe.upright_homography {
+        edits.push((
+            "Upright homography".into(),
+            matrix.map(|value| format!("{value:.3}")).join(", "),
+        ));
+    }
+    push_value!("Manual lens distortion", recipe.lens_distortion);
+    for (index, spot) in recipe.heal_spots.iter().enumerate() {
+        edits.push((
+            format!("{:?} spot {}", spot.kind, index + 1),
+            format!(
+                "to {:.3},{:.3} from {:.3},{:.3}; radius {:.3}, opacity {:.0}%, feather {:.0}%",
+                spot.destination[0],
+                spot.destination[1],
+                spot.source[0],
+                spot.source[1],
+                spot.radius,
+                spot.opacity * 100.0,
+                spot.feather * 100.0
+            ),
+        ));
+    }
+    if let Some(grain) = recipe.grain {
+        edits.push((
+            "Grain".into(),
+            format!(
+                "amount {:.2}, size {:.2}, roughness {:.2}",
+                grain.amount, grain.size, grain.roughness
+            ),
+        ));
+    }
+    edits
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -247,8 +419,8 @@ struct PendingGridDemand {
     preview_variant: RenderVariant,
 }
 
-struct TreeContextMenu {
-    node: NodeId,
+struct PathContextMenu {
+    path: PathBuf,
     position: (f32, f32),
 }
 
@@ -282,30 +454,25 @@ impl PictureBrowser {
         }
     }
 
-    fn new(
-        root: PathBuf,
-        image_cache_size: usize,
-        pair_preference: RawJpegPreference,
-        cache_root: PathBuf,
-        job_parallelism: usize,
-        raw_parallelism: usize,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let model = DirectoryModel::new(root);
+    fn new(config: &Config, cx: &mut Context<Self>) -> Self {
+        let model = DirectoryModel::new(config.root.clone());
         let root = model.root();
         let root_path = model.node(root).path.to_path_buf();
-        let job_limiter = JobLimiter::new(job_parallelism);
+        let job_limiter = JobLimiter::new(config.job_parallelism);
         let render_pipeline = RenderPipeline::with_source_cache_capacity(
-            cache_root.clone(),
-            job_parallelism,
-            raw_parallelism,
-            image_cache_size,
+            config.cache_root.clone(),
+            config.job_parallelism,
+            config.raw_parallelism,
+            config.image_cache_size,
         );
-        let metadata_loader =
-            MetadataLoader::new(cache_root.clone(), job_parallelism, job_limiter.clone());
+        let metadata_loader = MetadataLoader::new(
+            config.cache_root.clone(),
+            config.job_parallelism,
+            job_limiter.clone(),
+        );
         let render_job_limiter = job_limiter.clone();
         let scheduler = RenderScheduler::new(
-            job_parallelism,
+            config.job_parallelism,
             Arc::new(move |key, priority, cancelled| {
                 let Some(_permit) = render_job_limiter.acquire(
                     priority.class >= scheduler::PriorityClass::Visible,
@@ -313,11 +480,15 @@ impl PictureBrowser {
                 ) else {
                     return PreviewState::Error("render cancelled".into());
                 };
-                render_pipeline.render(
-                    key.path.clone(),
-                    key.variant,
-                    priority.class == scheduler::PriorityClass::Interactive,
-                    priority.class < scheduler::PriorityClass::Visible,
+                render_pipeline.render_with_recipe(
+                    RenderInvocation {
+                        path: key.path.clone(),
+                        variant: key.variant,
+                        render_identity: key.render_identity,
+                        recipe: key.recipe.as_deref(),
+                        interactive: priority.class == scheduler::PriorityClass::Interactive,
+                        durable_cache_write: priority.class < scheduler::PriorityClass::Visible,
+                    },
                     cancelled,
                 )
             }),
@@ -330,9 +501,9 @@ impl PictureBrowser {
             }],
             expanded: HashSet::from([root]),
             selected: root,
-            previews: PreviewCache::new(image_cache_size),
-            raw_previews: PreviewCache::new(image_cache_size),
-            thumbnails: PreviewCache::new(image_cache_size.saturating_mul(16).max(64)),
+            previews: PreviewCache::new(config.image_cache_size),
+            raw_previews: PreviewCache::new(config.image_cache_size),
+            thumbnails: PreviewCache::new(config.image_cache_size.saturating_mul(16).max(64)),
             main_view: MainView::Dir(root_path, ImageSelection::default()),
             saved_selection: ImageSelection::default(),
             thumbnail_width: DEFAULT_THUMBNAIL_WIDTH,
@@ -343,10 +514,10 @@ impl PictureBrowser {
             main_focus: cx.focus_handle(),
             sidebar_width: 300.0,
             resizing_sidebar: false,
-            pair_preference,
+            pair_preference: config.pair_preference,
             work: WorkProgress::default(),
             scheduler,
-            directory_scanner: DirectoryScanner::new(job_parallelism, job_limiter.clone()),
+            directory_scanner: DirectoryScanner::new(config.job_parallelism, job_limiter.clone()),
             grid_demand_epoch: 0,
             grid_prediction: None,
             scroll_direction: 1,
@@ -359,15 +530,37 @@ impl PictureBrowser {
             pending_grid_demand: None,
             grid_publish_scheduled: false,
             show_job_queue: false,
+            show_develop_inspector: false,
             show_view_menu: false,
             job_queue_snapshot: SchedulerSnapshot::default(),
             job_queue_scroll: UniformListScrollHandle::new(),
             scheduler_refresh_scheduled: false,
-            tree_context_menu: None,
+            path_context_menu: None,
+            system_clipboard: None,
             metadata_loader,
             metadata_load: None,
             scrollbar_drag: None,
+            recipes: None,
+            developed: true,
         };
+        this.work.start();
+        let catalog_root = config.root.clone();
+        let loading = cx
+            .background_executor()
+            .spawn(async move { catalog::load_recipes(&catalog_root) });
+        cx.spawn(async move |this, cx| {
+            let result = loading.await;
+            this.update(cx, |this, cx| {
+                this.work.finish();
+                this.recipes = Some(Arc::new(result.unwrap_or_else(|error| {
+                    eprintln!("cannot load Pics catalog: {error:#}");
+                    HashMap::new()
+                })));
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
         this.ensure_directory_loaded(root, DirectoryScanPriority::Interactive, cx);
         this
     }
@@ -642,6 +835,18 @@ impl PictureBrowser {
         }
     }
 
+    fn render_identity_for(&self, path: &std::path::Path) -> RenderIdentity {
+        self.developed
+            .then(|| self.recipes.as_ref()?.get(path))
+            .flatten()
+            .map(|entry| RenderIdentity {
+                mode: RenderMode::Developed,
+                recipe_digest: entry.digest,
+                renderer_model: catalog::RENDERER_MODEL_VERSION,
+            })
+            .unwrap_or_default()
+    }
+
     fn replace_render_scope(
         &mut self,
         scope: DemandScopeId,
@@ -660,12 +865,31 @@ impl PictureBrowser {
     ) {
         let mut requests = HashMap::new();
         let mut demands = Vec::new();
+        let Some(recipes) = self.recipes.clone() else {
+            return;
+        };
         for (path, variant, priority) in requested {
-            if !self.cache_for_variant(variant).needs_work(&path, variant) {
+            let render_identity = self.render_identity_for(&path);
+            if !self
+                .cache_for_variant(variant)
+                .needs_work_for(&path, variant, render_identity)
+            {
                 continue;
             }
-            let request = self.cache_for_variant_mut(variant).begin(&path, variant);
-            let key = JobKey { path, variant };
+            let request =
+                self.cache_for_variant_mut(variant)
+                    .begin_for(&path, variant, render_identity);
+            let recipe = self
+                .developed
+                .then(|| recipes.get(&path))
+                .flatten()
+                .map(|entry| Arc::new(entry.recipe.clone()));
+            let key = JobKey {
+                path,
+                variant,
+                render_identity,
+                recipe,
+            };
             if let Some(request) = request {
                 requests.insert(key.clone(), request);
             }
@@ -682,7 +906,12 @@ impl PictureBrowser {
             let Some(request) = requests.remove(&subscription.key) else {
                 continue;
             };
-            let JobKey { path, variant } = subscription.key;
+            let JobKey {
+                path,
+                variant,
+                render_identity,
+                ..
+            } = subscription.key;
             if track_progress {
                 self.work.start();
                 progress_started = true;
@@ -697,13 +926,21 @@ impl PictureBrowser {
                         Ok(JobCompletion::Finished(result)) => {
                             if let PreviewState::Loaded(preview) = &result {
                                 this.model
-                                    .record_render_metadata(path.clone(), preview.metadata);
+                                    .record_render_metadata(path.clone(), preview.metadata.clone());
                             }
-                            this.cache_for_variant_mut(variant)
-                                .finish(&path, request, result);
+                            this.cache_for_variant_mut(variant).finish_for(
+                                &path,
+                                render_identity,
+                                request,
+                                result,
+                            );
                         }
                         Ok(JobCompletion::Cancelled) | Err(_) => {
-                            this.cache_for_variant_mut(variant).cancel(&path, request);
+                            this.cache_for_variant_mut(variant).cancel_for(
+                                &path,
+                                render_identity,
+                                request,
+                            );
                         }
                     }
                     cx.notify();
@@ -1104,7 +1341,8 @@ impl PictureBrowser {
         // Interactive, so the scheduler promotes it above this retained work
         // and cooperatively preempts lower-priority running renders. Returning
         // to the grid can then resume instead of rebuilding an erased queue.
-        self.previews.mark_used(&path);
+        let identity = self.render_identity_for(&path);
+        self.previews.mark_used_for(&path, identity);
         cx.notify();
     }
 
@@ -1205,6 +1443,10 @@ impl PictureBrowser {
         if !event.dragging() {
             return;
         }
+        let identity = match &self.main_view {
+            MainView::Image(state) => self.render_identity_for(&state.path),
+            MainView::Dir(_, _) => return,
+        };
         let MainView::Image(state) = &mut self.main_view else {
             return;
         };
@@ -1218,7 +1460,7 @@ impl PictureBrowser {
         state.pan.0 += position.0 - previous.0;
         state.pan.1 += position.1 - previous.1;
 
-        if let PreviewState::Loaded(preview) = self.previews.state(&state.path) {
+        if let PreviewState::Loaded(preview) = self.previews.state_for(&state.path, identity) {
             let (image_width, image_height) = preview.metadata.output_dimensions;
             let viewport_width =
                 (f32::from(window.viewport_size().width) - self.sidebar_width - 5.0).max(0.0);
@@ -1288,7 +1530,8 @@ impl PictureBrowser {
                 }) {
                     let index = *index;
                     let path = path.clone();
-                    let image_content = match self.thumbnails.state(&path) {
+                    let identity = self.render_identity_for(&path);
+                    let image_content = match self.thumbnails.state_for(&path, identity) {
                         PreviewState::Loaded(preview) => img(preview.image.clone())
                             .max_w_full()
                             .max_h_full()
@@ -1304,7 +1547,9 @@ impl PictureBrowser {
                         .to_string_lossy()
                         .into_owned()
                         .into();
+                    let has_develop_data = has_develop_recipe(self.recipes.as_deref(), &path);
                     let open_path = path.clone();
+                    let context_path = path.clone();
                     row_element = row_element.child(
                         div()
                             .id(("thumbnail", index))
@@ -1331,7 +1576,43 @@ impl PictureBrowser {
                                     .justify_center()
                                     .child(image_content),
                             )
-                            .child(div().mt_2().truncate().text_xs().child(name))
+                            .child(
+                                div()
+                                    .mt_2()
+                                    .w_full()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .text_xs()
+                                    .child(div().min_w_0().flex_1().truncate().child(name))
+                                    .when(has_develop_data, |this| {
+                                        this.child(
+                                            div()
+                                                .flex_none()
+                                                .px_1()
+                                                .rounded_sm()
+                                                .bg(rgb(0x36547a))
+                                                .text_color(rgb(0xd7e7ff))
+                                                .child("D"),
+                                        )
+                                    }),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                    window.focus(&this.main_focus);
+                                    this.select_thumbnail(index, false, false, cx);
+                                    this.path_context_menu = Some(PathContextMenu {
+                                        path: context_path.clone(),
+                                        position: (
+                                            f32::from(event.position.x),
+                                            f32::from(event.position.y),
+                                        ),
+                                    });
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }),
+                            )
                             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                                 let modifiers = window.modifiers();
                                 window.focus(&this.main_focus);
@@ -1410,8 +1691,8 @@ impl PictureBrowser {
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                            this.tree_context_menu = Some(TreeContextMenu {
-                                node: select_node,
+                            this.path_context_menu = Some(PathContextMenu {
+                                path: this.model.node(select_node).path.to_path_buf(),
                                 position: (
                                     f32::from(event.position.x),
                                     f32::from(event.position.y),
@@ -1438,6 +1719,131 @@ impl PictureBrowser {
         self.show_view_menu = false;
         self.job_queue_snapshot = self.scheduler.snapshot();
         cx.notify();
+    }
+
+    fn copy_absolute_path(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        let text = path.to_string_lossy().into_owned();
+        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+        if self.system_clipboard.is_none() {
+            self.system_clipboard = arboard::Clipboard::new()
+                .map_err(|error| {
+                    eprintln!("cannot initialize clipboard fallback: {error}");
+                    error
+                })
+                .ok();
+        }
+        if let Some(clipboard) = &mut self.system_clipboard
+            && let Err(error) = clipboard.set_text(text)
+        {
+            eprintln!("cannot copy path through clipboard fallback: {error}");
+        }
+        self.path_context_menu = None;
+        cx.notify();
+    }
+
+    fn toggle_develop_inspector(
+        &mut self,
+        _: &ToggleDevelopInspector,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_develop_inspector = !self.show_develop_inspector;
+        self.show_view_menu = false;
+        cx.notify();
+    }
+
+    fn toggle_developed(&mut self, _: &ToggleDeveloped, _: &mut Window, cx: &mut Context<Self>) {
+        self.developed = !self.developed;
+        cx.notify();
+    }
+
+    fn inspected_image_path(&self) -> Option<PathBuf> {
+        match &self.main_view {
+            MainView::Image(state) => Some(state.path.clone()),
+            MainView::Dir(_, selection) => selection
+                .focused
+                .and_then(|index| self.selected_images().get(index).cloned()),
+        }
+    }
+
+    fn render_develop_inspector(&self) -> AnyElement {
+        let selected = self.inspected_image_path();
+        let recipe = selected
+            .as_ref()
+            .and_then(|path| self.recipes.as_ref()?.get(path));
+        let title = selected
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "No image selected".to_owned());
+        let rows = recipe
+            .map(|entry| format_develop_edits(&entry.recipe))
+            .unwrap_or_default();
+        let mut contents = div()
+            .id("develop-edit-rows")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .p_3()
+            .flex()
+            .flex_col()
+            .gap_2();
+        if self.recipes.is_none() {
+            contents = contents.child("Loading catalog…");
+        } else if selected.is_none() {
+            contents = contents.child("Select an image to inspect its develop edits.");
+        } else if recipe.is_none() {
+            contents = contents.child("This image has no imported develop data.");
+        } else if rows.is_empty() {
+            contents = contents.child("The imported recipe contains no active edits.");
+        } else {
+            for (name, value) in rows {
+                contents = contents.child(
+                    div()
+                        .pb_2()
+                        .border_b_1()
+                        .border_color(rgb(0x292d36))
+                        .child(div().text_xs().text_color(rgb(0x8d96a5)).child(name))
+                        .child(
+                            div()
+                                .mt_1()
+                                .text_sm()
+                                .text_color(rgb(0xd0d5df))
+                                .child(value),
+                        ),
+                );
+            }
+        }
+        div()
+            .w(px(DEVELOP_PANEL_WIDTH))
+            .h_full()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .bg(rgb(0x15171c))
+            .border_l_1()
+            .border_color(rgb(0x30343d))
+            .child(
+                div()
+                    .h(px(54.0))
+                    .flex_none()
+                    .px_3()
+                    .flex()
+                    .flex_col()
+                    .justify_center()
+                    .border_b_1()
+                    .border_color(rgb(0x30343d))
+                    .child("Develop edits")
+                    .child(
+                        div()
+                            .truncate()
+                            .text_xs()
+                            .text_color(rgb(0x9da7b6))
+                            .child(title),
+                    ),
+            )
+            .child(contents)
+            .into_any_element()
     }
 
     fn schedule_scheduler_refresh(&mut self, cx: &mut Context<Self>) {
@@ -1612,6 +2018,10 @@ impl Render for PictureBrowser {
             JOB_QUEUE_PANEL_WIDTH
         } else {
             0.0
+        } + if self.show_develop_inspector {
+            DEVELOP_PANEL_WIDTH
+        } else {
+            0.0
         };
         let main_width =
             (f32::from(window.viewport_size().width) - self.sidebar_width - inspector_width - 29.0)
@@ -1655,9 +2065,20 @@ impl Render for PictureBrowser {
             )
             .child(tree_scrollbar);
 
+        let has_active_recipe = self.developed
+            && match &self.main_view {
+                MainView::Image(state) => {
+                    self.render_identity_for(&state.path).mode == RenderMode::Developed
+                }
+                MainView::Dir(_, _) => self
+                    .selected_images()
+                    .iter()
+                    .any(|path| self.render_identity_for(path).mode == RenderMode::Developed),
+            };
         let (title, show_back, main_content) = match &self.main_view {
             MainView::Image(state) => {
                 let path = state.path.clone();
+                let context_path = path.clone();
                 let zoom = state.zoom;
                 let pan = state.pan;
                 let variant = if zoom == ZoomLevel::FitWindow && formats::is_raw(&path) {
@@ -1671,8 +2092,12 @@ impl Render for PictureBrowser {
                     cx,
                 );
                 let state = match variant {
-                    RenderVariant::Preview { .. } => self.raw_previews.state(&path),
-                    RenderVariant::Full => self.previews.state(&path),
+                    RenderVariant::Preview { .. } => self
+                        .raw_previews
+                        .state_for(&path, self.render_identity_for(&path)),
+                    RenderVariant::Full => self
+                        .previews
+                        .state_for(&path, self.render_identity_for(&path)),
                     RenderVariant::Thumbnail { .. } => unreachable!(),
                 };
                 let content = match state {
@@ -1723,6 +2148,20 @@ impl Render for PictureBrowser {
                             ZoomLevel::ActualSize => CursorStyle::OpenHand,
                         })
                         .on_mouse_down(MouseButton::Left, cx.listener(Self::image_mouse_down))
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                this.path_context_menu = Some(PathContextMenu {
+                                    path: context_path.clone(),
+                                    position: (
+                                        f32::from(event.position.x),
+                                        f32::from(event.position.y),
+                                    ),
+                                });
+                                cx.stop_propagation();
+                                cx.notify();
+                            }),
+                        )
                         .on_mouse_move(cx.listener(Self::image_mouse_move))
                         .on_mouse_up(MouseButton::Left, cx.listener(Self::image_mouse_up))
                         .child(content)
@@ -1870,7 +2309,31 @@ impl Render for PictureBrowser {
                                 })),
                         )
                     })
-                    .child(title),
+                    .child(title)
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id("toggle-developed")
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .bg(rgb(if has_active_recipe {
+                                0x36547a
+                            } else {
+                                0x30343d
+                            }))
+                            .hover(|this| this.bg(rgb(0x445066)))
+                            .child(if has_active_recipe {
+                                "Developed"
+                            } else if self.developed {
+                                "Baseline (no adjustments)"
+                            } else {
+                                "Baseline"
+                            })
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_developed(&ToggleDeveloped, window, cx);
+                            })),
+                    ),
             )
             .child(
                 div()
@@ -1894,6 +2357,9 @@ impl Render for PictureBrowser {
                     cx.notify();
                 }),
             );
+        let develop_inspector = self
+            .show_develop_inspector
+            .then(|| self.render_develop_inspector());
         let workspace = div()
             .w_full()
             .h_full()
@@ -1913,6 +2379,7 @@ impl Render for PictureBrowser {
             .child(tree)
             .child(splitter)
             .child(main_view)
+            .when_some(develop_inspector, |this, panel| this.child(panel))
             .when(self.show_job_queue, |this| {
                 this.child(
                     div()
@@ -2034,7 +2501,7 @@ impl Render for PictureBrowser {
                         ),
                 )
             });
-        let tree_context_menu = self.tree_context_menu.as_ref().map(|menu| {
+        let path_context_menu = self.path_context_menu.as_ref().map(|menu| {
             let viewport = window.viewport_size();
             let left = menu
                 .position
@@ -2044,7 +2511,7 @@ impl Render for PictureBrowser {
                 .position
                 .1
                 .min((f32::from(viewport.height) - 38.0).max(0.0));
-            (self.model.node(menu.node).path.to_path_buf(), left, top)
+            (menu.path.clone(), left, top)
         });
         div()
             .size_full()
@@ -2053,10 +2520,12 @@ impl Render for PictureBrowser {
             .flex_col()
             .key_context("PictureBrowser")
             .on_action(cx.listener(Self::toggle_job_queue))
+            .on_action(cx.listener(Self::toggle_develop_inspector))
+            .on_action(cx.listener(Self::toggle_developed))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
-                    if this.tree_context_menu.take().is_some() {
+                    if this.path_context_menu.take().is_some() {
                         cx.notify();
                     }
                 }),
@@ -2064,7 +2533,7 @@ impl Render for PictureBrowser {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|this, _, _, cx| {
-                    if this.tree_context_menu.take().is_some() {
+                    if this.path_context_menu.take().is_some() {
                         cx.notify();
                     }
                 }),
@@ -2100,10 +2569,33 @@ impl Render for PictureBrowser {
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.toggle_job_queue(&ToggleJobQueue, window, cx);
                                 })),
+                        )
+                        .child(
+                            div()
+                                .id("toggle-develop-inspector-menu-item")
+                                .h(px(28.0))
+                                .px_2()
+                                .flex()
+                                .items_center()
+                                .rounded_sm()
+                                .text_sm()
+                                .hover(|this| this.bg(rgb(0x3b4658)))
+                                .child(if self.show_develop_inspector {
+                                    "✓ Develop Edits"
+                                } else {
+                                    "Develop Edits"
+                                })
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.toggle_develop_inspector(
+                                        &ToggleDevelopInspector,
+                                        window,
+                                        cx,
+                                    );
+                                })),
                         ),
                 )
             })
-            .when_some(tree_context_menu, |this, (path, left, top)| {
+            .when_some(path_context_menu, |this, (path, left, top)| {
                 this.child(
                     div()
                         .absolute()
@@ -2124,7 +2616,7 @@ impl Render for PictureBrowser {
                         )
                         .child(
                             div()
-                                .id("copy-tree-path-menu-item")
+                                .id("copy-absolute-path-menu-item")
                                 .h(px(28.0))
                                 .px_2()
                                 .flex()
@@ -2133,13 +2625,13 @@ impl Render for PictureBrowser {
                                 .text_sm()
                                 .hover(|this| this.bg(rgb(0x3b4658)))
                                 .child("Copy Absolute Path")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(
-                                        path.to_string_lossy().into_owned(),
-                                    ));
-                                    this.tree_context_menu = None;
-                                    cx.notify();
-                                })),
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.copy_absolute_path(&path, cx);
+                                        cx.stop_propagation();
+                                    }),
+                                ),
                         ),
                 )
             })
@@ -2157,6 +2649,8 @@ struct Config {
     cache_root: PathBuf,
     job_parallelism: usize,
     raw_parallelism: usize,
+    import_lightroom: Option<PathBuf>,
+    apply_lightroom_import: bool,
 }
 
 fn config_from_args(args: impl IntoIterator<Item = OsString>) -> Result<Config> {
@@ -2170,6 +2664,8 @@ fn config_from_args(args: impl IntoIterator<Item = OsString>) -> Result<Config> 
         .map(|count| count.get().min(8))
         .unwrap_or(1);
     let mut requested_raw_parallelism = None;
+    let mut import_lightroom = None;
+    let mut apply_lightroom_import = false;
     while let Some(argument) = args.next() {
         if argument == "--image-cache-size" {
             let value = args
@@ -2210,6 +2706,13 @@ fn config_from_args(args: impl IntoIterator<Item = OsString>) -> Result<Config> 
                 Some(PathBuf::from(args.next().ok_or_else(|| {
                     anyhow::anyhow!("--cache-root requires a directory")
                 })?));
+        } else if argument == "--import-lightroom" {
+            import_lightroom =
+                Some(PathBuf::from(args.next().ok_or_else(|| {
+                    anyhow::anyhow!("--import-lightroom requires a .lrcat path")
+                })?));
+        } else if argument == "--apply-lightroom-import" {
+            apply_lightroom_import = true;
         } else if argument == "--cr3-jpeg-preference" {
             let value = args
                 .next()
@@ -2252,6 +2755,8 @@ fn config_from_args(args: impl IntoIterator<Item = OsString>) -> Result<Config> 
         cache_root,
         job_parallelism,
         raw_parallelism,
+        import_lightroom,
+        apply_lightroom_import,
     })
 }
 
@@ -2280,6 +2785,21 @@ fn recommended_raw_parallelism(
 
 fn main() -> Result<()> {
     let config = config_from_args(env::args_os())?;
+    if let Some(lightroom) = &config.import_lightroom {
+        let report = if config.apply_lightroom_import {
+            catalog::import_lightroom(&config.root, lightroom)?
+        } else {
+            catalog::analyze_lightroom(&config.root, lightroom)?
+        };
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        if !config.apply_lightroom_import {
+            eprintln!("dry run only; repeat with --apply-lightroom-import to commit this import");
+        }
+        return Ok(());
+    }
+    if config.apply_lightroom_import {
+        anyhow::bail!("--apply-lightroom-import requires --import-lightroom PATH");
+    }
     Application::new().run(move |cx: &mut App| {
         cx.bind_keys([
             KeyBinding::new("up", TreeUp, Some("DirectoryTree")),
@@ -2298,10 +2818,15 @@ fn main() -> Result<()> {
             KeyBinding::new("shift-up", GridExtendUp, Some("MainView")),
             KeyBinding::new("shift-down", GridExtendDown, Some("MainView")),
             KeyBinding::new("ctrl-shift-j", ToggleJobQueue, None),
+            KeyBinding::new("d", ToggleDeveloped, Some("MainView")),
         ]);
         cx.set_menus(vec![Menu {
             name: "View".into(),
-            items: vec![MenuItem::action("Job Queue", ToggleJobQueue)],
+            items: vec![
+                MenuItem::action("Developed / Baseline", ToggleDeveloped),
+                MenuItem::action("Develop Edits", ToggleDevelopInspector),
+                MenuItem::action("Job Queue", ToggleJobQueue),
+            ],
         }]);
         let bounds = Bounds::centered(None, size(px(1100.0), px(720.0)), cx);
         cx.open_window(
@@ -2309,19 +2834,7 @@ fn main() -> Result<()> {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| {
-                cx.new(|cx| {
-                    PictureBrowser::new(
-                        config.root.clone(),
-                        config.image_cache_size,
-                        config.pair_preference,
-                        config.cache_root.clone(),
-                        config.job_parallelism,
-                        config.raw_parallelism,
-                        cx,
-                    )
-                })
-            },
+            |_, cx| cx.new(|cx| PictureBrowser::new(&config, cx)),
         )
         .expect("failed to open window");
         cx.activate(true);
@@ -2335,6 +2848,73 @@ mod tests {
     use discovery::DirectoryScan;
     use futures::executor::block_on;
     use std::time::Instant;
+
+    #[test]
+    fn developed_marker_is_independent_of_the_rendering_toggle() {
+        let developed_path = PathBuf::from("/pictures/developed.CR3");
+        let baseline_path = PathBuf::from("/pictures/baseline.CR3");
+        let recipe = catalog::DevelopRecipe {
+            exposure_ev: Some(1.0),
+            ..catalog::DevelopRecipe::default()
+        };
+        let recipes = HashMap::from([(
+            developed_path.clone(),
+            catalog::RecipeEntry {
+                digest: recipe.digest().unwrap(),
+                recipe,
+            },
+        )]);
+
+        assert!(has_develop_recipe(Some(&recipes), &developed_path));
+        assert!(!has_develop_recipe(Some(&recipes), &baseline_path));
+        assert!(!has_develop_recipe(None, &developed_path));
+    }
+
+    #[test]
+    fn develop_inspector_formats_active_recipe_groups() {
+        let recipe = catalog::DevelopRecipe {
+            exposure_ev: Some(1.25),
+            white_balance: Some(catalog::WhiteBalance {
+                temperature: 6_500.0,
+                tint: 4.0,
+            }),
+            crop: Some(catalog::Crop {
+                left: 0.1,
+                top: 0.2,
+                right: 0.9,
+                bottom: 0.8,
+                angle_degrees: 1.5,
+                constrain_aspect: true,
+            }),
+            heal_spots: vec![catalog::HealSpot {
+                kind: catalog::HealKind::Clone,
+                destination: [0.5, 0.5],
+                source: [0.25, 0.25],
+                radius: 0.1,
+                opacity: 0.8,
+                feather: 0.2,
+            }],
+            grain: Some(catalog::GrainRecipe {
+                amount: 15.0,
+                size: 30.0,
+                roughness: 50.0,
+                seed: 42,
+            }),
+            ..catalog::DevelopRecipe::default()
+        };
+        let edits = format_develop_edits(&recipe);
+        let labels = edits
+            .iter()
+            .map(|(label, _)| label.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(labels.contains(&"Exposure"));
+        assert!(labels.contains(&"White balance"));
+        assert!(labels.contains(&"Crop"));
+        assert!(labels.contains(&"Clone spot 1"));
+        assert!(labels.contains(&"Grain"));
+        assert!(edits.iter().any(|(_, value)| value.contains("6500 K")));
+    }
 
     #[test]
     fn collapsing_a_branch_removes_all_descendant_rows() {
@@ -2652,6 +3232,8 @@ mod tests {
                         key: JobKey {
                             path: path.clone(),
                             variant,
+                            render_identity: RenderIdentity::default(),
+                            recipe: None,
                         },
                         priority: JobPriority::INTERACTIVE,
                         subscribe: true,
@@ -2738,6 +3320,8 @@ mod tests {
                         key: JobKey {
                             path: PathBuf::from(format!("overhead-{index}")),
                             variant: RenderVariant::Thumbnail { width: 300 },
+                            render_identity: RenderIdentity::default(),
+                            recipe: None,
                         },
                         priority: JobPriority::INTERACTIVE,
                         subscribe: true,
@@ -2822,6 +3406,8 @@ mod tests {
                         key: JobKey {
                             path,
                             variant: RenderVariant::Thumbnail { width: 300 },
+                            render_identity: RenderIdentity::default(),
+                            recipe: None,
                         },
                         priority: JobPriority::INTERACTIVE,
                         subscribe: true,
@@ -2855,6 +3441,8 @@ mod tests {
                     key: JobKey {
                         path: raw.clone(),
                         variant: RenderVariant::Thumbnail { width: 300 },
+                        render_identity: RenderIdentity::default(),
+                        recipe: None,
                     },
                     priority: JobPriority::INTERACTIVE,
                     subscribe: true,
@@ -2873,6 +3461,8 @@ mod tests {
                         key: JobKey {
                             path: jpeg.clone(),
                             variant: RenderVariant::Thumbnail { width: 300 },
+                            render_identity: RenderIdentity::default(),
+                            recipe: None,
                         },
                         priority: JobPriority::INTERACTIVE,
                         subscribe: true,

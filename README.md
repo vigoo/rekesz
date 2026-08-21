@@ -37,9 +37,12 @@ the platform renderer's support), plus Nikon NEF and Canon CR3 RAW files and
 iPhone HEIC/HEIF images.
 
 RAW files are developed into scene-linear sRGB before a camera-independent,
-histogram-based auto-exposure and filmic tone-mapping stage. Rendering settings
-are isolated from decoding and UI state so they can later be included in
-thumbnail and filesystem-cache keys.
+histogram-based auto-exposure and filmic tone-mapping stage. Auto-exposure is
+used for baseline rendering, but is disabled when an imported catalog recipe is
+active so it is not stacked on top of authored develop controls. Mandatory RAW
+normalization, white balance, camera calibration, tone mapping, and output
+encoding remain active. Rendering settings are isolated from decoding and UI
+state and are included in thumbnail and filesystem-cache keys.
 
 Images open fitted to the available window. Double-click the image to switch to
 1:1 pixels, then drag with the left mouse button to pan; double-click again to

@@ -258,7 +258,8 @@ fn cache_key(
     hasher.update(&identity.modified_seconds.to_le_bytes());
     hasher.update(&identity.modified_nanos.to_le_bytes());
     hasher.update(
-        &serde_json::to_vec(&(request.variant, settings)).map_err(|error| error.to_string())?,
+        &serde_json::to_vec(&(request.variant, request.identity, settings))
+            .map_err(|error| error.to_string())?,
     );
     Ok(hasher.finalize().to_hex().to_string())
 }
@@ -287,6 +288,7 @@ mod tests {
                 output_dimensions: (2, 1),
                 variant: request.variant,
                 orientation_applied: None,
+                develop: None,
             },
         };
         let settings = PhotographicSettings::default();
@@ -297,6 +299,104 @@ mod tests {
         let loaded = cache.load(&request, &identity, &settings).unwrap().unwrap();
         assert_eq!(loaded.image.width(), 2);
         assert_eq!(loaded.metadata, rendered.metadata);
+    }
+
+    #[test]
+    fn phase_d_recipe_and_action_metadata_round_trip() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.jpg");
+        fs::write(&source, b"source identity").unwrap();
+        let cache = DiskRenderCache::new(directory.path().join("cache"));
+        let recipe = crate::catalog::DevelopRecipe {
+            upright_homography: Some([1.0, 0.0, 0.05, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]),
+            lens_distortion: Some(10.0),
+            heal_spots: vec![crate::catalog::HealSpot {
+                kind: crate::catalog::HealKind::Heal,
+                destination: [1.0, 1.0],
+                source: [0.0, 0.0],
+                radius: 0.1,
+                opacity: 0.8,
+                feather: 0.25,
+            }],
+            grain: Some(crate::catalog::GrainRecipe {
+                amount: 20.0,
+                size: 30.0,
+                roughness: 50.0,
+                seed: 42,
+            }),
+            ..crate::catalog::DevelopRecipe::default()
+        };
+        let identity = super::super::RenderIdentity {
+            mode: super::super::RenderMode::Developed,
+            recipe_digest: recipe.digest().unwrap(),
+            renderer_model: crate::catalog::RENDERER_MODEL_VERSION,
+        };
+        let request = RenderRequest::with_identity(
+            source,
+            super::super::RenderVariant::Thumbnail { width: 300 },
+            identity,
+        );
+        let phase_d_actions = super::super::develop::actions::HEAL
+            | super::super::develop::actions::LENS
+            | super::super::develop::actions::UPRIGHT
+            | super::super::develop::actions::GRAIN;
+        let rendered = RenderedImage {
+            image: DynamicImage::ImageRgb8(ImageBuffer::from_pixel(2, 1, Rgb([1, 2, 3]))),
+            metadata: RenderMetadata {
+                source_pipeline: super::super::SourcePipeline::Standard,
+                photographic: None,
+                source_dimensions: (2, 1),
+                output_dimensions: (2, 1),
+                variant: request.variant,
+                orientation_applied: None,
+                develop: Some(super::super::DevelopRenderMetadata {
+                    identity,
+                    recipe,
+                    applied_actions: phase_d_actions,
+                    fidelity_warnings: super::super::develop::warnings::APPROXIMATED,
+                }),
+            },
+        };
+        let settings = PhotographicSettings::default();
+        let source_identity = source_identity(&request).unwrap().unwrap();
+        cache
+            .store(&request, &source_identity, &settings, &rendered)
+            .unwrap();
+        let loaded = cache
+            .load(&request, &source_identity, &settings)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.metadata, rendered.metadata);
+        assert_eq!(
+            loaded.metadata.develop.unwrap().applied_actions,
+            phase_d_actions
+        );
+    }
+
+    #[test]
+    fn recipe_and_mode_are_part_of_the_cache_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.jpg");
+        fs::write(&source, b"source").unwrap();
+        let baseline = RenderRequest::new(
+            source.clone(),
+            super::super::RenderVariant::Thumbnail { width: 300 },
+        );
+        let developed = RenderRequest::with_identity(
+            source,
+            baseline.variant,
+            super::super::RenderIdentity {
+                mode: super::super::RenderMode::Developed,
+                recipe_digest: [7; 32],
+                renderer_model: 1,
+            },
+        );
+        let identity = source_identity(&baseline).unwrap().unwrap();
+        let settings = PhotographicSettings::default();
+        assert_ne!(
+            cache_key(&baseline, &identity, &settings).unwrap(),
+            cache_key(&developed, &identity, &settings).unwrap()
+        );
     }
 
     #[test]
@@ -314,6 +414,7 @@ mod tests {
                 output_dimensions: (8, 8),
                 variant: super::super::RenderVariant::Thumbnail { width: 300 },
                 orientation_applied: None,
+                develop: None,
             },
         };
         let first = directory.path().join("first.jpg");

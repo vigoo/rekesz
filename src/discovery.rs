@@ -441,7 +441,9 @@ pub fn scan_directory(
         };
         let path = entry.path();
         if file_type.is_dir() {
-            directories.push(path);
+            if entry.file_name() != crate::catalog::CATALOG_DIR {
+                directories.push(path);
+            }
         } else if file_type.is_file() && is_supported_image(&path) {
             let modified = entry
                 .metadata()
@@ -548,6 +550,15 @@ mod tests {
         thread,
         time::{Duration, Instant, SystemTime},
     };
+
+    #[test]
+    fn reserved_catalog_directory_is_not_discovered() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join(crate::catalog::CATALOG_DIR)).unwrap();
+        fs::create_dir(root.path().join("visible")).unwrap();
+        let scan = scan_directory(root.path(), RawJpegPreference::Raw).unwrap();
+        assert_eq!(scan.directories, [root.path().join("visible")]);
+    }
 
     #[test]
     fn recognizes_raw_and_heif_extensions_case_insensitively() {

@@ -1,6 +1,7 @@
 use std::{
     cmp::Reverse,
     collections::{HashMap, HashSet},
+    hash::{Hash, Hasher},
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
     sync::{
@@ -14,12 +15,38 @@ use std::{
 use futures::channel::oneshot;
 use priority_queue::PriorityQueue;
 
-use crate::{preview::PreviewState, rendering::RenderVariant};
+use crate::{
+    catalog::DevelopRecipe,
+    preview::PreviewState,
+    rendering::{RenderIdentity, RenderVariant},
+};
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct JobKey {
     pub path: PathBuf,
     pub variant: RenderVariant,
+    pub render_identity: RenderIdentity,
+    /// Payload is excluded from key semantics; its canonical digest is already
+    /// part of `render_identity` and is verified before rendering.
+    pub recipe: Option<Arc<DevelopRecipe>>,
+}
+
+impl PartialEq for JobKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+            && self.variant == other.variant
+            && self.render_identity == other.render_identity
+    }
+}
+
+impl Eq for JobKey {}
+
+impl Hash for JobKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.path.hash(state);
+        self.variant.hash(state);
+        self.render_identity.hash(state);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -745,6 +772,8 @@ mod tests {
         JobKey {
             path: PathBuf::from(name),
             variant: RenderVariant::Thumbnail { width: 300 },
+            render_identity: RenderIdentity::default(),
+            recipe: None,
         }
     }
 

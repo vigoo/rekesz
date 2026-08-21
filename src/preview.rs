@@ -15,9 +15,11 @@ use image::{DynamicImage, Frame};
 
 use crate::discovery::RequestId;
 use crate::{
+    catalog::DevelopRecipe,
     formats::is_raw,
     rendering::{
-        RenderBackend, RenderMetadata, RenderRequest, RenderVariant, RenderedImage, SourceIdentity,
+        RenderBackend, RenderIdentity, RenderMetadata, RenderRequest, RenderVariant, RenderedImage,
+        SourceIdentity,
     },
 };
 
@@ -32,6 +34,15 @@ pub enum PreviewState {
 pub struct DecodedPreview {
     pub image: Arc<RenderImage>,
     pub metadata: RenderMetadata,
+}
+
+pub struct RenderInvocation<'a> {
+    pub path: PathBuf,
+    pub variant: RenderVariant,
+    pub render_identity: RenderIdentity,
+    pub recipe: Option<&'a DevelopRecipe>,
+    pub interactive: bool,
+    pub durable_cache_write: bool,
 }
 
 /// Blocking render stages and their independent resource limits. The scheduler
@@ -475,6 +486,7 @@ impl RenderPipeline {
         }
     }
 
+    #[cfg(test)]
     pub fn render(
         &self,
         path: PathBuf,
@@ -483,7 +495,41 @@ impl RenderPipeline {
         durable_cache_write: bool,
         cancelled: &Arc<AtomicBool>,
     ) -> PreviewState {
-        let request = RenderRequest::new(path.clone(), variant);
+        self.render_with_recipe(
+            RenderInvocation {
+                path,
+                variant,
+                render_identity: RenderIdentity::default(),
+                recipe: None,
+                interactive,
+                durable_cache_write,
+            },
+            cancelled,
+        )
+    }
+
+    pub fn render_with_recipe(
+        &self,
+        invocation: RenderInvocation<'_>,
+        cancelled: &Arc<AtomicBool>,
+    ) -> PreviewState {
+        let RenderInvocation {
+            path,
+            variant,
+            render_identity,
+            recipe,
+            interactive,
+            durable_cache_write,
+        } = invocation;
+        if render_identity.mode == crate::rendering::RenderMode::Developed {
+            let Some(recipe) = recipe else {
+                return PreviewState::Error("developed render is missing its recipe".into());
+            };
+            if recipe.digest().ok() != Some(render_identity.recipe_digest) {
+                return PreviewState::Error("developed render recipe digest mismatch".into());
+            }
+        }
+        let request = RenderRequest::with_identity(path.clone(), variant, render_identity);
         if cancelled.load(Ordering::Acquire) {
             return PreviewState::Error("render cancelled".into());
         }
@@ -560,8 +606,10 @@ impl RenderPipeline {
             };
             self.metrics.source_decode.record(decode_started);
             let transform_started = Instant::now();
-            let rendered =
-                decoded.and_then(|decoded| self.backend.render_source(variant, decoded, cancelled));
+            let rendered = decoded.and_then(|decoded| {
+                self.backend
+                    .render_source(variant, render_identity, recipe, decoded, cancelled)
+            });
             self.metrics.derivative_transform.record(transform_started);
             rendered
         };
@@ -602,15 +650,15 @@ fn decoded_preview(rendered: &RenderedImage, metrics: &PipelineMetrics) -> Previ
     metrics.ui_image_conversion.record(started);
     PreviewState::Loaded(Arc::new(DecodedPreview {
         image,
-        metadata: rendered.metadata,
+        metadata: rendered.metadata.clone(),
     }))
 }
 
 /// Independent resource cache. Future thumbnails and metadata can follow the
 /// same lifecycle without becoming part of the tree projection.
 pub struct PreviewCache {
-    entries: HashMap<PathBuf, PreviewState>,
-    last_used: HashMap<PathBuf, u64>,
+    entries: HashMap<(PathBuf, RenderIdentity), PreviewState>,
+    last_used: HashMap<(PathBuf, RenderIdentity), u64>,
     capacity: usize,
     next_request: RequestId,
     access_clock: u64,
@@ -628,79 +676,136 @@ impl PreviewCache {
         }
     }
 
+    #[cfg(test)]
     pub fn state(&self, path: &std::path::Path) -> PreviewState {
+        self.state_for(path, RenderIdentity::default())
+    }
+
+    pub fn state_for(&self, path: &std::path::Path, identity: RenderIdentity) -> PreviewState {
         self.entries
-            .get(path)
+            .get(&(path.to_path_buf(), identity))
             .cloned()
             .unwrap_or(PreviewState::Unloaded)
     }
 
+    #[cfg(test)]
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.last_used.clear();
+    }
+
+    #[cfg(test)]
     pub fn begin(&mut self, path: &std::path::Path, variant: RenderVariant) -> Option<RequestId> {
-        if matches!(self.state(path), PreviewState::Loaded(ref preview) if variant_satisfies(preview.metadata.variant, variant))
+        self.begin_for(path, variant, RenderIdentity::default())
+    }
+
+    pub fn begin_for(
+        &mut self,
+        path: &std::path::Path,
+        variant: RenderVariant,
+        identity: RenderIdentity,
+    ) -> Option<RequestId> {
+        if matches!(self.state_for(path, identity), PreviewState::Loaded(ref preview) if variant_satisfies(preview.metadata.variant, variant))
         {
-            self.touch(path);
+            self.touch(path, identity);
             return None;
         }
-        if matches!(self.state(path), PreviewState::Loaded(_)) {
-            self.entries.remove(path);
-            self.last_used.remove(path);
+        let key = (path.to_path_buf(), identity);
+        if matches!(self.state_for(path, identity), PreviewState::Loaded(_)) {
+            self.entries.remove(&key);
+            self.last_used.remove(&key);
         }
-        if !matches!(self.state(path), PreviewState::Unloaded) {
+        if !matches!(self.state_for(path, identity), PreviewState::Unloaded) {
             return None;
         }
         self.next_request += 1;
         let request = self.next_request;
-        self.touch(path);
-        self.entries
-            .insert(path.to_path_buf(), PreviewState::Loading(request));
+        self.touch(path, identity);
+        self.entries.insert(key, PreviewState::Loading(request));
         Some(request)
     }
 
-    pub fn needs_work(&self, path: &std::path::Path, variant: RenderVariant) -> bool {
-        match self.state(path) {
+    pub fn needs_work_for(
+        &self,
+        path: &std::path::Path,
+        variant: RenderVariant,
+        identity: RenderIdentity,
+    ) -> bool {
+        match self.state_for(path, identity) {
             PreviewState::Loaded(preview) => !variant_satisfies(preview.metadata.variant, variant),
             PreviewState::Unloaded | PreviewState::Loading(_) => true,
             PreviewState::Error(_) => false,
         }
     }
 
+    #[cfg(test)]
     pub fn cancel(&mut self, path: &std::path::Path, request: RequestId) -> bool {
-        if !matches!(self.state(path), PreviewState::Loading(active) if active == request) {
+        self.cancel_for(path, RenderIdentity::default(), request)
+    }
+
+    pub fn cancel_for(
+        &mut self,
+        path: &std::path::Path,
+        identity: RenderIdentity,
+        request: RequestId,
+    ) -> bool {
+        if !matches!(self.state_for(path, identity), PreviewState::Loading(active) if active == request)
+        {
             return false;
         }
-        self.entries.remove(path);
-        self.last_used.remove(path);
+        let key = (path.to_path_buf(), identity);
+        self.entries.remove(&key);
+        self.last_used.remove(&key);
         true
     }
 
+    #[cfg(test)]
     pub fn finish(
         &mut self,
         path: &std::path::Path,
         request: RequestId,
         result: PreviewState,
     ) -> bool {
-        if !matches!(self.state(path), PreviewState::Loading(active) if active == request) {
+        self.finish_for(path, RenderIdentity::default(), request, result)
+    }
+
+    pub fn finish_for(
+        &mut self,
+        path: &std::path::Path,
+        identity: RenderIdentity,
+        request: RequestId,
+        result: PreviewState,
+    ) -> bool {
+        if !matches!(self.state_for(path, identity), PreviewState::Loading(active) if active == request)
+        {
             return false;
         }
+        let key = (path.to_path_buf(), identity);
         let is_loaded = matches!(result, PreviewState::Loaded(_));
-        self.entries.insert(path.to_path_buf(), result);
+        self.entries.insert(key.clone(), result);
         if is_loaded {
             self.evict_over_capacity();
         } else {
-            self.last_used.remove(path);
+            self.last_used.remove(&key);
         }
         true
     }
 
+    #[cfg(test)]
     pub fn mark_used(&mut self, path: &std::path::Path) {
-        if matches!(self.state(path), PreviewState::Loaded(_)) {
-            self.touch(path);
+        self.mark_used_for(path, RenderIdentity::default());
+    }
+
+    pub fn mark_used_for(&mut self, path: &std::path::Path, identity: RenderIdentity) {
+        if matches!(self.state_for(path, identity), PreviewState::Loaded(_)) {
+            self.touch(path, identity);
         }
     }
 
-    fn touch(&mut self, path: &std::path::Path) {
+    fn touch(&mut self, path: &std::path::Path, identity: RenderIdentity) {
         self.access_clock += 1;
-        self.last_used.insert(path.to_path_buf(), self.access_clock);
+        self.last_used
+            .insert((path.to_path_buf(), identity), self.access_clock);
     }
 
     fn evict_over_capacity(&mut self) {
@@ -770,6 +875,7 @@ mod tests {
                 output_dimensions: (1, 1),
                 variant,
                 orientation_applied: None,
+                develop: None,
             },
         }))
     }
@@ -841,6 +947,81 @@ mod tests {
 
         assert!(matches!(cache.state(missing), PreviewState::Error(_)));
         assert!(matches!(cache.state(image), PreviewState::Loaded(_)));
+    }
+
+    #[test]
+    fn clearing_cache_rejects_a_completion_from_the_previous_mode() {
+        let mut cache = PreviewCache::new(1);
+        let path = Path::new("image");
+        let old_request = cache.begin(path, RenderVariant::Full).unwrap();
+        cache.clear();
+        let new_request = cache.begin(path, RenderVariant::Full).unwrap();
+
+        assert!(!cache.finish(path, old_request, image_state()));
+        assert!(matches!(cache.state(path), PreviewState::Loading(id) if id == new_request));
+    }
+
+    #[test]
+    fn baseline_and_developed_entries_coexist_in_memory() {
+        let mut cache = PreviewCache::new(2);
+        let path = Path::new("image");
+        let developed = RenderIdentity {
+            mode: crate::rendering::RenderMode::Developed,
+            recipe_digest: [7; 32],
+            renderer_model: crate::catalog::RENDERER_MODEL_VERSION,
+        };
+        let baseline_request = cache
+            .begin_for(path, RenderVariant::Full, RenderIdentity::default())
+            .unwrap();
+        cache.finish_for(
+            path,
+            RenderIdentity::default(),
+            baseline_request,
+            image_state(),
+        );
+        let developed_request = cache
+            .begin_for(path, RenderVariant::Full, developed)
+            .unwrap();
+        cache.finish_for(path, developed, developed_request, image_state());
+
+        assert!(matches!(
+            cache.state_for(path, RenderIdentity::default()),
+            PreviewState::Loaded(_)
+        ));
+        assert!(matches!(
+            cache.state_for(path, developed),
+            PreviewState::Loaded(_)
+        ));
+    }
+
+    #[test]
+    fn developed_pipeline_rejects_a_mismatched_recipe_digest() {
+        let directory = tempfile::tempdir().unwrap();
+        let pipeline =
+            RenderPipeline::with_source_cache_capacity(directory.path().join("cache"), 2, 1, 2);
+        let recipe = DevelopRecipe {
+            exposure_ev: Some(1.0),
+            ..DevelopRecipe::default()
+        };
+        let result = pipeline.render_with_recipe(
+            RenderInvocation {
+                path: directory.path().join("missing.jpg"),
+                variant: RenderVariant::Full,
+                render_identity: RenderIdentity {
+                    mode: crate::rendering::RenderMode::Developed,
+                    recipe_digest: [9; 32],
+                    renderer_model: crate::catalog::RENDERER_MODEL_VERSION,
+                },
+                recipe: Some(&recipe),
+                interactive: true,
+                durable_cache_write: false,
+            },
+            &Arc::new(AtomicBool::new(false)),
+        );
+
+        assert!(
+            matches!(result, PreviewState::Error(message) if message.contains("digest mismatch"))
+        );
     }
 
     #[test]
@@ -926,6 +1107,7 @@ mod tests {
                 output_dimensions: (1, 1),
                 variant: request.variant,
                 orientation_applied: None,
+                develop: None,
             },
         });
         let make_write = || CacheWrite {
@@ -1051,5 +1233,49 @@ mod tests {
         std::thread::sleep(Duration::from_millis(10));
         cancellation.store(true, Ordering::Release);
         assert!(matches!(worker.join().unwrap(), PreviewState::Error(_)));
+    }
+
+    #[test]
+    fn cr3_develop_metadata_records_actions_parameters_and_approximation() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test/IMG_0052.CR3");
+        if !path.exists() {
+            return;
+        }
+        let cache_root = tempfile::tempdir().unwrap();
+        let pipeline =
+            RenderPipeline::with_source_cache_capacity(cache_root.path().to_path_buf(), 2, 1, 1);
+        let recipe = DevelopRecipe {
+            shadows: Some(25.0),
+            ..DevelopRecipe::default()
+        };
+        let identity = RenderIdentity {
+            mode: crate::rendering::RenderMode::Developed,
+            recipe_digest: recipe.digest().unwrap(),
+            renderer_model: crate::catalog::RENDERER_MODEL_VERSION,
+        };
+        let result = pipeline.render_with_recipe(
+            RenderInvocation {
+                path,
+                variant: RenderVariant::Thumbnail { width: 64 },
+                render_identity: identity,
+                recipe: Some(&recipe),
+                interactive: true,
+                durable_cache_write: false,
+            },
+            &Arc::new(AtomicBool::new(false)),
+        );
+        let PreviewState::Loaded(preview) = result else {
+            panic!("developed CR3 did not render");
+        };
+        let metadata = preview.metadata.develop.as_ref().unwrap();
+        assert_eq!(metadata.recipe, recipe);
+        assert_ne!(
+            metadata.applied_actions & crate::rendering::develop::actions::BASIC_TONE,
+            0
+        );
+        assert_ne!(
+            metadata.fidelity_warnings & crate::rendering::develop::warnings::APPROXIMATED,
+            0
+        );
     }
 }

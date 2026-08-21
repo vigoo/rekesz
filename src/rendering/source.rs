@@ -12,6 +12,7 @@ use super::{AppliedPhotographicTransform, PhotographicSettings, RenderVariant, S
 
 pub(crate) struct DecodedSource {
     pub image: DynamicImage,
+    pub raw_linear: Option<super::photographic::DecodedRaw>,
     pub source_dimensions: (u32, u32),
     pub source_pipeline: SourcePipeline,
     pub photographic: Option<AppliedPhotographicTransform>,
@@ -20,8 +21,9 @@ pub(crate) struct DecodedSource {
 
 pub(super) fn decode(
     path: &Path,
-    raw_settings: &PhotographicSettings,
+    _raw_settings: &PhotographicSettings,
     variant: RenderVariant,
+    developed: bool,
     cancelled: &Arc<AtomicBool>,
 ) -> image::ImageResult<DecodedSource> {
     check_cancelled(cancelled)?;
@@ -30,6 +32,7 @@ pub(super) fn decode(
             .map(|image| DecodedSource {
                 source_dimensions: (image.width(), image.height()),
                 image,
+                raw_linear: None,
                 source_pipeline: SourcePipeline::Heif,
                 photographic: None,
                 orientation_applied: None,
@@ -37,18 +40,19 @@ pub(super) fn decode(
             .map_err(decoding_error);
     }
     if crate::formats::is_raw(path) {
-        return super::photographic::decode_raw(path, raw_settings, cancelled)
-            .map(|(image, photographic)| DecodedSource {
-                source_dimensions: (image.width(), image.height()),
-                image,
+        return super::photographic::decode_raw(path, cancelled)
+            .map(|raw| DecodedSource {
+                source_dimensions: raw.oriented_dimensions(),
+                image: DynamicImage::new_rgb8(1, 1),
                 source_pipeline: SourcePipeline::Raw,
-                photographic: Some(photographic),
-                orientation_applied: photographic.orientation_applied,
+                orientation_applied: raw.orientation.map(|value| value.to_exif()),
+                raw_linear: Some(raw),
+                photographic: None,
             })
             .map_err(decoding_error);
     }
 
-    if is_jpeg(path) && variant != RenderVariant::Full {
+    if is_jpeg(path) && variant != RenderVariant::Full && !developed {
         return decode_scaled_jpeg(path, variant, cancelled);
     }
 
@@ -62,6 +66,7 @@ pub(super) fn decode(
     Ok(DecodedSource {
         source_dimensions: (image.width(), image.height()),
         image,
+        raw_linear: None,
         source_pipeline: SourcePipeline::Standard,
         photographic: None,
         orientation_applied: Some(orientation.to_exif()),
@@ -139,6 +144,7 @@ fn decode_scaled_jpeg(
     }
     Ok(DecodedSource {
         image,
+        raw_linear: None,
         source_dimensions: (original.width.into(), original.height.into()),
         source_pipeline: SourcePipeline::Standard,
         photographic: None,
@@ -205,6 +211,7 @@ mod tests {
             &path,
             &PhotographicSettings::default(),
             RenderVariant::Thumbnail { width: 100 },
+            false,
             &Arc::new(AtomicBool::new(false)),
         )
         .unwrap();
@@ -212,5 +219,25 @@ mod tests {
         assert_eq!(decoded.source_dimensions, (800, 600));
         assert!(decoded.image.width() < 800);
         assert!(decoded.image.height() < 600);
+    }
+
+    #[test]
+    fn developed_jpeg_thumbnail_keeps_full_resolution_for_recipe_processing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("large.jpg");
+        DynamicImage::ImageRgb8(ImageBuffer::from_pixel(800, 600, Rgb([1, 2, 3])))
+            .save(&path)
+            .unwrap();
+        let decoded = decode(
+            &path,
+            &PhotographicSettings::default(),
+            RenderVariant::Thumbnail { width: 100 },
+            true,
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+
+        assert_eq!(decoded.image.width(), 800);
+        assert_eq!(decoded.image.height(), 600);
     }
 }

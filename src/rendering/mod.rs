@@ -4,6 +4,7 @@
 //! types so they can later become stable memory/disk-cache keys, while callers
 //! remain free to schedule work on any executor.
 
+pub(crate) mod develop;
 mod disk_cache;
 mod photographic;
 pub(crate) mod source;
@@ -16,6 +17,7 @@ use std::{
     },
 };
 
+use crate::catalog::DevelopRecipe;
 use image::DynamicImage;
 use serde::{Deserialize, Serialize};
 
@@ -26,12 +28,40 @@ pub use photographic::{AutoExposure, PhotographicSettings, ToneMapper};
 pub struct RenderRequest {
     pub path: PathBuf,
     pub variant: RenderVariant,
+    pub identity: RenderIdentity,
 }
 
 impl RenderRequest {
+    #[cfg(test)]
     pub fn new(path: PathBuf, variant: RenderVariant) -> Self {
-        Self { path, variant }
+        Self {
+            path,
+            variant,
+            identity: RenderIdentity::default(),
+        }
     }
+
+    pub fn with_identity(path: PathBuf, variant: RenderVariant, identity: RenderIdentity) -> Self {
+        Self {
+            path,
+            variant,
+            identity,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RenderMode {
+    #[default]
+    Baseline,
+    Developed,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RenderIdentity {
+    pub mode: RenderMode,
+    pub recipe_digest: [u8; 32],
+    pub renderer_model: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -62,7 +92,7 @@ pub struct AppliedPhotographicTransform {
     pub orientation_applied: Option<u8>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RenderMetadata {
     pub source_pipeline: SourcePipeline,
     pub photographic: Option<AppliedPhotographicTransform>,
@@ -71,6 +101,18 @@ pub struct RenderMetadata {
     pub variant: RenderVariant,
     /// EXIF orientation value applied before resizing, when known.
     pub orientation_applied: Option<u8>,
+    pub develop: Option<DevelopRenderMetadata>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DevelopRenderMetadata {
+    pub identity: RenderIdentity,
+    /// Exact normalized controls used to produce this cached derivative.
+    pub recipe: DevelopRecipe,
+    /// Stable bitset of normalized Pics actions applied by this renderer model.
+    pub applied_actions: u64,
+    /// Stable bitset of approximated, clamped, or skipped recipe behavior.
+    pub fidelity_warnings: u64,
 }
 
 #[derive(Clone)]
@@ -128,12 +170,21 @@ impl RenderBackend {
         request: &RenderRequest,
         cancelled: &Arc<AtomicBool>,
     ) -> image::ImageResult<Arc<source::DecodedSource>> {
-        source::decode(&request.path, &self.raw, request.variant, cancelled).map(Arc::new)
+        source::decode(
+            &request.path,
+            &self.raw,
+            request.variant,
+            request.identity.mode == RenderMode::Developed,
+            cancelled,
+        )
+        .map(Arc::new)
     }
 
     pub(crate) fn render_source(
         &self,
         variant: RenderVariant,
+        request_identity: RenderIdentity,
+        recipe: Option<&DevelopRecipe>,
         decoded: Arc<source::DecodedSource>,
         cancelled: &Arc<AtomicBool>,
     ) -> image::ImageResult<RenderedImage> {
@@ -146,13 +197,153 @@ impl RenderBackend {
             ));
         }
         let source_dimensions = decoded.source_dimensions;
+        let (source_image, photographic, raw_preapplied, raw_fidelity) = match &decoded.raw_linear {
+            Some(raw) => {
+                let (image, metadata) = photographic::render_raw(
+                    raw,
+                    &self.raw,
+                    (request_identity.mode == RenderMode::Developed)
+                        .then_some(recipe)
+                        .flatten(),
+                    cancelled,
+                )
+                .map_err(|error| {
+                    image::ImageError::Decoding(image::error::DecodingError::new(
+                        image::error::ImageFormatHint::Unknown,
+                        error,
+                    ))
+                })?;
+                let actions = recipe
+                    .filter(|_| request_identity.mode == RenderMode::Developed)
+                    .map(|recipe| {
+                        let mut actions = 0;
+                        if recipe.exposure_ev.is_some() {
+                            actions |= develop::actions::EXPOSURE;
+                        }
+                        if recipe.white_balance.is_some()
+                            || recipe.white_balance_increment.is_some()
+                        {
+                            actions |= develop::actions::WHITE_BALANCE;
+                        }
+                        if recipe.contrast.is_some()
+                            || recipe.highlights.is_some()
+                            || recipe.shadows.is_some()
+                            || recipe.whites.is_some()
+                            || recipe.blacks.is_some()
+                        {
+                            actions |= develop::actions::BASIC_TONE;
+                        }
+                        if recipe.saturation.is_some() || recipe.vibrance.is_some() {
+                            actions |= develop::actions::COLOR;
+                        }
+                        if recipe.tone_curve.is_some()
+                            || recipe.tone_curve_red.is_some()
+                            || recipe.tone_curve_green.is_some()
+                            || recipe.tone_curve_blue.is_some()
+                        {
+                            actions |= develop::actions::TONE_CURVE;
+                        }
+                        if recipe.detail.is_some() {
+                            actions |= develop::actions::DETAIL;
+                        }
+                        if recipe.texture.is_some() || recipe.dehaze.is_some() {
+                            actions |= develop::actions::TEXTURE_DEHAZE;
+                        }
+                        if recipe.monochrome.is_some() {
+                            actions |= develop::actions::MONOCHROME;
+                        }
+                        if recipe.parametric_curve.is_some() {
+                            actions |= develop::actions::PARAMETRIC_CURVE;
+                        }
+                        actions
+                    })
+                    .unwrap_or(0);
+                let approximate = recipe
+                    .filter(|_| request_identity.mode == RenderMode::Developed)
+                    .is_some_and(|recipe| {
+                        recipe.white_balance.is_some()
+                            || recipe.white_balance_increment.is_some()
+                            || recipe.contrast.is_some()
+                            || recipe.highlights.is_some()
+                            || recipe.shadows.is_some()
+                            || recipe.whites.is_some()
+                            || recipe.blacks.is_some()
+                            || recipe.saturation.is_some()
+                            || recipe.vibrance.is_some()
+                            || recipe.tone_curve.is_some()
+                            || recipe.tone_curve_red.is_some()
+                            || recipe.tone_curve_green.is_some()
+                            || recipe.tone_curve_blue.is_some()
+                            || recipe.detail.is_some()
+                            || recipe.texture.is_some()
+                            || recipe.dehaze.is_some()
+                            || recipe.monochrome.is_some()
+                            || recipe.parametric_curve.is_some()
+                    });
+                (
+                    image,
+                    Some(metadata),
+                    actions,
+                    if approximate {
+                        develop::warnings::APPROXIMATED
+                    } else {
+                        0
+                    },
+                )
+            }
+            None => (decoded.image.clone(), decoded.photographic, 0, 0),
+        };
+        let source_image = match (variant, recipe) {
+            (RenderVariant::Thumbnail { width }, None) => source_image.thumbnail(width, width),
+            (
+                RenderVariant::Preview {
+                    max_width,
+                    max_height,
+                },
+                None,
+            ) => source_image.thumbnail(max_width, max_height),
+            _ => source_image,
+        };
+        let post_recipe = recipe.map(|recipe| {
+            let mut recipe = recipe.clone();
+            if decoded.raw_linear.is_some() {
+                recipe.exposure_ev = None;
+                recipe.white_balance = None;
+                recipe.white_balance_increment = None;
+                recipe.contrast = None;
+                recipe.highlights = None;
+                recipe.shadows = None;
+                recipe.whites = None;
+                recipe.blacks = None;
+                recipe.saturation = None;
+                recipe.vibrance = None;
+                recipe.tone_curve = None;
+                recipe.tone_curve_red = None;
+                recipe.tone_curve_green = None;
+                recipe.tone_curve_blue = None;
+                recipe.detail = None;
+                recipe.texture = None;
+                recipe.dehaze = None;
+                recipe.monochrome = None;
+                recipe.parametric_curve = None;
+            }
+            recipe
+        });
+        let (developed, mut applied_actions, mut fidelity_warnings) = match post_recipe.as_ref() {
+            Some(recipe) if request_identity.mode == RenderMode::Developed => {
+                develop::apply(&source_image, recipe, cancelled)?
+            }
+            _ => (source_image, 0, 0),
+        };
+        applied_actions |= raw_preapplied;
+        fidelity_warnings |= raw_fidelity;
         let image = match variant {
-            RenderVariant::Full => decoded.image.clone(),
-            RenderVariant::Thumbnail { width } => decoded.image.thumbnail(width, width),
+            RenderVariant::Full => developed,
+            RenderVariant::Thumbnail { width } => developed.thumbnail(width, width),
             RenderVariant::Preview {
                 max_width,
                 max_height,
-            } => decoded.image.thumbnail(max_width, max_height),
+            } => developed.thumbnail(max_width, max_height),
         };
         if cancelled.load(Ordering::Acquire) {
             return Err(image::ImageError::Decoding(
@@ -167,11 +358,19 @@ impl RenderBackend {
             image,
             metadata: RenderMetadata {
                 source_pipeline: decoded.source_pipeline,
-                photographic: decoded.photographic,
+                photographic,
                 source_dimensions,
                 output_dimensions,
                 variant,
                 orientation_applied: decoded.orientation_applied,
+                develop: (request_identity.mode == RenderMode::Developed).then_some(
+                    DevelopRenderMetadata {
+                        identity: request_identity,
+                        recipe: recipe.cloned().unwrap_or_default(),
+                        applied_actions,
+                        fidelity_warnings,
+                    },
+                ),
             },
         })
     }
@@ -204,6 +403,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn developed_render_applies_recipe_and_records_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.png");
+        DynamicImage::ImageRgb8(ImageBuffer::from_pixel(8, 8, Rgb([64, 64, 64])))
+            .save(&source)
+            .unwrap();
+        let backend = RenderBackend::new(directory.path().join("cache"));
+        let recipe = DevelopRecipe {
+            exposure_ev: Some(1.0),
+            ..DevelopRecipe::default()
+        };
+        let identity = RenderIdentity {
+            mode: RenderMode::Developed,
+            recipe_digest: recipe.digest().unwrap(),
+            renderer_model: crate::catalog::RENDERER_MODEL_VERSION,
+        };
+        let request = RenderRequest::with_identity(source, RenderVariant::Full, identity);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let decoded = backend.decode_source(&request, &cancelled).unwrap();
+        let baseline = decoded.image.to_rgb8().get_pixel(0, 0)[0];
+
+        let rendered = backend
+            .render_source(
+                request.variant,
+                identity,
+                Some(&recipe),
+                decoded,
+                &cancelled,
+            )
+            .unwrap();
+
+        assert!(rendered.image.to_rgb8().get_pixel(0, 0)[0] > baseline);
+        let metadata = rendered.metadata.develop.unwrap();
+        assert_eq!(metadata.identity, identity);
+        assert_ne!(metadata.applied_actions & develop::actions::EXPOSURE, 0);
+    }
+
+    #[test]
     fn stale_render_is_not_stored_under_a_changed_source_identity() {
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("source.jpg");
@@ -220,6 +457,7 @@ mod tests {
                 output_dimensions: (1, 1),
                 variant: request.variant,
                 orientation_applied: None,
+                develop: None,
             },
         };
         thread::sleep(Duration::from_millis(2));
