@@ -1,16 +1,141 @@
 use std::{
+    cmp::Reverse,
     collections::HashMap,
     fs, io,
     path::{Path, PathBuf},
-    sync::Arc,
-    time::SystemTime,
+    sync::{Arc, Condvar, Mutex, atomic::AtomicBool},
 };
 
-use chrono::{Local, NaiveDateTime, TimeZone as _};
-
-use crate::rendering::{RenderMetadata, RenderVariant};
+use crate::{
+    jobs::JobLimiter,
+    metadata::ImageOrderingMetadata,
+    rendering::{RenderMetadata, RenderVariant},
+};
 
 pub type RequestId = u64;
+
+/// A small, independent permit pool for directory and metadata filesystem I/O.
+/// It prevents rapid tree expansion from consuming render-worker capacity or
+/// issuing an unbounded number of concurrent filesystem walks.
+#[derive(Clone)]
+pub struct DirectoryScanner {
+    permits: Arc<(Mutex<ScannerState>, Condvar)>,
+    capacity: usize,
+    limiter: JobLimiter,
+}
+
+struct ScannerState {
+    available: usize,
+    next_sequence: u64,
+    waiters: HashMap<PathBuf, ScanWaiter>,
+}
+
+#[derive(Clone, Copy)]
+struct ScanWaiter {
+    priority: DirectoryScanPriority,
+    sequence: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum DirectoryScanPriority {
+    Background,
+    Interactive,
+}
+
+struct DirectoryPermit<'a> {
+    scanner: &'a DirectoryScanner,
+}
+
+impl Drop for DirectoryPermit<'_> {
+    fn drop(&mut self) {
+        let (lock, wake) = &*self.scanner.permits;
+        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.available = (state.available + 1).min(self.scanner.capacity);
+        wake.notify_all();
+    }
+}
+
+impl DirectoryScanner {
+    pub fn new(capacity: usize, limiter: JobLimiter) -> Self {
+        Self {
+            permits: Arc::new((
+                Mutex::new(ScannerState {
+                    available: capacity.max(1),
+                    next_sequence: 0,
+                    waiters: HashMap::new(),
+                }),
+                Condvar::new(),
+            )),
+            capacity: capacity.max(1),
+            limiter,
+        }
+    }
+
+    pub fn promote(&self, path: &Path, priority: DirectoryScanPriority) {
+        let (lock, wake) = &*self.permits;
+        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(waiter) = state.waiters.get_mut(path) {
+            waiter.priority = waiter.priority.max(priority);
+            wake.notify_all();
+        }
+    }
+
+    pub fn scan(
+        &self,
+        path: &Path,
+        pair_preference: RawJpegPreference,
+        priority: DirectoryScanPriority,
+    ) -> Result<DirectoryScan, io::Error> {
+        let (lock, wake) = &*self.permits;
+        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let sequence = state.next_sequence;
+        state.next_sequence += 1;
+        state
+            .waiters
+            .insert(path.to_path_buf(), ScanWaiter { priority, sequence });
+        loop {
+            let next = state
+                .waiters
+                .iter()
+                .max_by_key(|(_, waiter)| (waiter.priority, Reverse(waiter.sequence)))
+                .map(|(path, _)| path.as_path());
+            let effective_priority = state
+                .waiters
+                .get(path)
+                .map(|waiter| waiter.priority)
+                .unwrap_or(priority);
+            // Keep one slot available for a newly selected directory whenever
+            // the configured capacity allows it. Already-running filesystem
+            // calls remain non-preemptible, but background expansion cannot
+            // occupy every scanner slot.
+            let has_capacity = match effective_priority {
+                DirectoryScanPriority::Interactive => state.available > 0,
+                DirectoryScanPriority::Background => {
+                    state.available > usize::from(self.capacity > 1)
+                }
+            };
+            if has_capacity && next == Some(path) {
+                state.waiters.remove(path);
+                state.available -= 1;
+                break;
+            }
+            state = wake
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        drop(state);
+        let _permit = DirectoryPermit { scanner: self };
+        let cancellation = AtomicBool::new(false);
+        let _job_permit = self
+            .limiter
+            .acquire(
+                priority == DirectoryScanPriority::Interactive,
+                &cancellation,
+            )
+            .expect("directory scans use a live cancellation token");
+        scan_directory(path, pair_preference)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct NodeId(pub(crate) usize);
@@ -46,6 +171,18 @@ pub enum DirectoryContents {
 pub struct LoadedDirectory {
     pub children: Vec<NodeId>,
     pub images: Vec<PathBuf>,
+    pub metadata_status: DirectoryMetadataStatus,
+    metadata_pending: Vec<PathBuf>,
+    ordering_metadata:
+        HashMap<PathBuf, (Option<std::time::SystemTime>, Option<std::time::SystemTime>)>,
+    pending_capture_order: Option<Vec<PathBuf>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectoryMetadataStatus {
+    Pending,
+    Loading(RequestId),
+    Complete,
 }
 
 /// The output of the only filesystem operation used to discover a directory.
@@ -137,7 +274,11 @@ impl DirectoryModel {
                     .collect();
                 self.nodes[id.0].contents = DirectoryContents::Loaded(LoadedDirectory {
                     children,
+                    metadata_pending: scan.images.clone(),
                     images: scan.images,
+                    metadata_status: DirectoryMetadataStatus::Pending,
+                    ordering_metadata: HashMap::new(),
+                    pending_capture_order: None,
                 });
             }
             Err(error) => {
@@ -145,6 +286,123 @@ impl DirectoryModel {
             }
         }
         true
+    }
+
+    pub fn begin_metadata_load(&mut self, id: NodeId) -> Option<(RequestId, Vec<PathBuf>)> {
+        let DirectoryContents::Loaded(contents) = &self.nodes[id.0].contents else {
+            return None;
+        };
+        if contents.metadata_status != DirectoryMetadataStatus::Pending {
+            return None;
+        }
+        self.next_request += 1;
+        let request = self.next_request;
+        let DirectoryContents::Loaded(contents) = &mut self.nodes[id.0].contents else {
+            unreachable!();
+        };
+        contents.metadata_status = DirectoryMetadataStatus::Loading(request);
+        Some((request, contents.metadata_pending.clone()))
+    }
+
+    pub fn apply_cached_metadata(
+        &mut self,
+        id: NodeId,
+        mut metadata: Vec<ImageOrderingMetadata>,
+        missing: Vec<PathBuf>,
+    ) -> bool {
+        let DirectoryContents::Loaded(contents) = &mut self.nodes[id.0].contents else {
+            return false;
+        };
+        for entry in &metadata {
+            contents.ordering_metadata.insert(
+                entry.path.clone(),
+                (entry.capture_time, entry.fallback_time),
+            );
+        }
+        sort_metadata(&mut metadata);
+        contents.images = metadata.into_iter().map(|entry| entry.path).collect();
+        contents.metadata_pending = missing;
+        contents.metadata_status = if contents.metadata_pending.is_empty() {
+            DirectoryMetadataStatus::Complete
+        } else {
+            DirectoryMetadataStatus::Pending
+        };
+        true
+    }
+
+    pub fn cancel_metadata_load(&mut self, id: NodeId, request: RequestId) {
+        if let DirectoryContents::Loaded(contents) = &mut self.nodes[id.0].contents
+            && contents.metadata_status == DirectoryMetadataStatus::Loading(request)
+        {
+            contents.metadata_status = DirectoryMetadataStatus::Pending;
+        }
+    }
+
+    pub fn finish_metadata_load(
+        &mut self,
+        id: NodeId,
+        request: RequestId,
+        metadata: Vec<ImageOrderingMetadata>,
+    ) -> bool {
+        let DirectoryContents::Loaded(contents) = &mut self.nodes[id.0].contents else {
+            return false;
+        };
+        if contents.metadata_status != DirectoryMetadataStatus::Loading(request) {
+            return false;
+        }
+        for entry in metadata {
+            contents
+                .ordering_metadata
+                .insert(entry.path, (entry.capture_time, entry.fallback_time));
+        }
+        let mut proposed = contents
+            .images
+            .iter()
+            .map(|path| {
+                let (capture_time, fallback_time) = contents
+                    .ordering_metadata
+                    .get(path)
+                    .copied()
+                    .unwrap_or((None, None));
+                ImageOrderingMetadata {
+                    path: path.clone(),
+                    capture_time,
+                    fallback_time,
+                }
+            })
+            .collect::<Vec<_>>();
+        sort_metadata(&mut proposed);
+        let proposed = proposed
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect::<Vec<_>>();
+        contents.pending_capture_order = (proposed != contents.images).then_some(proposed);
+        contents.metadata_pending.clear();
+        contents.metadata_status = DirectoryMetadataStatus::Complete;
+        true
+    }
+
+    pub fn has_pending_capture_order(&self, id: NodeId) -> bool {
+        self.loaded(id)
+            .is_some_and(|contents| contents.pending_capture_order.is_some())
+    }
+
+    pub fn apply_pending_capture_order(&mut self, id: NodeId) -> bool {
+        let Some(contents) = self.loaded_mut(id) else {
+            return false;
+        };
+        let Some(order) = contents.pending_capture_order.take() else {
+            return false;
+        };
+        contents.images = order;
+        true
+    }
+
+    fn loaded_mut(&mut self, id: NodeId) -> Option<&mut LoadedDirectory> {
+        match &mut self.nodes[id.0].contents {
+            DirectoryContents::Loaded(contents) => Some(contents),
+            _ => None,
+        }
     }
 
     fn insert_node(&mut self, path: PathBuf) -> NodeId {
@@ -185,18 +443,24 @@ pub fn scan_directory(
         if file_type.is_dir() {
             directories.push(path);
         } else if file_type.is_file() && is_supported_image(&path) {
-            image_paths.push(path);
+            let modified = entry
+                .metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok());
+            image_paths.push((modified, path));
         }
     }
-    let mut images = deduplicate_cr3_jpeg_pairs(image_paths, pair_preference)
-        .into_iter()
-        .map(|path| {
-            let created = fs::metadata(&path)
-                .ok()
-                .and_then(|metadata| metadata.created().ok());
-            (capture_time(&path).or(created), path)
-        })
-        .collect::<Vec<_>>();
+    let modified_by_path = image_paths
+        .iter()
+        .map(|(modified, path)| (path.clone(), *modified))
+        .collect::<HashMap<_, _>>();
+    let mut images = deduplicate_cr3_jpeg_pairs(
+        image_paths.into_iter().map(|(_, path)| path).collect(),
+        pair_preference,
+    )
+    .into_iter()
+    .map(|path| (modified_by_path.get(&path).copied().flatten(), path))
+    .collect::<Vec<_>>();
     directories.sort_by_cached_key(|path| sort_key(path));
     images.sort_by_cached_key(|(time, path)| (time.is_none(), *time, sort_key(path)));
     Ok(DirectoryScan {
@@ -253,52 +517,6 @@ fn has_extension(path: &Path, expected: &[&str]) -> bool {
     })
 }
 
-fn capture_time(path: &Path) -> Option<SystemTime> {
-    if crate::formats::is_raw(path) {
-        raw_capture_time(path).or_else(|| exif_capture_time(path))
-    } else {
-        exif_capture_time(path)
-    }
-}
-
-fn raw_capture_time(path: &Path) -> Option<SystemTime> {
-    use rawler::{decoders::RawDecodeParams, rawsource::RawSource};
-
-    let source = RawSource::new(path).ok()?;
-    let decoder = rawler::global_loader().get_decoder(&source).ok()?;
-    let metadata = decoder
-        .raw_metadata(&source, &RawDecodeParams::default())
-        .ok()?;
-    metadata
-        .exif
-        .date_time_original
-        .as_deref()
-        .and_then(parse_exif_time)
-}
-
-fn exif_capture_time(path: &Path) -> Option<SystemTime> {
-    use std::{fs::File, io::BufReader};
-
-    let file = File::open(path).ok()?;
-    let exif = exif::Reader::new()
-        .read_from_container(&mut BufReader::new(file))
-        .ok()?;
-    let field = exif.get_field(exif::Tag::DateTimeOriginal, exif::In::PRIMARY)?;
-    let exif::Value::Ascii(values) = &field.value else {
-        return None;
-    };
-    std::str::from_utf8(values.first()?)
-        .ok()
-        .map(|value| value.trim_matches(['\0', ' ']))
-        .and_then(parse_exif_time)
-}
-
-fn parse_exif_time(value: &str) -> Option<SystemTime> {
-    let naive = NaiveDateTime::parse_from_str(value, "%Y:%m:%d %H:%M:%S").ok()?;
-    let local = Local.from_local_datetime(&naive).earliest()?;
-    Some(local.into())
-}
-
 fn is_supported_image(path: &Path) -> bool {
     image::ImageFormat::from_path(path).is_ok()
         || crate::formats::is_raw(path)
@@ -312,9 +530,24 @@ fn sort_key(path: &Path) -> String {
         .to_lowercase()
 }
 
+fn sort_metadata(metadata: &mut [ImageOrderingMetadata]) {
+    metadata.sort_by_cached_key(|entry| {
+        (
+            entry.capture_time.or(entry.fallback_time).is_none(),
+            entry.capture_time.or(entry.fallback_time),
+            sort_key(&entry.path),
+        )
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        sync::mpsc,
+        thread,
+        time::{Duration, Instant, SystemTime},
+    };
 
     #[test]
     fn recognizes_raw_and_heif_extensions_case_insensitively() {
@@ -331,9 +564,66 @@ mod tests {
     }
 
     #[test]
-    fn parses_exif_capture_time() {
-        assert!(parse_exif_time("2026:07:24 14:17:45").is_some());
-        assert!(parse_exif_time("not a timestamp").is_none());
+    fn promoting_a_queued_directory_overtakes_background_scans() {
+        let root = tempfile::tempdir().unwrap();
+        let background_path = root.path().join("background");
+        let selected_path = root.path().join("selected");
+        fs::create_dir(&background_path).unwrap();
+        fs::create_dir(&selected_path).unwrap();
+
+        let scanner = DirectoryScanner::new(2, JobLimiter::new(2));
+        {
+            let (lock, _) = &*scanner.permits;
+            lock.lock().unwrap().available = 0;
+        }
+        let (finished_tx, finished_rx) = mpsc::channel();
+        for path in [background_path.clone(), selected_path.clone()] {
+            let scanner = scanner.clone();
+            let finished_tx = finished_tx.clone();
+            thread::spawn(move || {
+                scanner
+                    .scan(
+                        &path,
+                        RawJpegPreference::Raw,
+                        DirectoryScanPriority::Background,
+                    )
+                    .unwrap();
+                finished_tx.send(path).unwrap();
+            });
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let (lock, _) = &*scanner.permits;
+            if lock.lock().unwrap().waiters.len() == 2 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "scans did not enter the queue");
+            thread::yield_now();
+        }
+
+        scanner.promote(&selected_path, DirectoryScanPriority::Interactive);
+        {
+            let (lock, wake) = &*scanner.permits;
+            lock.lock().unwrap().available = 1;
+            wake.notify_all();
+        }
+        assert_eq!(
+            finished_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            selected_path
+        );
+
+        // Release the background-reserved capacity so the helper thread can
+        // finish instead of leaking into later tests.
+        {
+            let (lock, wake) = &*scanner.permits;
+            lock.lock().unwrap().available = 2;
+            wake.notify_all();
+        }
+        assert_eq!(
+            finished_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            background_path
+        );
     }
 
     #[test]
@@ -353,14 +643,6 @@ mod tests {
         let jpeg = deduplicate_cr3_jpeg_pairs(paths, RawJpegPreference::Jpeg);
         assert!(jpeg.contains(&PathBuf::from("IMG_1.JPG")));
         assert!(!jpeg.contains(&PathBuf::from("IMG_1.CR3")));
-    }
-
-    #[test]
-    fn reads_capture_time_from_the_cr3_regression_sample() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test/IMG_0052.CR3");
-        if path.exists() {
-            assert!(capture_time(&path).is_some());
-        }
     }
 
     #[test]
@@ -388,6 +670,123 @@ mod tests {
         let loaded = model.loaded(root).unwrap();
         assert_eq!(loaded.children.len(), 1);
         assert_eq!(loaded.images.len(), 1);
+    }
+
+    #[test]
+    fn newly_loaded_metadata_proposes_order_without_applying_it() {
+        let mut model = DirectoryModel::new(PathBuf::from("/pictures"));
+        let root = model.root();
+        let (request, _) = model.begin_load(root).unwrap();
+        model.finish_load(
+            root,
+            request,
+            Ok(DirectoryScan {
+                directories: Vec::new(),
+                images: vec![
+                    PathBuf::from("/pictures/later.jpg"),
+                    PathBuf::from("/pictures/earlier.jpg"),
+                ],
+            }),
+        );
+        let (request, _) = model.begin_metadata_load(root).unwrap();
+        assert!(model.finish_metadata_load(
+            root,
+            request,
+            vec![
+                ImageOrderingMetadata {
+                    path: PathBuf::from("/pictures/later.jpg"),
+                    capture_time: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
+                    fallback_time: None,
+                },
+                ImageOrderingMetadata {
+                    path: PathBuf::from("/pictures/earlier.jpg"),
+                    capture_time: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
+                    fallback_time: None,
+                },
+            ],
+        ));
+        assert_eq!(
+            model.loaded(root).unwrap().images,
+            vec![
+                PathBuf::from("/pictures/later.jpg"),
+                PathBuf::from("/pictures/earlier.jpg")
+            ]
+        );
+        assert!(model.has_pending_capture_order(root));
+        assert!(model.apply_pending_capture_order(root));
+        assert_eq!(
+            model.loaded(root).unwrap().images,
+            vec![
+                PathBuf::from("/pictures/earlier.jpg"),
+                PathBuf::from("/pictures/later.jpg")
+            ]
+        );
+    }
+
+    #[test]
+    fn cached_metadata_is_applied_to_the_initial_order() {
+        let mut model = DirectoryModel::new(PathBuf::from("/pictures"));
+        let root = model.root();
+        let (request, _) = model.begin_load(root).unwrap();
+        model.finish_load(
+            root,
+            request,
+            Ok(DirectoryScan {
+                directories: Vec::new(),
+                images: vec![
+                    PathBuf::from("/pictures/later.jpg"),
+                    PathBuf::from("/pictures/earlier.jpg"),
+                ],
+            }),
+        );
+        assert!(model.apply_cached_metadata(
+            root,
+            vec![
+                ImageOrderingMetadata {
+                    path: PathBuf::from("/pictures/later.jpg"),
+                    capture_time: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
+                    fallback_time: None,
+                },
+                ImageOrderingMetadata {
+                    path: PathBuf::from("/pictures/earlier.jpg"),
+                    capture_time: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
+                    fallback_time: None,
+                },
+            ],
+            Vec::new(),
+        ));
+        assert_eq!(
+            model.loaded(root).unwrap().images,
+            vec![
+                PathBuf::from("/pictures/earlier.jpg"),
+                PathBuf::from("/pictures/later.jpg")
+            ]
+        );
+        assert!(!model.has_pending_capture_order(root));
+    }
+
+    #[test]
+    fn initial_directory_order_uses_modification_time() {
+        let root = tempfile::tempdir().unwrap();
+        let later = root.path().join("later.jpg");
+        let earlier = root.path().join("earlier.jpg");
+        fs::write(&later, b"not decoded during enumeration").unwrap();
+        fs::write(&earlier, b"not decoded during enumeration").unwrap();
+        fs::File::open(&later)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
+            )
+            .unwrap();
+        fs::File::open(&earlier)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
+            )
+            .unwrap();
+
+        let scan = scan_directory(root.path(), RawJpegPreference::Raw).unwrap();
+        assert_eq!(scan.images, vec![earlier, later]);
     }
 
     #[test]

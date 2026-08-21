@@ -1,18 +1,30 @@
 # pics
 
 A small GPUI directory image browser. The left panel contains directories only;
-selecting one displays its first decodable image (sorted by filename).
+selecting one displays a virtual thumbnail grid ordered by capture time.
 
 ```sh
 cargo run --release -- --image-cache-size 8 /path/to/pictures
 ```
+
+Image rendering is managed by a keyed priority scheduler. Use
+`--job-parallelism N` to set the application-wide admission limit shared by
+rendering, directory discovery, and metadata enrichment (the default is at most
+two). One slot is reserved for foreground work when possible.
+`--render-parallelism N` remains a compatibility alias. Opened images have interactive priority;
+visible virtual-grid thumbnails are ordered center-first, and obsolete queued
+thumbnail demand is cancelled when scrolling or changing directories.
 
 Thumbnails and RAW fit-window previews are persisted in the operating system's
 application cache directory (`~/.cache/pics` on Linux). Use
 `--cache-root /path/to/cache` to override it. Entries are keyed by source path,
 modification time, file size, render dimensions, and rendering recipe; cached
 pixels and their transformation metadata are written atomically as PNG/JSON
-pairs before being reused by later sessions.
+pairs by a deferred maintenance writer and reused by later sessions. The disk
+cache uses access sidecars and a 10 GiB least-recently-used budget.
+
+Set `PICS_DIAGNOSTICS=1` to print aggregate scheduling latency, cancellation,
+and persistent-cache activity when the application shuts down.
 
 When a directory contains matching `name.CR3` and `name.JPG` files, the grid
 shows one item and uses CR3 by default. Pass `--cr3-jpeg-preference jpeg` to use
@@ -53,8 +65,10 @@ uses GPUI's virtual `uniform_list`, and collapsing a branch removes all of its
 descendants from the visible row projection. Revisiting a directory does not
 rescan it or decode the same preview again.
 
-A progress bar at the bottom tracks active directory scans and image/thumbnail
-renders, and disappears when the current batch has completed.
+A progress overlay at the bottom tracks currently active foreground directory
+scans and image/visible-thumbnail renders without changing the virtual grid's
+layout. Near-viewport and idle prediction remain deliberately absent from the
+foreground count.
 
 Successfully decoded images use a bounded least-recently-used cache. The
 default holds 8 images and can be changed with `--image-cache-size N`. Evicted

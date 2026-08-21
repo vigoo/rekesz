@@ -1,6 +1,12 @@
 //! Camera-independent photographic rendering of scene-linear RGB.
 
-use std::path::Path;
+use std::{
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use image::{DynamicImage, Rgb, RgbImage};
 use rawler::imgop::develop::{Intermediate, ProcessingStep, RawDevelop};
@@ -48,20 +54,25 @@ pub struct PhotographicSettings {
 pub(super) fn decode_raw(
     path: &Path,
     settings: &PhotographicSettings,
+    cancelled: &Arc<AtomicBool>,
 ) -> Result<(DynamicImage, AppliedPhotographicTransform), String> {
     use rawler::{decoders::RawDecodeParams, rawsource::RawSource};
 
     let source = RawSource::new(path).map_err(|error| error.to_string())?;
+    check_cancelled(cancelled)?;
     let decoder = rawler::global_loader()
         .get_decoder(&source)
         .map_err(|error| error.to_string())?;
     let params = RawDecodeParams::default();
+    let rawler_cancellation = rawler::cancel::CancellationToken::from_atomic(cancelled.clone());
     let metadata = decoder
         .raw_metadata(&source, &params)
         .map_err(|error| error.to_string())?;
+    check_cancelled(cancelled)?;
     let raw = decoder
-        .raw_image(&source, &params, false)
+        .raw_image_cancellable(&source, &params, false, &rawler_cancellation)
         .map_err(|error| error.to_string())?;
+    check_cancelled(cancelled)?;
     let orientation = metadata
         .exif
         .orientation
@@ -80,14 +91,18 @@ pub(super) fn decode_raw(
         ProcessingStep::CropDefault,
     ]);
     let intermediate = develop
-        .develop_intermediate(&raw)
+        .develop_intermediate_cancellable(&raw, &rawler_cancellation)
         .map_err(|error| error.to_string())?;
-    let (width, height, pixels) = linear_rgb(intermediate);
-    let (image, automatic_exposure_stops) = render_linear_rgb(width, height, pixels, settings);
+    check_cancelled(cancelled)?;
+    let (width, height, pixels) = linear_rgb(intermediate, cancelled)?;
+    let (image, automatic_exposure_stops) =
+        render_linear_rgb(width, height, pixels, settings, cancelled)?;
     let mut image = DynamicImage::ImageRgb8(image);
+    check_cancelled(cancelled)?;
     if let Some(orientation) = orientation {
         image.apply_orientation(orientation);
     }
+    check_cancelled(cancelled)?;
     Ok((
         image,
         AppliedPhotographicTransform {
@@ -100,28 +115,38 @@ pub(super) fn decode_raw(
     ))
 }
 
-fn linear_rgb(intermediate: Intermediate) -> (u32, u32, Vec<[f32; 3]>) {
-    match intermediate {
-        Intermediate::Monochrome(pixels) => (
-            pixels.width as u32,
-            pixels.height as u32,
-            pixels.data.into_iter().map(|v| [v, v, v]).collect(),
-        ),
+fn linear_rgb(
+    intermediate: Intermediate,
+    cancelled: &AtomicBool,
+) -> Result<(u32, u32, Vec<[f32; 3]>), String> {
+    check_cancelled(cancelled)?;
+    Ok(match intermediate {
+        Intermediate::Monochrome(pixels) => {
+            let mut converted = Vec::with_capacity(pixels.data.len());
+            for (index, value) in pixels.data.into_iter().enumerate() {
+                if index % 4096 == 0 {
+                    check_cancelled(cancelled)?;
+                }
+                converted.push([value, value, value]);
+            }
+            (pixels.width as u32, pixels.height as u32, converted)
+        }
         Intermediate::ThreeColor(pixels) => {
             (pixels.width as u32, pixels.height as u32, pixels.data)
         }
         // Calibration normally converts four sensor colors to RGB. Retaining a
         // graceful fallback makes this boundary robust to unusual decoders.
-        Intermediate::FourColor(pixels) => (
-            pixels.width as u32,
-            pixels.height as u32,
-            pixels
-                .data
-                .into_iter()
-                .map(|v| [v[0], v[1], v[2]])
-                .collect(),
-        ),
-    }
+        Intermediate::FourColor(pixels) => {
+            let mut converted = Vec::with_capacity(pixels.data.len());
+            for (index, value) in pixels.data.into_iter().enumerate() {
+                if index % 4096 == 0 {
+                    check_cancelled(cancelled)?;
+                }
+                converted.push([value[0], value[1], value[2]]);
+            }
+            (pixels.width as u32, pixels.height as u32, converted)
+        }
+    })
 }
 
 fn render_linear_rgb(
@@ -129,35 +154,44 @@ fn render_linear_rgb(
     height: u32,
     pixels: Vec<[f32; 3]>,
     settings: &PhotographicSettings,
-) -> (RgbImage, f32) {
-    let automatic = exposure_multiplier(&pixels, settings.auto_exposure);
+    cancelled: &AtomicBool,
+) -> Result<(RgbImage, f32), String> {
+    let automatic = exposure_multiplier(&pixels, settings.auto_exposure, cancelled)?;
     let exposure = automatic * 2.0_f32.powf(settings.exposure_compensation_stops);
-    let bytes = pixels
-        .into_iter()
-        .flat_map(|pixel| {
-            pixel.map(|channel| {
-                let linear = (channel.max(0.0) * exposure).max(0.0);
-                let mapped = match settings.tone_mapper {
-                    ToneMapper::AcesFitted => aces_fitted(linear),
-                };
-                (linear_to_srgb(mapped) * 255.0).round().clamp(0.0, 255.0) as u8
-            })
-        })
-        .collect();
-    (
+    let mut bytes = Vec::with_capacity(pixels.len().saturating_mul(3));
+    for (index, pixel) in pixels.into_iter().enumerate() {
+        if index % 4096 == 0 {
+            check_cancelled(cancelled)?;
+        }
+        bytes.extend(pixel.map(|channel| {
+            let linear = (channel.max(0.0) * exposure).max(0.0);
+            let mapped = match settings.tone_mapper {
+                ToneMapper::AcesFitted => aces_fitted(linear),
+            };
+            (linear_to_srgb(mapped) * 255.0).round().clamp(0.0, 255.0) as u8
+        }));
+    }
+    Ok((
         RgbImage::from_raw(width, height, bytes)
             .unwrap_or_else(|| RgbImage::from_pixel(1, 1, Rgb([0; 3]))),
         automatic.log2(),
-    )
+    ))
 }
 
-fn exposure_multiplier(pixels: &[[f32; 3]], settings: AutoExposure) -> f32 {
+fn exposure_multiplier(
+    pixels: &[[f32; 3]],
+    settings: AutoExposure,
+    cancelled: &AtomicBool,
+) -> Result<f32, String> {
     let mut histogram = [0_u32; HISTOGRAM_BINS];
     let mut samples = 0_u64;
     // At most roughly one million samples; the full-resolution transform still
     // visits every pixel, while statistics stay cheap for very large sensors.
     let stride = pixels.len().div_ceil(1_000_000).max(1);
-    for pixel in pixels.iter().step_by(stride) {
+    for (index, pixel) in pixels.iter().step_by(stride).enumerate() {
+        if index % 4096 == 0 {
+            check_cancelled(cancelled)?;
+        }
         let luminance = 0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2];
         if luminance.is_finite() && luminance > 0.0 {
             let normalized = ((luminance.log2() - MIN_LOG2_LUMINANCE)
@@ -169,7 +203,7 @@ fn exposure_multiplier(pixels: &[[f32; 3]], settings: AutoExposure) -> f32 {
         }
     }
     if samples == 0 {
-        return 1.0;
+        return Ok(1.0);
     }
     let wanted = (samples as f32 * settings.percentile.clamp(0.0, 1.0))
         .ceil()
@@ -187,7 +221,15 @@ fn exposure_multiplier(pixels: &[[f32; 3]], settings: AutoExposure) -> f32 {
     let stops = (settings.target.max(f32::MIN_POSITIVE) / log_luminance.exp2())
         .log2()
         .clamp(-settings.max_stops.abs(), settings.max_stops.abs());
-    stops.exp2()
+    Ok(stops.exp2())
+}
+
+fn check_cancelled(cancelled: &AtomicBool) -> Result<(), String> {
+    if cancelled.load(Ordering::Acquire) {
+        Err("render cancelled".into())
+    } else {
+        Ok(())
+    }
 }
 
 fn aces_fitted(value: f32) -> f32 {
@@ -212,14 +254,18 @@ mod tests {
     #[test]
     fn auto_exposure_places_middle_grey_at_the_target() {
         let pixels = vec![[0.045; 3]; 100];
-        let multiplier = exposure_multiplier(&pixels, AutoExposure::default());
+        let multiplier =
+            exposure_multiplier(&pixels, AutoExposure::default(), &AtomicBool::new(false)).unwrap();
         assert!((multiplier - 4.0).abs() < 0.1);
     }
 
     #[test]
     fn auto_exposure_is_bounded_for_nearly_black_scenes() {
         let pixels = vec![[0.000_001; 3]];
-        assert_eq!(exposure_multiplier(&pixels, AutoExposure::default()), 16.0);
+        assert_eq!(
+            exposure_multiplier(&pixels, AutoExposure::default(), &AtomicBool::new(false)).unwrap(),
+            16.0
+        );
     }
 
     #[test]
@@ -228,5 +274,20 @@ mod tests {
             let mapped = aces_fitted(value);
             assert!(mapped.is_finite() && (0.0..=1.0).contains(&mapped));
         }
+    }
+
+    #[test]
+    fn photographic_transform_observes_cancellation() {
+        let pixels = vec![[0.18; 3]; 10_000];
+        assert!(
+            render_linear_rgb(
+                100,
+                100,
+                pixels,
+                &PhotographicSettings::default(),
+                &AtomicBool::new(true),
+            )
+            .is_err()
+        );
     }
 }
