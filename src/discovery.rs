@@ -766,6 +766,41 @@ mod tests {
     }
 
     #[test]
+    fn metadata_that_keeps_the_current_order_does_not_offer_apply() {
+        let mut model = DirectoryModel::new(PathBuf::from("/pictures"));
+        let root = model.root();
+        let later = PathBuf::from("/pictures/later.jpg");
+        let earlier = PathBuf::from("/pictures/earlier.jpg");
+        let (request, _) = model.begin_load(root).unwrap();
+        model.finish_load(
+            root,
+            request,
+            Ok(DirectoryScan {
+                directories: Vec::new(),
+                images: vec![earlier.clone(), later.clone()],
+            }),
+        );
+        let (request, _) = model.begin_metadata_load(root).unwrap();
+        assert!(model.finish_metadata_load(
+            root,
+            request,
+            vec![
+                ImageOrderingMetadata {
+                    path: earlier,
+                    capture_time: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
+                    fallback_time: None,
+                },
+                ImageOrderingMetadata {
+                    path: later,
+                    capture_time: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
+                    fallback_time: None,
+                },
+            ],
+        ));
+        assert!(!model.has_pending_capture_order(root));
+    }
+
+    #[test]
     fn initial_directory_order_uses_modification_time() {
         let root = tempfile::tempdir().unwrap();
         let later = root.path().join("later.jpg");

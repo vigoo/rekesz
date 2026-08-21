@@ -147,12 +147,7 @@ impl MetadataLoader {
         let source_metadata = fs::metadata(&path).ok();
         let fallback_time = source_metadata
             .as_ref()
-            .and_then(|metadata| metadata.created().ok())
-            .or_else(|| {
-                source_metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.modified().ok())
-            });
+            .and_then(|metadata| metadata.modified().ok());
         let xmp_path = adjacent_xmp(&path);
         let key = metadata_cache_key(&path, xmp_path.as_deref()).ok();
         if let Some(cached) = key.as_deref().and_then(|key| self.load_cache(key)) {

@@ -13,11 +13,11 @@ use std::{
 
 use anyhow::Result;
 use gpui::{
-    App, AppContext as _, Application, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle,
-    FocusHandle, KeyBinding, ListSizingBehavior, Menu, MenuItem, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Render, ScrollStrategy, SharedString, UniformListScrollHandle,
-    Window, WindowBounds, WindowOptions, actions, div, img, prelude::*, px, relative, rgb, size,
-    uniform_list,
+    AnyElement, App, AppContext as _, Application, Bounds, ClickEvent, ClipboardItem, Context,
+    CursorStyle, FocusHandle, KeyBinding, ListSizingBehavior, Menu, MenuItem, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, ScrollStrategy, SharedString,
+    UniformListScrollHandle, Window, WindowBounds, WindowOptions, actions, canvas, div, img, point,
+    prelude::*, px, relative, rgb, size, uniform_list,
 };
 
 mod discovery;
@@ -215,6 +215,19 @@ struct PictureBrowser {
     tree_context_menu: Option<TreeContextMenu>,
     metadata_loader: MetadataLoader,
     metadata_load: Option<(NodeId, discovery::RequestId, Arc<AtomicBool>)>,
+    scrollbar_drag: Option<ScrollbarDrag>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScrollbarTarget {
+    Tree,
+    Grid,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScrollbarDrag {
+    target: ScrollbarTarget,
+    pointer_offset: gpui::Pixels,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -353,6 +366,7 @@ impl PictureBrowser {
             tree_context_menu: None,
             metadata_loader,
             metadata_load: None,
+            scrollbar_drag: None,
         };
         this.ensure_directory_loaded(root, DirectoryScanPriority::Interactive, cx);
         this
@@ -514,6 +528,102 @@ impl PictureBrowser {
         }
         self.reset_grid_prediction();
         cx.notify();
+    }
+
+    fn render_scrollbar(
+        &self,
+        id: &'static str,
+        target: ScrollbarTarget,
+        handle: &UniformListScrollHandle,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        const MIN_THUMB_HEIGHT: f32 = 28.0;
+        let base_handle = handle.0.borrow().base_handle.clone();
+        let viewport = base_handle.bounds();
+        let viewport_height = viewport.size.height;
+        let max_offset = base_handle.max_offset().height;
+        if viewport_height <= px(0.0) || max_offset <= px(0.0) {
+            return div().id(id).into_any_element();
+        }
+        let content_height = viewport_height + max_offset;
+        let thumb_height = (viewport_height * (viewport_height / content_height))
+            .clamp(px(MIN_THUMB_HEIGHT), viewport_height);
+        let travel = (viewport_height - thumb_height).max(px(0.0));
+        let scroll_offset = (-base_handle.offset().y).clamp(px(0.0), max_offset);
+        let thumb_top = if max_offset > px(0.0) {
+            travel * (scroll_offset / max_offset)
+        } else {
+            px(0.0)
+        };
+        let entity = cx.entity();
+        div()
+            .id(id)
+            .absolute()
+            .top(thumb_top)
+            .right_1()
+            .w(px(8.0))
+            .h(thumb_height)
+            .rounded_lg()
+            .bg(rgb(0x596273))
+            .hover(|this| this.bg(rgb(0x788397)))
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    move |thumb_bounds, _, window, _| {
+                        window.on_mouse_event({
+                            let entity = entity.clone();
+                            move |event: &MouseDownEvent, _, _, cx| {
+                                if !thumb_bounds.contains(&event.position) {
+                                    return;
+                                }
+                                entity.update(cx, |this, _| {
+                                    this.scrollbar_drag = Some(ScrollbarDrag {
+                                        target,
+                                        pointer_offset: event.position.y - thumb_bounds.origin.y,
+                                    });
+                                });
+                            }
+                        });
+                        window.on_mouse_event({
+                            let entity = entity.clone();
+                            move |_: &MouseUpEvent, _, _, cx| {
+                                entity.update(cx, |this, _| {
+                                    if this
+                                        .scrollbar_drag
+                                        .is_some_and(|drag| drag.target == target)
+                                    {
+                                        this.scrollbar_drag = None;
+                                    }
+                                });
+                            }
+                        });
+                        window.on_mouse_event(move |event: &MouseMoveEvent, _, _, cx| {
+                            if !event.dragging() {
+                                return;
+                            }
+                            let Some(drag) = entity
+                                .read(cx)
+                                .scrollbar_drag
+                                .filter(|drag| drag.target == target)
+                            else {
+                                return;
+                            };
+                            let thumb_top =
+                                (event.position.y - viewport.origin.y - drag.pointer_offset)
+                                    .clamp(px(0.0), travel);
+                            let offset = if travel > px(0.0) {
+                                max_offset * (thumb_top / travel)
+                            } else {
+                                px(0.0)
+                            };
+                            base_handle.set_offset(point(px(0.0), -offset));
+                            cx.notify(entity.entity_id());
+                        });
+                    },
+                )
+                .size_full(),
+            )
+            .into_any_element()
     }
 
     fn cache_for_variant(&self, variant: RenderVariant) -> &PreviewCache {
@@ -861,6 +971,7 @@ impl PictureBrowser {
     }
 
     fn select(&mut self, node: NodeId, cx: &mut Context<Self>) {
+        let directory_changed = self.selected != node;
         self.scheduler.clear_scope(GRID_SCOPE);
         self.scheduler.clear_scope(IMAGE_SCOPE);
         self.reset_grid_prediction();
@@ -870,6 +981,10 @@ impl PictureBrowser {
             self.model.node(node).path.to_path_buf(),
             ImageSelection::default(),
         );
+        if directory_changed {
+            self.thumbnail_scroll
+                .scroll_to_item_strict(0, ScrollStrategy::Top);
+        }
         self.saved_selection = ImageSelection::default();
         self.ensure_directory_loaded(node, DirectoryScanPriority::Interactive, cx);
         self.start_metadata_enrichment(node, cx);
@@ -1505,6 +1620,14 @@ impl Render for PictureBrowser {
             / (self.thumbnail_width as f32 + THUMBNAIL_GAP))
             .floor()
             .max(1.0) as usize;
+        let tree_scrollbar =
+            self.render_scrollbar("tree-scrollbar", ScrollbarTarget::Tree, &self.scroll, cx);
+        let grid_scrollbar = self.render_scrollbar(
+            "grid-scrollbar",
+            ScrollbarTarget::Grid,
+            &self.thumbnail_scroll,
+            cx,
+        );
         let tree = div()
             .id("directory-tree")
             .w(px(self.sidebar_width))
@@ -1519,6 +1642,7 @@ impl Render for PictureBrowser {
             .on_action(cx.listener(Self::tree_confirm))
             .bg(rgb(0x181a20))
             .py_2()
+            .relative()
             .child(
                 uniform_list(
                     "directory-rows",
@@ -1528,7 +1652,8 @@ impl Render for PictureBrowser {
                 .size_full()
                 .track_scroll(self.scroll.clone())
                 .with_sizing_behavior(ListSizingBehavior::Auto),
-            );
+            )
+            .child(tree_scrollbar);
 
         let (title, show_back, main_content) = match &self.main_view {
             MainView::Image(state) => {
@@ -1678,7 +1803,14 @@ impl Render for PictureBrowser {
                                 ),
                         )
                     })
-                    .child(div().flex_1().min_h_0().child(grid_content))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .relative()
+                            .child(grid_content)
+                            .child(grid_scrollbar),
+                    )
                     .into_any_element();
                 (
                     format!(
