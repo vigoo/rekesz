@@ -1,5 +1,9 @@
+// A custom test harness does not apply libtest's implicit dead-code and
+// unused-import allowances to the binary under test.
+#![cfg_attr(test, allow(dead_code, unused_imports))]
+
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     env,
     ffi::OsString,
     ops::Range,
@@ -15,9 +19,9 @@ use anyhow::Result;
 use gpui::{
     AnyElement, App, AppContext as _, Application, Bounds, ClickEvent, ClipboardItem, Context,
     CursorStyle, FocusHandle, KeyBinding, ListSizingBehavior, Menu, MenuItem, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, ScrollStrategy, SharedString,
-    UniformListScrollHandle, Window, WindowBounds, WindowOptions, actions, canvas, div, img, point,
-    prelude::*, px, relative, rgb, size, uniform_list,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, ScrollStrategy, ScrollWheelEvent,
+    SharedString, UniformListScrollHandle, Window, WindowBounds, WindowOptions, actions, canvas,
+    div, img, point, prelude::*, px, relative, rgb, size, uniform_list,
 };
 
 mod catalog;
@@ -38,7 +42,7 @@ use metadata::MetadataLoader;
 use preview::{PreviewCache, PreviewState, RenderInvocation, RenderPipeline};
 use rendering::{RenderIdentity, RenderMode, RenderVariant};
 use scheduler::{
-    DemandScopeId, JobCompletion, JobDemand, JobKey, JobPriority, JobSnapshotStatus,
+    DemandScopeId, JobCompletion, JobDemand, JobKey, JobPriority, JobSnapshotStatus, PriorityClass,
     RenderScheduler, SchedulerSnapshot,
 };
 
@@ -74,12 +78,15 @@ const GRID_SCOPE: DemandScopeId = DemandScopeId(2);
 const NEAR_GRID_SCOPE: DemandScopeId = DemandScopeId(3);
 const IDLE_PREFETCH_SCOPE: DemandScopeId = DemandScopeId(4);
 const FOCUSED_PREFETCH_SCOPE: DemandScopeId = DemandScopeId(5);
+const IMAGE_PREFETCH_SCOPE: DemandScopeId = DemandScopeId(6);
 const IDLE_PREFETCH_DELAY: Duration = Duration::from_millis(400);
 const IDLE_PREFETCH_BATCH: usize = 64;
+const IMAGE_PREFETCH_COUNT: usize = 4;
 const JOB_QUEUE_PANEL_WIDTH: f32 = 430.0;
 const DEVELOP_PANEL_WIDTH: f32 = 320.0;
 const SCHEDULER_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
-const USE_IN_WINDOW_MENU: bool = !cfg!(target_os = "macos");
+const USE_IN_WINDOW_MENU: bool = cfg!(target_os = "linux");
+const IMAGE_WHEEL_THRESHOLD_PX: f32 = 30.0;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct ImageSelection {
@@ -118,6 +125,7 @@ struct ImageViewState {
     zoom: ZoomLevel,
     pan: (f32, f32),
     drag_last: Option<(f32, f32)>,
+    wheel_delta_y: f32,
 }
 
 impl ImageViewState {
@@ -127,6 +135,7 @@ impl ImageViewState {
             zoom: ZoomLevel::FitWindow,
             pan: (0.0, 0.0),
             drag_last: None,
+            wheel_delta_y: 0.0,
         }
     }
 
@@ -156,19 +165,28 @@ struct WorkProgress {
     active: usize,
     completed: usize,
     total: usize,
+    next_id: u64,
+    activities: BTreeMap<u64, String>,
 }
 
 impl WorkProgress {
-    fn start(&mut self) {
+    fn start(&mut self, activity: impl Into<String>) -> u64 {
         if self.active == 0 {
             self.completed = 0;
             self.total = 0;
         }
         self.active += 1;
         self.total += 1;
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.activities.insert(id, activity.into());
+        id
     }
 
-    fn finish(&mut self) {
+    fn finish(&mut self, id: u64) {
+        if self.activities.remove(&id).is_none() {
+            return;
+        }
         self.active = self.active.saturating_sub(1);
         self.completed = (self.completed + 1).min(self.total);
     }
@@ -179,6 +197,12 @@ impl WorkProgress {
         } else {
             self.completed as f32 / self.total as f32
         }
+    }
+
+    fn current_activity(&self) -> Option<&str> {
+        self.activities
+            .last_key_value()
+            .map(|(_, label)| label.as_str())
     }
 }
 
@@ -202,6 +226,7 @@ struct PictureBrowser {
     resizing_sidebar: bool,
     pair_preference: RawJpegPreference,
     work: WorkProgress,
+    render_pipeline: RenderPipeline,
     scheduler: RenderScheduler,
     directory_scanner: DirectoryScanner,
     grid_demand_epoch: u64,
@@ -210,6 +235,7 @@ struct PictureBrowser {
     idle_prefetch_batch: usize,
     prefetch_preview_variant: RenderVariant,
     focused_prefetch_epoch: u64,
+    image_prefetch_epoch: u64,
     pending_grid_demand: Option<PendingGridDemand>,
     grid_publish_scheduled: bool,
     show_job_queue: bool,
@@ -219,6 +245,7 @@ struct PictureBrowser {
     job_queue_scroll: UniformListScrollHandle,
     scheduler_refresh_scheduled: bool,
     path_context_menu: Option<PathContextMenu>,
+    last_export_directory: Option<PathBuf>,
     system_clipboard: Option<arboard::Clipboard>,
     metadata_loader: MetadataLoader,
     metadata_load: Option<(NodeId, discovery::RequestId, Arc<AtomicBool>)>,
@@ -244,6 +271,102 @@ fn has_develop_recipe(
     path: &std::path::Path,
 ) -> bool {
     recipes.is_some_and(|recipes| recipes.contains_key(path))
+}
+
+fn path_display_name(path: &std::path::Path) -> String {
+    path.file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn adjacent_image_index(current: usize, image_count: usize, delta: isize) -> Option<usize> {
+    if image_count == 0 {
+        return None;
+    }
+    let target = current
+        .saturating_add_signed(delta)
+        .min(image_count.saturating_sub(1));
+    (target != current).then_some(target)
+}
+
+fn directional_adjacent_indices(
+    current: usize,
+    image_count: usize,
+    direction: isize,
+    count: usize,
+) -> Vec<usize> {
+    let mut indices = Vec::with_capacity(count);
+    let mut index = current;
+    for _ in 0..count {
+        let Some(next) = adjacent_image_index(index, image_count, direction) else {
+            break;
+        };
+        indices.push(next);
+        index = next;
+    }
+    indices
+}
+
+fn render_activity_label(
+    path: &std::path::Path,
+    variant: RenderVariant,
+    mode: RenderMode,
+    status: JobSnapshotStatus,
+) -> String {
+    let action = match status {
+        JobSnapshotStatus::Running => "Rendering",
+        JobSnapshotStatus::Queued | JobSnapshotStatus::PendingSuccessor => "Preparing",
+    };
+    let stage = match (variant, mode) {
+        (RenderVariant::Full, RenderMode::Developed) => "developed image",
+        (RenderVariant::Full, RenderMode::Baseline) => "full image",
+        (RenderVariant::Preview { .. }, RenderMode::Developed) => "developed preview",
+        (RenderVariant::Preview { .. }, RenderMode::Baseline) => "preview",
+        (RenderVariant::Thumbnail { .. }, RenderMode::Developed) => "developed thumbnail",
+        (RenderVariant::Thumbnail { .. }, RenderMode::Baseline) => "thumbnail",
+    };
+    format!("{action} {stage}: {}…", path_display_name(path))
+}
+
+fn scheduler_progress_label(snapshot: &SchedulerSnapshot) -> Option<String> {
+    let jobs = snapshot
+        .jobs
+        .iter()
+        .filter(|job| !job.cancelled)
+        .collect::<Vec<_>>();
+    let current = jobs
+        .iter()
+        .find(|job| {
+            job.status == JobSnapshotStatus::Running && job.priority.class >= PriorityClass::Visible
+        })
+        .or_else(|| {
+            jobs.iter()
+                .find(|job| job.status == JobSnapshotStatus::Running)
+        })
+        .or_else(|| {
+            jobs.iter()
+                .find(|job| job.priority.class >= PriorityClass::Visible)
+        })
+        .or_else(|| jobs.first())?;
+    let mut label = render_activity_label(
+        &current.key.path,
+        current.key.variant,
+        current.key.render_identity.mode,
+        current.status,
+    );
+    if current.priority.class < PriorityClass::Visible {
+        label = match current.status {
+            JobSnapshotStatus::Running => label.replacen("Rendering", "Pre-rendering", 1),
+            JobSnapshotStatus::Queued | JobSnapshotStatus::PendingSuccessor => {
+                label.replacen("Preparing", "Waiting to pre-render", 1)
+            }
+        };
+    }
+    if jobs.len() > 1 {
+        label.push_str(&format!(" ({} more)", jobs.len() - 1));
+    }
+    Some(label)
 }
 
 fn format_develop_edits(recipe: &catalog::DevelopRecipe) -> Vec<(String, String)> {
@@ -422,6 +545,7 @@ struct PendingGridDemand {
 struct PathContextMenu {
     path: PathBuf,
     position: (f32, f32),
+    exportable: bool,
 }
 
 fn merge_grid_demand(slot: &mut Option<PendingGridDemand>, next: PendingGridDemand) {
@@ -471,6 +595,7 @@ impl PictureBrowser {
             job_limiter.clone(),
         );
         let render_job_limiter = job_limiter.clone();
+        let scheduler_pipeline = render_pipeline.clone();
         let scheduler = RenderScheduler::new(
             config.job_parallelism,
             Arc::new(move |key, priority, cancelled| {
@@ -480,7 +605,7 @@ impl PictureBrowser {
                 ) else {
                     return PreviewState::Error("render cancelled".into());
                 };
-                render_pipeline.render_with_recipe(
+                scheduler_pipeline.render_with_recipe(
                     RenderInvocation {
                         path: key.path.clone(),
                         variant: key.variant,
@@ -516,6 +641,7 @@ impl PictureBrowser {
             resizing_sidebar: false,
             pair_preference: config.pair_preference,
             work: WorkProgress::default(),
+            render_pipeline,
             scheduler,
             directory_scanner: DirectoryScanner::new(config.job_parallelism, job_limiter.clone()),
             grid_demand_epoch: 0,
@@ -527,6 +653,7 @@ impl PictureBrowser {
                 max_height: 1080,
             },
             focused_prefetch_epoch: 0,
+            image_prefetch_epoch: 0,
             pending_grid_demand: None,
             grid_publish_scheduled: false,
             show_job_queue: false,
@@ -536,6 +663,7 @@ impl PictureBrowser {
             job_queue_scroll: UniformListScrollHandle::new(),
             scheduler_refresh_scheduled: false,
             path_context_menu: None,
+            last_export_directory: None,
             system_clipboard: None,
             metadata_loader,
             metadata_load: None,
@@ -543,7 +671,7 @@ impl PictureBrowser {
             recipes: None,
             developed: true,
         };
-        this.work.start();
+        let catalog_work = this.work.start("Loading develop catalog…");
         let catalog_root = config.root.clone();
         let loading = cx
             .background_executor()
@@ -551,7 +679,7 @@ impl PictureBrowser {
         cx.spawn(async move |this, cx| {
             let result = loading.await;
             this.update(cx, |this, cx| {
-                this.work.finish();
+                this.work.finish(catalog_work);
                 this.recipes = Some(Arc::new(result.unwrap_or_else(|error| {
                     eprintln!("cannot load Pics catalog: {error:#}");
                     HashMap::new()
@@ -576,7 +704,9 @@ impl PictureBrowser {
             self.directory_scanner.promote(&node_path, priority);
             return;
         };
-        self.work.start();
+        let scan_work = self
+            .work
+            .start(format!("Scanning {}…", path_display_name(&path)));
         cx.notify();
         let pair_preference = self.pair_preference;
         let scanner = self.directory_scanner.clone();
@@ -590,7 +720,7 @@ impl PictureBrowser {
         cx.spawn(async move |this, cx| {
             let result = scan.await;
             this.update(cx, |this, cx| {
-                this.work.finish();
+                this.work.finish(scan_work);
                 let loaded = match result {
                     Ok((scan, cached_metadata, missing_metadata)) => {
                         let loaded = this.model.finish_load(node, request, Ok(scan));
@@ -646,7 +776,9 @@ impl PictureBrowser {
         };
         let cancelled = Arc::new(AtomicBool::new(false));
         self.metadata_load = Some((node, request, cancelled.clone()));
-        self.work.start();
+        let metadata_work = self
+            .work
+            .start(format!("Reading metadata for {} images…", paths.len()));
         cx.notify();
         let loader = self.metadata_loader.clone();
         let task_cancelled = cancelled.clone();
@@ -654,7 +786,7 @@ impl PictureBrowser {
         cx.spawn(async move |this, cx| {
             let metadata = load.await;
             this.update(cx, |this, cx| {
-                this.work.finish();
+                this.work.finish(metadata_work);
                 let is_active =
                     this.metadata_load
                         .as_ref()
@@ -912,15 +1044,22 @@ impl PictureBrowser {
                 render_identity,
                 ..
             } = subscription.key;
+            let render_work = track_progress.then(|| {
+                self.work.start(render_activity_label(
+                    &path,
+                    variant,
+                    render_identity.mode,
+                    JobSnapshotStatus::Running,
+                ))
+            });
             if track_progress {
-                self.work.start();
                 progress_started = true;
             }
             cx.spawn(async move |this, cx| {
                 let completion = subscription.receiver.await;
                 this.update(cx, |this, cx| {
-                    if track_progress {
-                        this.work.finish();
+                    if let Some(render_work) = render_work {
+                        this.work.finish(render_work);
                     }
                     match completion {
                         Ok(JobCompletion::Finished(result)) => {
@@ -970,11 +1109,13 @@ impl PictureBrowser {
     fn reset_grid_prediction(&mut self) {
         self.grid_demand_epoch = self.grid_demand_epoch.wrapping_add(1);
         self.focused_prefetch_epoch = self.focused_prefetch_epoch.wrapping_add(1);
+        self.image_prefetch_epoch = self.image_prefetch_epoch.wrapping_add(1);
         self.grid_prediction = None;
         self.idle_prefetch_batch = 0;
         self.scheduler.clear_scope(NEAR_GRID_SCOPE);
         self.scheduler.clear_scope(IDLE_PREFETCH_SCOPE);
         self.scheduler.clear_scope(FOCUSED_PREFETCH_SCOPE);
+        self.scheduler.clear_scope(IMAGE_PREFETCH_SCOPE);
         self.pending_grid_demand = None;
     }
 
@@ -1207,6 +1348,85 @@ impl PictureBrowser {
         .detach();
     }
 
+    fn schedule_image_prefetch(
+        &mut self,
+        current_path: PathBuf,
+        direction: isize,
+        preview_variant: RenderVariant,
+        cx: &mut Context<Self>,
+    ) {
+        self.image_prefetch_epoch = self.image_prefetch_epoch.wrapping_add(1);
+        let epoch = self.image_prefetch_epoch;
+        self.scheduler.clear_scope(IMAGE_PREFETCH_SCOPE);
+        self.schedule_image_prefetch_epoch(epoch, current_path, direction, preview_variant, cx);
+    }
+
+    fn schedule_image_prefetch_epoch(
+        &self,
+        epoch: u64,
+        current_path: PathBuf,
+        direction: isize,
+        preview_variant: RenderVariant,
+        cx: &mut Context<Self>,
+    ) {
+        let timer = cx.background_executor().timer(IDLE_PREFETCH_DELAY);
+        cx.spawn(async move |this, cx| {
+            timer.await;
+            this.update(cx, |this, cx| {
+                if epoch != this.image_prefetch_epoch
+                    || !matches!(this.main_view, MainView::Image(_))
+                {
+                    return;
+                }
+                if this.scheduler.has_foreground_work() {
+                    this.schedule_image_prefetch_epoch(
+                        epoch,
+                        current_path,
+                        direction,
+                        preview_variant,
+                        cx,
+                    );
+                    return;
+                }
+                let images = this.selected_images();
+                let MainView::Image(state) = &this.main_view else {
+                    return;
+                };
+                if state.path != current_path {
+                    return;
+                }
+                let Some(current) = images.iter().position(|path| path == &current_path) else {
+                    return;
+                };
+                let demands = directional_adjacent_indices(
+                    current,
+                    images.len(),
+                    direction,
+                    IMAGE_PREFETCH_COUNT,
+                )
+                .into_iter()
+                .enumerate()
+                .map(|(rank, index)| {
+                    let path = images[index].clone();
+                    let variant = if formats::is_raw(&path) {
+                        preview_variant
+                    } else {
+                        RenderVariant::Full
+                    };
+                    (
+                        path,
+                        variant,
+                        JobPriority::speculative(-(rank.min(i32::MAX as usize) as i32)),
+                    )
+                })
+                .collect();
+                this.replace_background_scope(IMAGE_PREFETCH_SCOPE, demands, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn select(&mut self, node: NodeId, cx: &mut Context<Self>) {
         let directory_changed = self.selected != node;
         self.scheduler.clear_scope(GRID_SCOPE);
@@ -1336,11 +1556,17 @@ impl PictureBrowser {
         if let MainView::Dir(_, selection) = &self.main_view {
             self.saved_selection = selection.clone();
         }
+        // Full-screen navigation owns background prediction. Invalidate grid
+        // timers and remove their speculative work so the job list and worker
+        // budget contain only relevant adjacent images.
+        self.grid_demand_epoch = self.grid_demand_epoch.wrapping_add(1);
+        self.focused_prefetch_epoch = self.focused_prefetch_epoch.wrapping_add(1);
+        self.scheduler.clear_scope(NEAR_GRID_SCOPE);
+        self.scheduler.clear_scope(IDLE_PREFETCH_SCOPE);
+        self.scheduler.clear_scope(FOCUSED_PREFETCH_SCOPE);
         self.main_view = MainView::Image(ImageViewState::new(path.clone()));
-        // Keep thumbnail and prediction demand alive. The image request is
-        // Interactive, so the scheduler promotes it above this retained work
-        // and cooperatively preempts lower-priority running renders. Returning
-        // to the grid can then resume instead of rebuilding an erased queue.
+        // Keep visible thumbnail demand alive. Returning to the grid can then
+        // resume without rebuilding its visible cache entries.
         let identity = self.render_identity_for(&path);
         self.previews.mark_used_for(&path, identity);
         cx.notify();
@@ -1409,6 +1635,8 @@ impl PictureBrowser {
     fn close_image(&mut self, _: &CloseImage, _: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.main_view, MainView::Image(_)) {
             self.scheduler.clear_scope(IMAGE_SCOPE);
+            self.scheduler.clear_scope(IMAGE_PREFETCH_SCOPE);
+            self.image_prefetch_epoch = self.image_prefetch_epoch.wrapping_add(1);
             self.main_view = MainView::Dir(
                 self.model.node(self.selected).path.to_path_buf(),
                 self.saved_selection.clone(),
@@ -1478,6 +1706,63 @@ impl PictureBrowser {
             state.drag_last = None;
             cx.notify();
         }
+    }
+
+    fn image_scroll_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let direction = {
+            let MainView::Image(state) = &mut self.main_view else {
+                return;
+            };
+            if state.zoom != ZoomLevel::FitWindow {
+                return;
+            }
+            cx.stop_propagation();
+            state.wheel_delta_y += f32::from(event.delta.pixel_delta(px(20.0)).y);
+            if state.wheel_delta_y <= -IMAGE_WHEEL_THRESHOLD_PX {
+                1
+            } else if state.wheel_delta_y >= IMAGE_WHEEL_THRESHOLD_PX {
+                -1
+            } else {
+                return;
+            }
+        };
+
+        let MainView::Image(state) = &self.main_view else {
+            return;
+        };
+        let images = self.selected_images();
+        let Some(current) = images.iter().position(|path| path == &state.path) else {
+            return;
+        };
+        let Some(target) = adjacent_image_index(current, images.len(), direction) else {
+            if let MainView::Image(state) = &mut self.main_view {
+                state.wheel_delta_y = 0.0;
+            }
+            return;
+        };
+        let path = images[target].clone();
+        let preview_variant = Self::raw_preview_variant(window, cx);
+        let current_variant = if formats::is_raw(&path) {
+            preview_variant
+        } else {
+            RenderVariant::Full
+        };
+        self.saved_selection.select(target, false, false);
+        self.show_image(path.clone(), cx);
+        // Promote before clearing the old speculative scope. This transfers
+        // the in-flight cache subscription instead of cancelling the render
+        // for the image the user just navigated to.
+        self.replace_render_scope(
+            IMAGE_SCOPE,
+            vec![(path.clone(), current_variant, JobPriority::INTERACTIVE)],
+            cx,
+        );
+        self.schedule_image_prefetch(path, direction, preview_variant, cx);
     }
 
     fn selected_images(&self) -> &[PathBuf] {
@@ -1608,6 +1893,7 @@ impl PictureBrowser {
                                             f32::from(event.position.x),
                                             f32::from(event.position.y),
                                         ),
+                                        exportable: true,
                                     });
                                     cx.stop_propagation();
                                     cx.notify();
@@ -1697,6 +1983,7 @@ impl PictureBrowser {
                                     f32::from(event.position.x),
                                     f32::from(event.position.y),
                                 ),
+                                exportable: false,
                             });
                             cx.stop_propagation();
                             cx.notify();
@@ -1739,6 +2026,75 @@ impl PictureBrowser {
         }
         self.path_context_menu = None;
         cx.notify();
+    }
+
+    fn export_image(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.path_context_menu = None;
+        let suggested_name = path
+            .file_stem()
+            .unwrap_or(path.as_os_str())
+            .to_string_lossy()
+            .into_owned()
+            + ".png";
+        let directory = export_dialog_directory(self.last_export_directory.as_deref(), &path);
+        let destination = cx.prompt_for_new_path(directory, Some(&suggested_name));
+        let pipeline = self.render_pipeline.clone();
+        let render_identity = self.render_identity_for(&path);
+        let recipe = self
+            .developed
+            .then(|| self.recipes.as_ref()?.get(&path))
+            .flatten()
+            .map(|entry| entry.recipe.clone());
+        let background = cx.background_executor().clone();
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let destination = match destination.await {
+                Ok(Ok(Some(destination))) => destination,
+                Ok(Ok(None)) | Err(_) => return,
+                Ok(Err(error)) => {
+                    eprintln!("cannot open export save dialog: {error:#}");
+                    return;
+                }
+            };
+            let export_directory = destination.parent().map(std::path::Path::to_path_buf);
+            let export_work = this
+                .update(cx, |this, cx| {
+                    this.last_export_directory = export_directory;
+                    let export_work = this
+                        .work
+                        .start(format!("Exporting {}…", path_display_name(&destination)));
+                    cx.notify();
+                    export_work
+                })
+                .ok()
+                .unwrap_or_default();
+            let export = background.spawn(async move {
+                let cancelled = Arc::new(AtomicBool::new(false));
+                let rendered = pipeline.render_with_recipe(
+                    RenderInvocation {
+                        path,
+                        variant: RenderVariant::Full,
+                        render_identity,
+                        recipe: recipe.as_ref(),
+                        interactive: true,
+                        durable_cache_write: false,
+                    },
+                    &cancelled,
+                );
+                save_preview_as_png(rendered, &destination)
+            });
+            let result = export.await;
+            this.update(cx, |this, cx| {
+                this.work.finish(export_work);
+                if let Err(error) = result {
+                    eprintln!("cannot export image: {error:#}");
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn toggle_develop_inspector(
@@ -2010,8 +2366,13 @@ fn speculative_indices(
 impl Render for PictureBrowser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.job_queue_snapshot = self.scheduler.snapshot();
-        let foreground_jobs = self.job_queue_snapshot.foreground_count();
-        if self.show_job_queue || foreground_jobs > 0 || self.work.active > 0 {
+        let scheduler_jobs = self
+            .job_queue_snapshot
+            .jobs
+            .iter()
+            .filter(|job| !job.cancelled)
+            .count();
+        if self.show_job_queue || scheduler_jobs > 0 || self.work.active > 0 {
             self.schedule_scheduler_refresh(cx);
         }
         let inspector_width = if self.show_job_queue {
@@ -2157,6 +2518,7 @@ impl Render for PictureBrowser {
                                         f32::from(event.position.x),
                                         f32::from(event.position.y),
                                     ),
+                                    exportable: true,
                                 });
                                 cx.stop_propagation();
                                 cx.notify();
@@ -2164,6 +2526,7 @@ impl Render for PictureBrowser {
                         )
                         .on_mouse_move(cx.listener(Self::image_mouse_move))
                         .on_mouse_up(MouseButton::Left, cx.listener(Self::image_mouse_up))
+                        .on_scroll_wheel(cx.listener(Self::image_scroll_wheel))
                         .child(content)
                         .into_any_element(),
                 )
@@ -2420,21 +2783,15 @@ impl Render for PictureBrowser {
                         ),
                 )
             });
-        let progress_active = self.work.active > 0 || foreground_jobs > 0;
+        let progress_active = self.work.active > 0 || scheduler_jobs > 0;
         let progress = if self.work.active > 0 {
             self.work.fraction().clamp(0.08, 1.0)
         } else {
             0.35
         };
-        let progress_label = format!(
-            "Working… {} foreground job{}",
-            foreground_jobs.max(self.work.active),
-            if foreground_jobs.max(self.work.active) == 1 {
-                ""
-            } else {
-                "s"
-            }
-        );
+        let progress_label = scheduler_progress_label(&self.job_queue_snapshot)
+            .or_else(|| self.work.current_activity().map(str::to_owned))
+            .unwrap_or_else(|| "Finishing background work…".to_owned());
         let menu_bar = div()
             .h(px(30.0))
             .w_full()
@@ -2443,6 +2800,7 @@ impl Render for PictureBrowser {
             .items_center()
             .px_2()
             .bg(rgb(0x20232a))
+            .text_color(rgb(0xd8dde7))
             .border_b_1()
             .border_color(rgb(0x30343d))
             .child(
@@ -2503,6 +2861,7 @@ impl Render for PictureBrowser {
             });
         let path_context_menu = self.path_context_menu.as_ref().map(|menu| {
             let viewport = window.viewport_size();
+            let can_export = menu.exportable;
             let left = menu
                 .position
                 .0
@@ -2510,8 +2869,8 @@ impl Render for PictureBrowser {
             let top = menu
                 .position
                 .1
-                .min((f32::from(viewport.height) - 38.0).max(0.0));
-            (menu.path.clone(), left, top)
+                .min((f32::from(viewport.height) - if can_export { 66.0 } else { 38.0 }).max(0.0));
+            (menu.path.clone(), left, top, can_export)
         });
         div()
             .size_full()
@@ -2548,7 +2907,9 @@ impl Render for PictureBrowser {
                         .top(px(29.0))
                         .w(px(230.0))
                         .p_1()
+                        .occlude()
                         .bg(rgb(0x252932))
+                        .text_color(rgb(0xd8dde7))
                         .border_1()
                         .border_color(rgb(0x30343d))
                         .child(
@@ -2595,7 +2956,8 @@ impl Render for PictureBrowser {
                         ),
                 )
             })
-            .when_some(path_context_menu, |this, (path, left, top)| {
+            .when_some(path_context_menu, |this, (path, left, top, can_export)| {
+                let export_path = path.clone();
                 this.child(
                     div()
                         .absolute()
@@ -2603,7 +2965,9 @@ impl Render for PictureBrowser {
                         .top(px(top))
                         .w(px(220.0))
                         .p_1()
+                        .occlude()
                         .bg(rgb(0x252932))
+                        .text_color(rgb(0xd8dde7))
                         .border_1()
                         .border_color(rgb(0x414754))
                         .on_mouse_down(
@@ -2632,9 +2996,70 @@ impl Render for PictureBrowser {
                                         cx.stop_propagation();
                                     }),
                                 ),
-                        ),
+                        )
+                        .when(can_export, |this| {
+                            this.child(
+                                div()
+                                    .id("export-png-menu-item")
+                                    .h(px(28.0))
+                                    .px_2()
+                                    .flex()
+                                    .items_center()
+                                    .rounded_sm()
+                                    .text_sm()
+                                    .hover(|this| this.bg(rgb(0x3b4658)))
+                                    .child("Export PNG…")
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.export_image(export_path.clone(), cx);
+                                            cx.stop_propagation();
+                                        }),
+                                    ),
+                            )
+                        }),
                 )
             })
+    }
+}
+
+fn export_dialog_directory<'a>(
+    last_export_directory: Option<&'a std::path::Path>,
+    source: &'a std::path::Path,
+) -> &'a std::path::Path {
+    last_export_directory
+        .or_else(|| source.parent())
+        .unwrap_or_else(|| std::path::Path::new("."))
+}
+
+fn save_preview_as_png(preview: PreviewState, destination: &std::path::Path) -> Result<()> {
+    let PreviewState::Loaded(preview) = preview else {
+        let PreviewState::Error(error) = preview else {
+            anyhow::bail!("full-size render did not complete");
+        };
+        anyhow::bail!(error.to_string());
+    };
+    let (width, height) = preview.metadata.output_dimensions;
+    let mut rgba = preview
+        .image
+        .as_bytes(0)
+        .ok_or_else(|| anyhow::anyhow!("rendered image has no frame"))?
+        .to_vec();
+    bgra_to_rgba(&mut rgba);
+    image::save_buffer_with_format(
+        destination,
+        &rgba,
+        width,
+        height,
+        image::ColorType::Rgba8,
+        image::ImageFormat::Png,
+    )?;
+    Ok(())
+}
+
+fn bgra_to_rgba(pixels: &mut [u8]) {
+    for pixel in pixels.as_chunks_mut::<4>().0 {
+        pixel.swap(0, 2);
     }
 }
 
@@ -2783,7 +3208,9 @@ fn recommended_raw_parallelism(
     cpu_limit.min(memory_limit).min(job_parallelism).max(1)
 }
 
+#[cfg(not(test))]
 fn main() -> Result<()> {
+    rendering::assert_hevc_decoder_available()?;
     let config = config_from_args(env::args_os())?;
     if let Some(lightroom) = &config.import_lightroom {
         let report = if config.apply_lightroom_import {
@@ -2843,647 +3270,8 @@ fn main() -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use discovery::DirectoryScan;
-    use futures::executor::block_on;
-    use std::time::Instant;
+test_r::enable!();
 
-    #[test]
-    fn developed_marker_is_independent_of_the_rendering_toggle() {
-        let developed_path = PathBuf::from("/pictures/developed.CR3");
-        let baseline_path = PathBuf::from("/pictures/baseline.CR3");
-        let recipe = catalog::DevelopRecipe {
-            exposure_ev: Some(1.0),
-            ..catalog::DevelopRecipe::default()
-        };
-        let recipes = HashMap::from([(
-            developed_path.clone(),
-            catalog::RecipeEntry {
-                digest: recipe.digest().unwrap(),
-                recipe,
-            },
-        )]);
-
-        assert!(has_develop_recipe(Some(&recipes), &developed_path));
-        assert!(!has_develop_recipe(Some(&recipes), &baseline_path));
-        assert!(!has_develop_recipe(None, &developed_path));
-    }
-
-    #[test]
-    fn develop_inspector_formats_active_recipe_groups() {
-        let recipe = catalog::DevelopRecipe {
-            exposure_ev: Some(1.25),
-            white_balance: Some(catalog::WhiteBalance {
-                temperature: 6_500.0,
-                tint: 4.0,
-            }),
-            crop: Some(catalog::Crop {
-                left: 0.1,
-                top: 0.2,
-                right: 0.9,
-                bottom: 0.8,
-                angle_degrees: 1.5,
-                constrain_aspect: true,
-            }),
-            heal_spots: vec![catalog::HealSpot {
-                kind: catalog::HealKind::Clone,
-                destination: [0.5, 0.5],
-                source: [0.25, 0.25],
-                radius: 0.1,
-                opacity: 0.8,
-                feather: 0.2,
-            }],
-            grain: Some(catalog::GrainRecipe {
-                amount: 15.0,
-                size: 30.0,
-                roughness: 50.0,
-                seed: 42,
-            }),
-            ..catalog::DevelopRecipe::default()
-        };
-        let edits = format_develop_edits(&recipe);
-        let labels = edits
-            .iter()
-            .map(|(label, _)| label.as_str())
-            .collect::<Vec<_>>();
-
-        assert!(labels.contains(&"Exposure"));
-        assert!(labels.contains(&"White balance"));
-        assert!(labels.contains(&"Crop"));
-        assert!(labels.contains(&"Clone spot 1"));
-        assert!(labels.contains(&"Grain"));
-        assert!(edits.iter().any(|(_, value)| value.contains("6500 K")));
-    }
-
-    #[test]
-    fn collapsing_a_branch_removes_all_descendant_rows() {
-        let mut model = DirectoryModel::new(PathBuf::from("/pictures"));
-        let root = model.root();
-        let (request, _) = model.begin_load(root).unwrap();
-        model.finish_load(
-            root,
-            request,
-            Ok(DirectoryScan {
-                directories: vec![PathBuf::from("/pictures/a")],
-                images: Vec::new(),
-            }),
-        );
-        let child = model.loaded(root).unwrap().children[0];
-        let (request, _) = model.begin_load(child).unwrap();
-        model.finish_load(
-            child,
-            request,
-            Ok(DirectoryScan {
-                directories: vec![PathBuf::from("/pictures/a/b")],
-                images: Vec::new(),
-            }),
-        );
-
-        let mut expanded = HashSet::from([root, child]);
-        assert_eq!(visible_rows(&model, &expanded).len(), 3);
-        expanded.remove(&child);
-        assert_eq!(visible_rows(&model, &expanded).len(), 2);
-        assert_eq!(model.loaded(child).unwrap().children.len(), 1);
-    }
-
-    #[test]
-    fn parses_image_cache_size() {
-        let config = config_from_args([
-            OsString::from("pics"),
-            OsString::from("--image-cache-size"),
-            OsString::from("3"),
-            OsString::from("/pictures"),
-        ])
-        .unwrap();
-        assert_eq!(config.image_cache_size, 3);
-        assert_eq!(config.root, PathBuf::from("/pictures"));
-        assert_eq!(config.pair_preference, RawJpegPreference::Raw);
-    }
-
-    #[test]
-    fn parses_jpeg_pair_preference() {
-        let config = config_from_args([
-            OsString::from("pics"),
-            OsString::from("--cr3-jpeg-preference"),
-            OsString::from("jpeg"),
-        ])
-        .unwrap();
-        assert_eq!(config.pair_preference, RawJpegPreference::Jpeg);
-    }
-
-    #[test]
-    fn parses_custom_cache_root() {
-        let config = config_from_args([
-            OsString::from("pics"),
-            OsString::from("--cache-root"),
-            OsString::from("relative-cache"),
-        ])
-        .unwrap();
-        assert!(config.cache_root.is_absolute());
-        assert!(config.cache_root.ends_with("relative-cache"));
-    }
-
-    #[test]
-    fn parses_job_parallelism() {
-        let config = config_from_args([
-            OsString::from("pics"),
-            OsString::from("--job-parallelism"),
-            OsString::from("3"),
-        ])
-        .unwrap();
-        assert_eq!(config.job_parallelism, 3);
-    }
-
-    #[test]
-    fn parses_and_bounds_raw_parallelism() {
-        let config = config_from_args([
-            OsString::from("pics"),
-            OsString::from("--job-parallelism"),
-            OsString::from("3"),
-            OsString::from("--raw-parallelism"),
-            OsString::from("8"),
-        ])
-        .unwrap();
-        assert_eq!(config.raw_parallelism, 3);
-    }
-
-    #[test]
-    fn automatic_raw_parallelism_respects_cpu_memory_and_job_limits() {
-        assert_eq!(recommended_raw_parallelism(16, 16 * 1024_u64.pow(3), 8), 8);
-        assert_eq!(recommended_raw_parallelism(16, 2 * 1024_u64.pow(3), 8), 1);
-        assert_eq!(recommended_raw_parallelism(4, 16 * 1024_u64.pow(3), 8), 2);
-        assert_eq!(recommended_raw_parallelism(32, 16 * 1024_u64.pow(3), 3), 3);
-    }
-
-    #[test]
-    fn rejects_zero_job_parallelism() {
-        assert!(
-            config_from_args([
-                OsString::from("pics"),
-                OsString::from("--job-parallelism"),
-                OsString::from("0"),
-            ])
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn rejects_zero_raw_parallelism() {
-        assert!(
-            config_from_args([
-                OsString::from("pics"),
-                OsString::from("--raw-parallelism"),
-                OsString::from("0"),
-            ])
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn thumbnail_selection_supports_replace_toggle_and_ranges() {
-        let mut selection = ImageSelection::default();
-        selection.select(2, false, false);
-        assert_eq!(selection.indices, BTreeSet::from([2]));
-
-        selection.select(4, false, true);
-        assert_eq!(selection.indices, BTreeSet::from([2, 4]));
-
-        selection.select(6, true, false);
-        assert_eq!(selection.indices, BTreeSet::from([4, 5, 6]));
-        assert_eq!(selection.focused, Some(6));
-    }
-
-    #[test]
-    fn work_progress_tracks_overlapping_tasks_and_resets_batches() {
-        let mut work = WorkProgress::default();
-        work.start();
-        work.start();
-        work.finish();
-        assert_eq!(work.active, 1);
-        assert_eq!(work.fraction(), 0.5);
-        work.finish();
-        work.start();
-        assert_eq!(work.active, 1);
-        assert_eq!(work.completed, 0);
-        assert_eq!(work.total, 1);
-    }
-
-    #[test]
-    fn image_zoom_starts_fitted_and_toggle_resets_pan() {
-        let mut state = ImageViewState::new(PathBuf::from("photo.jpg"));
-        assert_eq!(state.zoom, ZoomLevel::FitWindow);
-        state.toggle_zoom();
-        assert_eq!(state.zoom, ZoomLevel::ActualSize);
-        state.pan = (100.0, -50.0);
-        state.toggle_zoom();
-        assert_eq!(state.zoom, ZoomLevel::FitWindow);
-        assert_eq!(state.pan, (0.0, 0.0));
-    }
-
-    #[test]
-    fn virtual_grid_demands_only_visible_rows_and_prioritizes_the_center() {
-        let images: Vec<_> = (0..20)
-            .map(|index| PathBuf::from(format!("image-{index}.jpg")))
-            .collect();
-        let demands = visible_thumbnail_demands(&images, 1..3, 4, 300);
-        let paths: Vec<_> = demands.iter().map(|demand| demand.0.clone()).collect();
-        assert_eq!(paths, images[4..12]);
-        let strongest = demands.iter().max_by_key(|demand| demand.2).unwrap();
-        assert_eq!(strongest.0, images[8]);
-    }
-
-    #[test]
-    fn speculative_batches_are_bounded_and_follow_scroll_direction() {
-        assert_eq!(speculative_indices(20, 8..12, 1, 0, 3), vec![12, 13, 14]);
-        assert_eq!(speculative_indices(20, 8..12, -1, 0, 3), vec![7, 6, 5]);
-        assert_eq!(speculative_indices(20, 8..12, 1, 1, 3), vec![15, 16, 17]);
-        assert!(speculative_indices(4, 0..4, 1, 0, 64).is_empty());
-        assert_eq!(
-            speculative_indices(1_000_000_000, 100..110, 1, 0, 64).len(),
-            64
-        );
-    }
-
-    #[test]
-    fn prediction_identity_changes_with_grid_geometry_and_display() {
-        let base = GridPredictionState {
-            visible_rows: 1..3,
-            columns: 4,
-            thumbnail_width: 300,
-            preview_variant: RenderVariant::Preview {
-                max_width: 1920,
-                max_height: 1080,
-            },
-        };
-        let mut changed = base.clone();
-        changed.columns = 5;
-        assert_ne!(base, changed);
-        changed = base.clone();
-        changed.preview_variant = RenderVariant::Preview {
-            max_width: 3840,
-            max_height: 2160,
-        };
-        assert_ne!(base, changed);
-    }
-
-    #[test]
-    fn virtual_grid_callbacks_merge_fragments_but_replace_a_disjoint_viewport() {
-        let variant = RenderVariant::Preview {
-            max_width: 1920,
-            max_height: 1080,
-        };
-        let mut pending = None;
-        merge_grid_demand(
-            &mut pending,
-            PendingGridDemand {
-                node: NodeId(1),
-                visible_rows: 4..7,
-                columns: 3,
-                thumbnail_width: 300,
-                preview_variant: variant,
-            },
-        );
-        merge_grid_demand(
-            &mut pending,
-            PendingGridDemand {
-                node: NodeId(1),
-                visible_rows: 2..5,
-                columns: 3,
-                thumbnail_width: 300,
-                preview_variant: variant,
-            },
-        );
-        assert_eq!(pending.as_ref().unwrap().visible_rows, 2..7);
-
-        merge_grid_demand(
-            &mut pending,
-            PendingGridDemand {
-                node: NodeId(1),
-                visible_rows: 20..23,
-                columns: 3,
-                thumbnail_width: 300,
-                preview_variant: variant,
-            },
-        );
-        assert_eq!(pending.unwrap().visible_rows, 20..23);
-    }
-
-    #[test]
-    #[ignore = "manual end-to-end queue benchmark"]
-    fn benchmark_all_scheduled_jobs() {
-        let directory = PathBuf::from("/mnt/pictures/Pictures/2018/Nyaralás/2018-08-06");
-        let nef = directory.join("DSC_0389.NEF");
-        let jpeg = directory.join("DSC_2587.JPG");
-        let cr3 = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test/IMG_0052.CR3");
-        let heic = PathBuf::from("/mnt/pictures/Pictures/2026/Alpok túra/2026-07-25/IMG_5562.HEIC");
-        for path in [&directory, &nef, &jpeg, &cr3, &heic] {
-            assert!(path.exists(), "missing benchmark input: {}", path.display());
-        }
-
-        let started = Instant::now();
-        let scan = discovery::scan_directory(&directory, RawJpegPreference::Raw).unwrap();
-        let directory_scan = started.elapsed();
-
-        let cache = tempfile::tempdir().unwrap();
-        let limiter = JobLimiter::new(2);
-        let metadata_loader =
-            MetadataLoader::new(cache.path().join("metadata"), 2, limiter.clone());
-        let started = Instant::now();
-        let metadata =
-            metadata_loader.load_directory(scan.images.clone(), Arc::new(AtomicBool::new(false)));
-        let metadata_cold = started.elapsed();
-        let started = Instant::now();
-        let cached_metadata =
-            metadata_loader.load_directory(scan.images, Arc::new(AtomicBool::new(false)));
-        let metadata_cached = started.elapsed();
-        assert_eq!(metadata.len(), cached_metadata.len());
-
-        let pipeline =
-            RenderPipeline::with_source_cache_capacity(cache.path().join("renders"), 2, 2, 8);
-        let render_limiter = limiter.clone();
-        let pipeline_for_scheduler = pipeline.clone();
-        let scheduler = RenderScheduler::new(
-            2,
-            Arc::new(move |key, priority, cancelled| {
-                let Some(_permit) = render_limiter.acquire(
-                    priority.class >= scheduler::PriorityClass::Visible,
-                    cancelled,
-                ) else {
-                    return PreviewState::Error("cancelled".into());
-                };
-                pipeline_for_scheduler.render(
-                    key.path.clone(),
-                    key.variant,
-                    priority.class == scheduler::PriorityClass::Interactive,
-                    true,
-                    cancelled,
-                )
-            }),
-        );
-        let mut scope = 10_000_u64;
-        let mut run = |path: &PathBuf, variant: RenderVariant| {
-            scope += 1;
-            let started = Instant::now();
-            let subscription = scheduler
-                .replace_scope(
-                    DemandScopeId(scope),
-                    vec![JobDemand {
-                        key: JobKey {
-                            path: path.clone(),
-                            variant,
-                            render_identity: RenderIdentity::default(),
-                            recipe: None,
-                        },
-                        priority: JobPriority::INTERACTIVE,
-                        subscribe: true,
-                    }],
-                )
-                .pop()
-                .unwrap();
-            let completion = block_on(subscription.receiver).unwrap();
-            assert!(matches!(
-                completion,
-                JobCompletion::Finished(PreviewState::Loaded(_))
-            ));
-            started.elapsed()
-        };
-        let (
-            jpeg_thumbnail,
-            nef_thumbnail,
-            cr3_thumbnail,
-            heic_thumbnail,
-            nef_preview,
-            cr3_preview,
-            heic_preview,
-        ) = {
-            let mut cached_variant = |path: &PathBuf, variant: RenderVariant| {
-                let writes = pipeline.stats().cache_writes;
-                let total_started = Instant::now();
-                let cold = run(path, variant);
-                let deadline = Instant::now() + Duration::from_secs(30);
-                while pipeline.stats().cache_writes == writes && Instant::now() < deadline {
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-                assert!(
-                    pipeline.stats().cache_writes > writes,
-                    "cache write timed out"
-                );
-                let persisted = total_started.elapsed();
-                let cached = run(path, variant);
-                (cold, persisted, cached)
-            };
-
-            (
-                cached_variant(&jpeg, RenderVariant::Thumbnail { width: 300 }),
-                cached_variant(&nef, RenderVariant::Thumbnail { width: 300 }),
-                cached_variant(&cr3, RenderVariant::Thumbnail { width: 300 }),
-                cached_variant(&heic, RenderVariant::Thumbnail { width: 300 }),
-                cached_variant(
-                    &nef,
-                    RenderVariant::Preview {
-                        max_width: 1920,
-                        max_height: 1080,
-                    },
-                ),
-                cached_variant(
-                    &cr3,
-                    RenderVariant::Preview {
-                        max_width: 1920,
-                        max_height: 1080,
-                    },
-                ),
-                cached_variant(
-                    &heic,
-                    RenderVariant::Preview {
-                        max_width: 1920,
-                        max_height: 1080,
-                    },
-                ),
-            )
-        };
-        let jpeg_full = run(&jpeg, RenderVariant::Full);
-        let nef_full = run(&nef, RenderVariant::Full);
-        let cr3_full = run(&cr3, RenderVariant::Full);
-        let heic_full = run(&heic, RenderVariant::Full);
-
-        let overhead_scheduler = RenderScheduler::new(
-            1,
-            Arc::new(|_, _, _| PreviewState::Error("benchmark".into())),
-        );
-        let overhead_started = Instant::now();
-        for index in 0..1_000_u32 {
-            let subscription = overhead_scheduler
-                .replace_scope(
-                    DemandScopeId(20_000 + u64::from(index)),
-                    vec![JobDemand {
-                        key: JobKey {
-                            path: PathBuf::from(format!("overhead-{index}")),
-                            variant: RenderVariant::Thumbnail { width: 300 },
-                            render_identity: RenderIdentity::default(),
-                            recipe: None,
-                        },
-                        priority: JobPriority::INTERACTIVE,
-                        subscribe: true,
-                    }],
-                )
-                .pop()
-                .unwrap();
-            let _ = block_on(subscription.receiver).unwrap();
-        }
-        let scheduler_overhead = overhead_started.elapsed() / 1_000;
-
-        eprintln!(
-            "scheduler_overhead={scheduler_overhead:?}\ndirectory_scan={directory_scan:?}\nmetadata_cold={metadata_cold:?}\nmetadata_cached={metadata_cached:?}\njpeg_thumbnail_cold={:?}\njpeg_thumbnail_persisted={:?}\njpeg_thumbnail_cached={:?}\nnef_thumbnail_cold={:?}\nnef_thumbnail_persisted={:?}\nnef_thumbnail_cached={:?}\ncr3_thumbnail_cold={:?}\ncr3_thumbnail_persisted={:?}\ncr3_thumbnail_cached={:?}\nheic_thumbnail_cold={:?}\nheic_thumbnail_persisted={:?}\nheic_thumbnail_cached={:?}\nnef_preview_cold={:?}\nnef_preview_persisted={:?}\nnef_preview_cached={:?}\ncr3_preview_cold={:?}\ncr3_preview_persisted={:?}\ncr3_preview_cached={:?}\nheic_preview_cold={:?}\nheic_preview_persisted={:?}\nheic_preview_cached={:?}\njpeg_full={jpeg_full:?}\nnef_full={nef_full:?}\ncr3_full={cr3_full:?}\nheic_full={heic_full:?}\nmetrics={:?}",
-            jpeg_thumbnail.0,
-            jpeg_thumbnail.1,
-            jpeg_thumbnail.2,
-            nef_thumbnail.0,
-            nef_thumbnail.1,
-            nef_thumbnail.2,
-            cr3_thumbnail.0,
-            cr3_thumbnail.1,
-            cr3_thumbnail.2,
-            heic_thumbnail.0,
-            heic_thumbnail.1,
-            heic_thumbnail.2,
-            nef_preview.0,
-            nef_preview.1,
-            nef_preview.2,
-            cr3_preview.0,
-            cr3_preview.1,
-            cr3_preview.2,
-            heic_preview.0,
-            heic_preview.1,
-            heic_preview.2,
-            pipeline.stats(),
-        );
-    }
-
-    #[test]
-    #[ignore = "manual cancellation and parallel-throughput benchmark"]
-    fn benchmark_scheduler_cancellation_and_parallelism() {
-        let directory = PathBuf::from("/mnt/pictures/Pictures/2018/Nyaralás/2018-08-06");
-        let raw_paths = [
-            "DSC_0389.NEF",
-            "DSC_0390.NEF",
-            "DSC_0391.NEF",
-            "DSC_0392.NEF",
-        ]
-        .map(|name| directory.join(name));
-        let jpeg = directory.join("DSC_2587.JPG");
-        let cr3 = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test/IMG_0052.CR3");
-        for path in raw_paths.iter().chain([&jpeg, &cr3]) {
-            assert!(
-                path.is_file(),
-                "missing benchmark input: {}",
-                path.display()
-            );
-        }
-
-        let throughput = |parallelism: usize| {
-            let cache = tempfile::tempdir().unwrap();
-            let pipeline = RenderPipeline::with_source_cache_capacity(
-                cache.path().to_path_buf(),
-                parallelism,
-                parallelism,
-                8,
-            );
-            let executor_pipeline = pipeline.clone();
-            let scheduler = RenderScheduler::new(
-                parallelism,
-                Arc::new(move |key, _, cancelled| {
-                    executor_pipeline.render(key.path.clone(), key.variant, true, false, cancelled)
-                }),
-            );
-            let started = Instant::now();
-            let subscriptions = scheduler.replace_scope(
-                DemandScopeId(30_000 + parallelism as u64),
-                raw_paths
-                    .iter()
-                    .cloned()
-                    .map(|path| JobDemand {
-                        key: JobKey {
-                            path,
-                            variant: RenderVariant::Thumbnail { width: 300 },
-                            render_identity: RenderIdentity::default(),
-                            recipe: None,
-                        },
-                        priority: JobPriority::INTERACTIVE,
-                        subscribe: true,
-                    })
-                    .collect(),
-            );
-            for subscription in subscriptions {
-                assert!(matches!(
-                    block_on(subscription.receiver).unwrap(),
-                    JobCompletion::Finished(PreviewState::Loaded(_))
-                ));
-            }
-            started.elapsed()
-        };
-
-        let cancellation_handoff = |raw: &PathBuf| {
-            let cache = tempfile::tempdir().unwrap();
-            let pipeline =
-                RenderPipeline::with_source_cache_capacity(cache.path().to_path_buf(), 1, 1, 1);
-            let executor_pipeline = pipeline.clone();
-            let scheduler = RenderScheduler::new(
-                1,
-                Arc::new(move |key, _, cancelled| {
-                    executor_pipeline.render(key.path.clone(), key.variant, true, false, cancelled)
-                }),
-            );
-            let raw_scope = DemandScopeId(40_000);
-            let _ = scheduler.replace_scope(
-                raw_scope,
-                vec![JobDemand {
-                    key: JobKey {
-                        path: raw.clone(),
-                        variant: RenderVariant::Thumbnail { width: 300 },
-                        render_identity: RenderIdentity::default(),
-                        recipe: None,
-                    },
-                    priority: JobPriority::INTERACTIVE,
-                    subscribe: true,
-                }],
-            );
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while scheduler.snapshot().running == 0 && Instant::now() < deadline {
-                std::thread::yield_now();
-            }
-            scheduler.clear_scope(raw_scope);
-            let started = Instant::now();
-            let subscription = scheduler
-                .replace_scope(
-                    DemandScopeId(40_001),
-                    vec![JobDemand {
-                        key: JobKey {
-                            path: jpeg.clone(),
-                            variant: RenderVariant::Thumbnail { width: 300 },
-                            render_identity: RenderIdentity::default(),
-                            recipe: None,
-                        },
-                        priority: JobPriority::INTERACTIVE,
-                        subscribe: true,
-                    }],
-                )
-                .pop()
-                .unwrap();
-            assert!(matches!(
-                block_on(subscription.receiver).unwrap(),
-                JobCompletion::Finished(PreviewState::Loaded(_))
-            ));
-            started.elapsed()
-        };
-
-        eprintln!(
-            "raw_batch_p1={:?}\nraw_batch_p2={:?}\nraw_batch_p4={:?}\nnef_cancel_to_jpeg={:?}\ncr3_cancel_to_jpeg={:?}",
-            throughput(1),
-            throughput(2),
-            throughput(4),
-            cancellation_handoff(&raw_paths[0]),
-            cancellation_handoff(&cr3),
-        );
-    }
-}
+#[cfg(test)]
+#[path = "main/tests.rs"]
+mod tests;

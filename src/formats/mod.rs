@@ -24,13 +24,5 @@ fn has_extension(path: &Path, expected: &[&str]) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn raw_extensions_are_case_insensitive() {
-        assert!(is_raw(Path::new("photo.ARW")));
-        assert!(is_raw(Path::new("photo.dng")));
-        assert!(!is_raw(Path::new("photo.jpg")));
-    }
-}
+#[path = "tests.rs"]
+mod tests;

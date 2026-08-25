@@ -39,7 +39,6 @@ impl DecodedRaw {
 const HISTOGRAM_BINS: usize = 4096;
 const MIN_LOG2_LUMINANCE: f32 = -16.0;
 const MAX_LOG2_LUMINANCE: f32 = 8.0;
-
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AutoExposure {
     /// Scene-luminance percentile used as the exposure anchor.
@@ -131,8 +130,16 @@ pub(super) fn render_raw(
         .map_err(|error| error.to_string())?;
     let (width, height, mut pixels) = linear_rgb(intermediate, cancelled)?;
     let recipe_exposure = recipe.and_then(|recipe| recipe.exposure_ev).unwrap_or(0.0);
-    let automatic =
-        apply_recipe_scene_linear(&mut pixels, width, height, settings, recipe, cancelled)?;
+    let developed_baseline = if recipe.is_some() { 0.75 } else { 0.0 };
+    let automatic = apply_recipe_scene_linear(
+        &mut pixels,
+        width,
+        height,
+        settings,
+        recipe,
+        developed_baseline,
+        cancelled,
+    )?;
     let mut adjusted = *settings;
     let (image, automatic_exposure_stops) =
         render_linear_rgb_with_exposure(width, height, pixels, &adjusted, automatic, cancelled)?;
@@ -141,6 +148,7 @@ pub(super) fn render_raw(
         image.apply_orientation(orientation);
     }
     adjusted.exposure_compensation_stops += recipe_exposure;
+    adjusted.exposure_compensation_stops += developed_baseline;
     Ok((
         image,
         AppliedPhotographicTransform {
@@ -148,7 +156,8 @@ pub(super) fn render_raw(
             automatic_exposure_stops,
             total_exposure_stops: automatic_exposure_stops
                 + settings.exposure_compensation_stops
-                + recipe_exposure,
+                + recipe_exposure
+                + developed_baseline,
             output_encoding: OutputEncoding::Srgb,
             orientation_applied: decoded.orientation.map(|value| value.to_exif()),
         },
@@ -161,6 +170,7 @@ fn apply_recipe_scene_linear(
     height: u32,
     settings: &PhotographicSettings,
     recipe: Option<&crate::catalog::DevelopRecipe>,
+    developed_baseline_stops: f32,
     cancelled: &AtomicBool,
 ) -> Result<f32, String> {
     // A catalog recipe represents an intentional developed rendering. Keep the
@@ -172,7 +182,7 @@ fn apply_recipe_scene_linear(
         exposure_multiplier(pixels, settings.auto_exposure, cancelled)?
     };
     let recipe_exposure = recipe.and_then(|recipe| recipe.exposure_ev).unwrap_or(0.0);
-    let exposure = 2.0_f32.powf(recipe_exposure);
+    let exposure = 2.0_f32.powf(recipe_exposure + developed_baseline_stops);
     for (index, pixel) in pixels.iter_mut().enumerate() {
         if index % 4096 == 0 {
             check_cancelled(cancelled)?;
@@ -350,7 +360,11 @@ fn normalized_wb_coefficients(
     raw: &rawler::RawImage,
     recipe: &crate::catalog::DevelopRecipe,
 ) -> [f32; 4] {
-    white_balance_coefficients(raw.wb_coeffs, raw.neutralwb(), recipe)
+    if let Some(white_balance) = recipe.white_balance {
+        absolute_white_balance_coefficients(raw, white_balance)
+    } else {
+        white_balance_coefficients(raw.wb_coeffs, raw.neutralwb(), recipe)
+    }
 }
 
 fn white_balance_coefficients(
@@ -358,15 +372,13 @@ fn white_balance_coefficients(
     neutral: [f32; 4],
     recipe: &crate::catalog::DevelopRecipe,
 ) -> [f32; 4] {
-    let mut coefficients = if let Some(wb) = recipe.white_balance {
-        let temperature = ((wb.temperature - 6_500.0) / 43_500.0).clamp(-1.0, 1.0);
-        let tint = (wb.tint / 150.0).clamp(-1.0, 1.0);
-        [
-            neutral[0] * (1.0 + temperature * 0.45 + tint * 0.08),
-            neutral[1] * (1.0 - tint * 0.12),
-            neutral[2] * (1.0 - temperature * 0.45 + tint * 0.08),
-            neutral[3],
-        ]
+    let mut coefficients = if recipe.white_balance.is_some() {
+        // Absolute Lightroom WB values describe a chromaticity, not generic
+        // output-RGB gains. The caller replaces this result on the RawImage,
+        // so the camera matrix is required to translate that chromaticity into
+        // sensor-space multipliers. `neutral` is retained as a safe fallback
+        // for invalid or unavailable camera calibration data.
+        neutral
     } else {
         as_shot
     };
@@ -378,6 +390,116 @@ fn white_balance_coefficients(
         coefficients[2] *= 1.0 - temperature * 0.15 + tint * 0.05;
     }
     coefficients
+}
+
+fn absolute_white_balance_coefficients(
+    raw: &rawler::RawImage,
+    white_balance: crate::catalog::WhiteBalance,
+) -> [f32; 4] {
+    let (x, y) = tinted_white_point(white_balance.temperature, white_balance.tint);
+    // Lightroom's tint scale is proprietary. Treat it as a small displacement
+    // perpendicular to the daylight/Planckian locus: positive values move the
+    // requested white point away from green and towards magenta.
+    let xyz = [x / y, 1.0, (1.0 - x - y) / y];
+    let matrix = nearest_color_matrix(raw, white_balance.temperature);
+    let mut coefficients = [f32::NAN; 4];
+    let components = matrix.as_ref().map_or(0, |matrix| matrix.len() / 3);
+    for channel in 0..components.min(4) {
+        let row = matrix
+            .as_ref()
+            .map(|matrix| &matrix[channel * 3..channel * 3 + 3])
+            .expect("a selected matrix has this row");
+        let response = row[0] * xyz[0] + row[1] * xyz[1] + row[2] * xyz[2];
+        if !response.is_finite() || response <= 0.0 {
+            return raw.wb_coeffs;
+        }
+        coefficients[channel] = response.recip();
+    }
+    let green = coefficients[1];
+    if !green.is_finite() || green <= 0.0 {
+        return raw.wb_coeffs;
+    }
+    for coefficient in &mut coefficients[..components.min(4)] {
+        *coefficient /= green;
+    }
+    coefficients
+}
+
+fn nearest_color_matrix(raw: &rawler::RawImage, temperature: f32) -> Option<Vec<f32>> {
+    use rawler::imgop::xyz::Illuminant;
+    let temperature_for = |illuminant| match illuminant {
+        Illuminant::A | Illuminant::Tungsten | Illuminant::IsoStudioTungsten => 2_856.0,
+        Illuminant::D50 => 5_003.0,
+        Illuminant::D55 => 5_503.0,
+        Illuminant::D65 | Illuminant::Daylight | Illuminant::Flash => 6_504.0,
+        Illuminant::D75 => 7_504.0,
+        _ => 6_000.0,
+    };
+    raw.color_matrix
+        .iter()
+        .filter(|(_, matrix)| matches!(matrix.len(), 9 | 12))
+        .min_by(|(left, _), (right, _)| {
+            (temperature_for(**left) - temperature)
+                .abs()
+                .total_cmp(&(temperature_for(**right) - temperature).abs())
+        })
+        .map(|(_, matrix)| matrix.clone())
+}
+
+fn tinted_white_point(temperature: f32, tint: f32) -> (f32, f32) {
+    let (x, y) = planckian_locus_xy_kang2002(temperature);
+    let to_uv = |x: f32, y: f32| {
+        let denominator = -2.0 * x + 12.0 * y + 3.0;
+        (4.0 * x / denominator, 6.0 * y / denominator)
+    };
+    let (u, v) = to_uv(x, y);
+    let delta = (temperature * 0.01).max(1.0);
+    let (u0, v0) = to_uv(
+        planckian_locus_xy_kang2002(temperature - delta).0,
+        planckian_locus_xy_kang2002(temperature - delta).1,
+    );
+    let (u1, v1) = to_uv(
+        planckian_locus_xy_kang2002(temperature + delta).0,
+        planckian_locus_xy_kang2002(temperature + delta).1,
+    );
+    let length = ((u1 - u0).powi(2) + (v1 - v0).powi(2)).sqrt().max(1e-6);
+    let amount = tint.clamp(-150.0, 150.0) * 0.00005;
+    let u = u - (v1 - v0) / length * amount;
+    let v = v + (u1 - u0) / length * amount;
+    let denominator = 2.0 * u - 8.0 * v + 4.0;
+    (3.0 * u / denominator, 2.0 * v / denominator)
+}
+
+/// Evaluates the piecewise polynomial approximation of the CIE 1931 xy
+/// Planckian locus from:
+///
+/// B. Kang, O. Moon, C. Hong, H. Lee, B. Cho, and Y. Kim, "Design of
+/// Advanced Color-Temperature Control System for HDTV Applications",
+/// Journal of the Korean Physical Society 41(6), pp. 865-871, 2002.
+/// https://www.kci.go.kr/kciportal/ci/sereArticleSearch/ciSereArtiView.kci?sereArticleSearchBean.artiId=ART000987865
+///
+/// Independent reference implementation:
+/// https://colour.readthedocs.io/en/master/_modules/colour/temperature/kang2002.html
+///
+/// The published fit is valid from 1667 K through 25000 K. This function
+/// clamps inputs to that interval; it does not estimate CCT from arbitrary xy.
+fn planckian_locus_xy_kang2002(temperature: f32) -> (f32, f32) {
+    let temperature = temperature.clamp(1_667.0, 25_000.0);
+    let t2 = temperature * temperature;
+    let t3 = t2 * temperature;
+    let x = if temperature <= 4_000.0 {
+        -0.266_123_9e9 / t3 - 2.343_58e5 / t2 + 0.877_695_6e3 / temperature + 0.179_910
+    } else {
+        -3.025_846_9e9 / t3 + 2.107_038e6 / t2 + 0.222_634_7e3 / temperature + 0.240_390
+    };
+    let y = if temperature <= 2_222.0 {
+        -1.106_381_4 * x.powi(3) - 1.348_110_2 * x.powi(2) + 2.185_558_3 * x - 0.202_196_83
+    } else if temperature <= 4_000.0 {
+        -0.954_947_6 * x.powi(3) - 1.374_185_9 * x.powi(2) + 2.091_37 * x - 0.167_488_67
+    } else {
+        3.081_758 * x.powi(3) - 5.873_387 * x.powi(2) + 3.751_129_9 * x - 0.370_014_83
+    };
+    (x, y)
 }
 
 fn apply_scene_linear_controls(
@@ -586,225 +708,5 @@ fn linear_to_srgb(value: f32) -> f32 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn auto_exposure_places_middle_grey_at_the_target() {
-        let pixels = vec![[0.045; 3]; 100];
-        let multiplier =
-            exposure_multiplier(&pixels, AutoExposure::default(), &AtomicBool::new(false)).unwrap();
-        assert!((multiplier - 4.0).abs() < 0.1);
-    }
-
-    #[test]
-    fn auto_exposure_is_bounded_for_nearly_black_scenes() {
-        let pixels = vec![[0.000_001; 3]];
-        assert_eq!(
-            exposure_multiplier(&pixels, AutoExposure::default(), &AtomicBool::new(false)).unwrap(),
-            16.0
-        );
-    }
-
-    #[test]
-    fn tone_mapping_is_finite_and_bounded() {
-        for value in [0.0, 0.18, 1.0, 10.0, f32::INFINITY] {
-            let mapped = aces_fitted(value);
-            assert!(mapped.is_finite() && (0.0..=1.0).contains(&mapped));
-        }
-    }
-
-    #[test]
-    fn photographic_transform_observes_cancellation() {
-        let pixels = vec![[0.18; 3]; 10_000];
-        assert!(
-            render_linear_rgb(
-                100,
-                100,
-                pixels,
-                &PhotographicSettings::default(),
-                &AtomicBool::new(true),
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn catalog_recipe_disables_auto_exposure_and_applies_authored_exposure_before_curves() {
-        let mut baseline = vec![[0.25; 3]];
-        let mut developed = baseline.clone();
-        let recipe = crate::catalog::DevelopRecipe {
-            exposure_ev: Some(1.0),
-            tone_curve: Some(vec![[0.0, 0.0], [0.5, 0.25], [1.0, 1.0]]),
-            ..crate::catalog::DevelopRecipe::default()
-        };
-        let settings = PhotographicSettings::default();
-        let baseline_anchor = apply_recipe_scene_linear(
-            &mut baseline,
-            1,
-            1,
-            &settings,
-            None,
-            &AtomicBool::new(false),
-        )
-        .unwrap();
-        let developed_anchor = apply_recipe_scene_linear(
-            &mut developed,
-            1,
-            1,
-            &settings,
-            Some(&recipe),
-            &AtomicBool::new(false),
-        )
-        .unwrap();
-
-        assert_ne!(baseline_anchor, 1.0);
-        assert_eq!(developed_anchor, 1.0);
-        assert!((developed[0][0] - 0.25).abs() < 0.001);
-    }
-
-    #[test]
-    fn even_a_recipe_without_exposure_disables_aesthetic_auto_exposure() {
-        let settings = PhotographicSettings::default();
-        let mut baseline = vec![[0.05; 3]];
-        let mut developed = baseline.clone();
-        let recipe = crate::catalog::DevelopRecipe {
-            saturation: Some(10.0),
-            ..crate::catalog::DevelopRecipe::default()
-        };
-
-        let baseline_automatic = apply_recipe_scene_linear(
-            &mut baseline,
-            1,
-            1,
-            &settings,
-            None,
-            &AtomicBool::new(false),
-        )
-        .unwrap();
-        let developed_automatic = apply_recipe_scene_linear(
-            &mut developed,
-            1,
-            1,
-            &settings,
-            Some(&recipe),
-            &AtomicBool::new(false),
-        )
-        .unwrap();
-
-        assert!(baseline_automatic > 1.0);
-        assert_eq!(developed_automatic, 1.0);
-    }
-
-    #[test]
-    fn developed_recipe_uses_identity_exposure_instead_of_rendering_black() {
-        let settings = PhotographicSettings::default();
-        let recipe = crate::catalog::DevelopRecipe {
-            exposure_ev: Some(0.5),
-            ..crate::catalog::DevelopRecipe::default()
-        };
-        let mut pixels = vec![[0.18; 3]; 4];
-        let automatic = apply_recipe_scene_linear(
-            &mut pixels,
-            2,
-            2,
-            &settings,
-            Some(&recipe),
-            &AtomicBool::new(false),
-        )
-        .unwrap();
-        let (rendered, automatic_stops) = render_linear_rgb_with_exposure(
-            2,
-            2,
-            pixels,
-            &settings,
-            automatic,
-            &AtomicBool::new(false),
-        )
-        .unwrap();
-
-        assert_eq!(automatic_stops, 0.0);
-        assert!(
-            rendered
-                .pixels()
-                .all(|pixel| pixel.0[..3].iter().all(|value| *value > 0))
-        );
-    }
-
-    #[test]
-    fn wb_coefficients_use_neutral_for_absolute_and_as_shot_for_incremental() {
-        let as_shot = [2.0, 1.0, 1.5, 1.0];
-        let neutral = [1.2, 1.0, 0.8, 1.0];
-        let absolute = crate::catalog::DevelopRecipe {
-            white_balance: Some(crate::catalog::WhiteBalance {
-                temperature: 6_500.0,
-                tint: 0.0,
-            }),
-            ..crate::catalog::DevelopRecipe::default()
-        };
-        assert_eq!(
-            white_balance_coefficients(as_shot, neutral, &absolute),
-            neutral
-        );
-        let incremental = crate::catalog::DevelopRecipe {
-            white_balance_increment: Some(crate::catalog::WhiteBalanceIncrement {
-                temperature: 0.0,
-                tint: 0.0,
-            }),
-            ..crate::catalog::DevelopRecipe::default()
-        };
-        assert_eq!(
-            white_balance_coefficients(as_shot, neutral, &incremental),
-            as_shot
-        );
-    }
-
-    #[test]
-    fn raw_phase_c_sharpen_radius_changes_the_scene_linear_result() {
-        let mut small_radius = vec![[0.1; 3]; 49];
-        small_radius[24] = [1.0; 3];
-        let mut large_radius = small_radius.clone();
-        let recipe = |radius| crate::catalog::DevelopRecipe {
-            detail: Some(crate::catalog::DetailRecipe {
-                sharpening: 100.0,
-                sharpen_radius: radius,
-                sharpen_detail: 50.0,
-                ..crate::catalog::DetailRecipe::default()
-            }),
-            ..crate::catalog::DevelopRecipe::default()
-        };
-        apply_phase_c_scene_linear(
-            &mut small_radius,
-            7,
-            7,
-            &recipe(1.0),
-            &AtomicBool::new(false),
-        )
-        .unwrap();
-        apply_phase_c_scene_linear(
-            &mut large_radius,
-            7,
-            7,
-            &recipe(3.0),
-            &AtomicBool::new(false),
-        )
-        .unwrap();
-
-        assert_ne!(small_radius, large_radius);
-    }
-
-    #[test]
-    fn raw_phase_c_pixel_passes_observe_cancellation() {
-        let mut pixels = vec![[0.2, 0.3, 0.4]; 16];
-        let recipe = crate::catalog::DevelopRecipe {
-            texture: Some(10.0),
-            monochrome: Some(crate::catalog::MonochromeRecipe { mixer: [0.0; 8] }),
-            parametric_curve: Some([1.0; 4]),
-            ..crate::catalog::DevelopRecipe::default()
-        };
-        assert!(
-            apply_phase_c_scene_linear(&mut pixels, 4, 4, &recipe, &AtomicBool::new(true),)
-                .is_err()
-        );
-    }
-}
+#[path = "tests.rs"]
+mod tests;

@@ -1,3 +1,7 @@
+// A custom test harness does not apply libtest's implicit dead-code and
+// unused-import allowances to the binary under test.
+#![cfg_attr(test, allow(dead_code, unused_imports))]
+
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, BinaryHeap},
@@ -102,6 +106,7 @@ struct ValueCount {
     count: u64,
 }
 
+#[cfg(not(test))]
 fn main() -> Result<()> {
     let args = parse_args()?;
     let catalog = match args.catalog {
@@ -120,6 +125,9 @@ fn main() -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+test_r::enable!();
 
 fn parse_args() -> Result<Args> {
     let mut args = Args {
@@ -616,43 +624,5 @@ fn is_identifier_continue(value: u8) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_and_flattens_lightroom_table() {
-        let value = Parser::new(
-            r#"s = { Exposure2012 = 1.25, Enabled = true, Name = "Custom", Curve = { 0, 10, 255, 250, }, }"#,
-        )
-        .parse_assignment()
-        .unwrap();
-        let mut properties = BTreeMap::new();
-        flatten_value("", &value, &mut properties);
-        assert_eq!(properties["Exposure2012"].numeric_min, Some(1.25));
-        assert_eq!(properties["Curve"].tables, 1);
-        assert_eq!(properties["Curve.[2]"].numeric_min, Some(255.0));
-    }
-
-    #[test]
-    fn parses_lightroom_bracketed_string_keys() {
-        let value = Parser::new(r#"s = { Group = { ["x-default"] = "Profiles" } }"#)
-            .parse_assignment()
-            .unwrap();
-        let mut properties = BTreeMap::new();
-        flatten_value("", &value, &mut properties);
-        assert_eq!(properties["Group.x-default"].strings, 1);
-    }
-
-    #[test]
-    fn latest_catalog_skips_corrupt_catalogs_directory() {
-        let temp = tempfile::tempdir().unwrap();
-        fs::write(temp.path().join("valid.lrcat"), []).unwrap();
-        let corrupt = temp.path().join("Corrupt Catalogs");
-        fs::create_dir(&corrupt).unwrap();
-        fs::write(corrupt.join("newer.lrcat"), []).unwrap();
-        assert_eq!(
-            newest_catalog(temp.path()).unwrap(),
-            temp.path().join("valid.lrcat")
-        );
-    }
-}
+#[path = "lightroom_inventory/tests.rs"]
+mod tests;
