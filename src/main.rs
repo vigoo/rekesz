@@ -39,7 +39,8 @@ use discovery::{
 };
 use jobs::JobLimiter;
 use metadata::MetadataLoader;
-use preview::{PreviewCache, PreviewState, RenderInvocation, RenderPipeline};
+use preview::{PreviewCache, PreviewRenderer, PreviewState};
+use rendering::pipeline::RenderInvocation;
 use rendering::{RenderIdentity, RenderMode, RenderVariant};
 use scheduler::{
     DemandScopeId, JobCompletion, JobDemand, JobKey, JobPriority, JobSnapshotStatus, PriorityClass,
@@ -226,7 +227,7 @@ struct PictureBrowser {
     resizing_sidebar: bool,
     pair_preference: RawJpegPreference,
     work: WorkProgress,
-    render_pipeline: RenderPipeline,
+    render_pipeline: PreviewRenderer,
     scheduler: RenderScheduler,
     directory_scanner: DirectoryScanner,
     grid_demand_epoch: u64,
@@ -583,7 +584,7 @@ impl PictureBrowser {
         let root = model.root();
         let root_path = model.node(root).path.to_path_buf();
         let job_limiter = JobLimiter::new(config.job_parallelism);
-        let render_pipeline = RenderPipeline::with_source_cache_capacity(
+        let render_pipeline = PreviewRenderer::with_source_cache_capacity(
             config.cache_root.clone(),
             config.job_parallelism,
             config.raw_parallelism,

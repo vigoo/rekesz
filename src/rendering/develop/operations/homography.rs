@@ -5,7 +5,7 @@ use image::RgbaImage;
 use super::DevelopAction;
 use crate::rendering::develop::{actions, bilinear_sample, check, decode_error};
 
-pub(crate) struct Homography {
+pub(in crate::rendering::develop) struct Homography {
     pub matrix: [f32; 9],
 }
 

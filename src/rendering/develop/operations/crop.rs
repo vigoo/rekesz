@@ -8,7 +8,7 @@ use crate::{
     rendering::develop::{actions, decode_error, rotate_same_bounds},
 };
 
-pub(crate) struct CropAction {
+pub(in crate::rendering::develop) struct CropAction {
     pub parameters: Crop,
 }
 

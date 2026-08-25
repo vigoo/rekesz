@@ -10,12 +10,12 @@ fn stores_and_loads_an_image_with_its_render_metadata() {
     let cache = DiskRenderCache::new(directory.path().join("cache"));
     let request = RenderRequest::new(
         source,
-        super::super::RenderVariant::Thumbnail { width: 300 },
+        crate::rendering::RenderVariant::Thumbnail { width: 300 },
     );
     let rendered = RenderedImage {
         image: DynamicImage::ImageRgb8(ImageBuffer::from_pixel(2, 1, Rgb([1, 2, 3]))),
         metadata: RenderMetadata {
-            source_pipeline: super::super::SourcePipeline::Standard,
+            source_pipeline: crate::rendering::SourcePipeline::Standard,
             photographic: None,
             source_dimensions: (2, 1),
             output_dimensions: (2, 1),
@@ -59,34 +59,34 @@ fn phase_d_recipe_and_action_metadata_round_trip() {
         }),
         ..crate::catalog::DevelopRecipe::default()
     };
-    let identity = super::super::RenderIdentity {
-        mode: super::super::RenderMode::Developed,
+    let identity = crate::rendering::RenderIdentity {
+        mode: crate::rendering::RenderMode::Developed,
         recipe_digest: recipe.digest().unwrap(),
         renderer_model: crate::catalog::RENDERER_MODEL_VERSION,
     };
     let request = RenderRequest::with_identity(
         source,
-        super::super::RenderVariant::Thumbnail { width: 300 },
+        crate::rendering::RenderVariant::Thumbnail { width: 300 },
         identity,
     );
-    let phase_d_actions = super::super::develop::actions::HEAL
-        | super::super::develop::actions::LENS
-        | super::super::develop::actions::UPRIGHT
-        | super::super::develop::actions::GRAIN;
+    let phase_d_actions = crate::rendering::develop::actions::HEAL
+        | crate::rendering::develop::actions::LENS
+        | crate::rendering::develop::actions::UPRIGHT
+        | crate::rendering::develop::actions::GRAIN;
     let rendered = RenderedImage {
         image: DynamicImage::ImageRgb8(ImageBuffer::from_pixel(2, 1, Rgb([1, 2, 3]))),
         metadata: RenderMetadata {
-            source_pipeline: super::super::SourcePipeline::Standard,
+            source_pipeline: crate::rendering::SourcePipeline::Standard,
             photographic: None,
             source_dimensions: (2, 1),
             output_dimensions: (2, 1),
             variant: request.variant,
             orientation_applied: None,
-            develop: Some(super::super::DevelopRenderMetadata {
+            develop: Some(crate::rendering::DevelopRenderMetadata {
                 identity,
                 recipe,
                 applied_actions: phase_d_actions,
-                fidelity_warnings: super::super::develop::warnings::APPROXIMATED,
+                fidelity_warnings: crate::rendering::develop::warnings::APPROXIMATED,
             }),
         },
     };
@@ -113,13 +113,13 @@ fn recipe_and_mode_are_part_of_the_cache_key() {
     fs::write(&source, b"source").unwrap();
     let baseline = RenderRequest::new(
         source.clone(),
-        super::super::RenderVariant::Thumbnail { width: 300 },
+        crate::rendering::RenderVariant::Thumbnail { width: 300 },
     );
     let developed = RenderRequest::with_identity(
         source,
         baseline.variant,
-        super::super::RenderIdentity {
-            mode: super::super::RenderMode::Developed,
+        crate::rendering::RenderIdentity {
+            mode: crate::rendering::RenderMode::Developed,
             recipe_digest: [7; 32],
             renderer_model: 1,
         },
@@ -133,6 +133,55 @@ fn recipe_and_mode_are_part_of_the_cache_key() {
 }
 
 #[test]
+fn persisted_cache_protocol_constants_are_stable() {
+    assert_eq!(CACHE_VERSION, "render-v2");
+    assert_eq!(
+        cache_extension(RenderVariant::Preview {
+            max_width: 1,
+            max_height: 1
+        }),
+        "qoi"
+    );
+    assert_eq!(
+        cache_format(RenderVariant::Preview {
+            max_width: 1,
+            max_height: 1
+        }),
+        ImageFormat::Qoi
+    );
+    assert_eq!(
+        cache_extension(RenderVariant::Thumbnail { width: 1 }),
+        "png"
+    );
+    assert_eq!(
+        cache_format(RenderVariant::Thumbnail { width: 1 }),
+        ImageFormat::Png
+    );
+
+    let request = RenderRequest::with_identity(
+        PathBuf::from("/compat/source.nef"),
+        RenderVariant::Preview {
+            max_width: 1_200,
+            max_height: 800,
+        },
+        crate::rendering::RenderIdentity {
+            mode: crate::rendering::RenderMode::Developed,
+            recipe_digest: [7; 32],
+            renderer_model: 2,
+        },
+    );
+    let identity = SourceIdentity {
+        length: 123_456,
+        modified_seconds: 1_700_000_000,
+        modified_nanos: 123_000_000,
+    };
+    assert_eq!(
+        cache_key(&request, &identity, &PhotographicSettings::default()).unwrap(),
+        "dae5d3a347b8e3fb668e0eb195e1070d5817bf0a207bcce07a37d366d5501f5f"
+    );
+}
+
+#[test]
 fn cleanup_removes_the_least_recently_accessed_entry() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("cache");
@@ -141,11 +190,11 @@ fn cleanup_removes_the_least_recently_accessed_entry() {
     let rendered = RenderedImage {
         image: DynamicImage::ImageRgb8(ImageBuffer::from_pixel(8, 8, Rgb([1, 2, 3]))),
         metadata: RenderMetadata {
-            source_pipeline: super::super::SourcePipeline::Standard,
+            source_pipeline: crate::rendering::SourcePipeline::Standard,
             photographic: None,
             source_dimensions: (8, 8),
             output_dimensions: (8, 8),
-            variant: super::super::RenderVariant::Thumbnail { width: 300 },
+            variant: crate::rendering::RenderVariant::Thumbnail { width: 300 },
             orientation_applied: None,
             develop: None,
         },

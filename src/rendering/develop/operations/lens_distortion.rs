@@ -5,7 +5,7 @@ use image::RgbaImage;
 use super::DevelopAction;
 use crate::rendering::develop::{actions, bilinear_sample, check};
 
-pub(crate) struct LensDistortion {
+pub(in crate::rendering::develop) struct LensDistortion {
     pub amount: f32,
 }
 

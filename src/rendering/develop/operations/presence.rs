@@ -5,7 +5,7 @@ use image::RgbaImage;
 use super::DevelopAction;
 use crate::rendering::develop::{actions, cancellable_box_blur, check};
 
-pub(crate) struct Presence {
+pub(in crate::rendering::develop) struct Presence {
     pub texture: Option<f32>,
     pub dehaze: Option<f32>,
 }

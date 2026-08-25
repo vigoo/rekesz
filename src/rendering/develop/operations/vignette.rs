@@ -8,7 +8,7 @@ use crate::{
     rendering::develop::{actions, check},
 };
 
-pub(crate) struct Vignette {
+pub(in crate::rendering::develop) struct Vignette {
     pub parameters: VignetteRecipe,
 }
 

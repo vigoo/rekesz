@@ -112,8 +112,12 @@ fn export_fixed_reference_renders() {
         root.join("2026/Alpok túra/2026-08-03/IMG_1056.CR3"),
     ];
     let cache = tempfile::tempdir().unwrap();
-    let pipeline =
-        RenderPipeline::with_source_cache_capacity(cache.path().to_path_buf(), 1, 1, samples.len());
+    let pipeline = PreviewRenderer::with_source_cache_capacity(
+        cache.path().to_path_buf(),
+        1,
+        1,
+        samples.len(),
+    );
     let cancelled = Arc::new(AtomicBool::new(false));
     for path in samples {
         let entry = recipes.get(&path).unwrap();
@@ -491,7 +495,7 @@ fn benchmark_all_scheduled_jobs() {
     assert_eq!(metadata.len(), cached_metadata.len());
 
     let pipeline =
-        RenderPipeline::with_source_cache_capacity(cache.path().join("renders"), 2, 2, 8);
+        PreviewRenderer::with_source_cache_capacity(cache.path().join("renders"), 2, 2, 8);
     let render_limiter = limiter.clone();
     let pipeline_for_scheduler = pipeline.clone();
     let scheduler = RenderScheduler::new(
@@ -674,7 +678,7 @@ fn benchmark_scheduler_cancellation_and_parallelism() {
 
     let throughput = |parallelism: usize| {
         let cache = tempfile::tempdir().unwrap();
-        let pipeline = RenderPipeline::with_source_cache_capacity(
+        let pipeline = PreviewRenderer::with_source_cache_capacity(
             cache.path().to_path_buf(),
             parallelism,
             parallelism,
@@ -717,7 +721,7 @@ fn benchmark_scheduler_cancellation_and_parallelism() {
     let cancellation_handoff = |raw: &PathBuf| {
         let cache = tempfile::tempdir().unwrap();
         let pipeline =
-            RenderPipeline::with_source_cache_capacity(cache.path().to_path_buf(), 1, 1, 1);
+            PreviewRenderer::with_source_cache_capacity(cache.path().to_path_buf(), 1, 1, 1);
         let executor_pipeline = pipeline.clone();
         let scheduler = RenderScheduler::new(
             1,

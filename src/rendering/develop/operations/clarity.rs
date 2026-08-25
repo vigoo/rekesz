@@ -5,7 +5,7 @@ use image::RgbaImage;
 use super::DevelopAction;
 use crate::rendering::develop::{actions, cancellable_box_blur, check};
 
-pub(crate) struct Clarity {
+pub(in crate::rendering::develop) struct Clarity {
     pub amount: f32,
 }
 

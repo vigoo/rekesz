@@ -29,18 +29,17 @@ fn developed_render_applies_recipe_and_records_identity() {
     };
     let request = RenderRequest::with_identity(source, RenderVariant::Full, identity);
     let cancelled = Arc::new(AtomicBool::new(false));
-    let decoded = backend.decode_source(&request, &cancelled).unwrap();
+    let plan = plan::RenderPlan::compile(
+        request.path.clone(),
+        request.variant,
+        identity,
+        Some(&recipe),
+    )
+    .unwrap();
+    let decoded = backend.decode_source(&plan, &cancelled).unwrap();
     let baseline = decoded.image.to_rgb8().get_pixel(0, 0)[0];
 
-    let rendered = backend
-        .render_source(
-            request.variant,
-            identity,
-            Some(&recipe),
-            decoded,
-            &cancelled,
-        )
-        .unwrap();
+    let rendered = backend.render_source(&plan, decoded, &cancelled).unwrap();
 
     assert!(rendered.image.to_rgb8().get_pixel(0, 0)[0] > baseline);
     let metadata = rendered.metadata.develop.unwrap();
@@ -80,4 +79,51 @@ fn stale_render_is_not_stored_under_a_changed_source_identity() {
             .unwrap()
             .is_none()
     );
+}
+
+#[test]
+fn rendering_sources_preserve_dependency_direction() {
+    fn visit(directory: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+        for entry in fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(&path, files);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                files.push(path);
+            }
+        }
+    }
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/rendering");
+    let mut files = Vec::new();
+    visit(&root, &mut files);
+    for path in files {
+        if path == root.join("tests.rs") {
+            continue;
+        }
+        let source = fs::read_to_string(&path).unwrap();
+        assert!(
+            !source.contains("crate::preview"),
+            "{} imports preview",
+            path.display()
+        );
+        assert!(!source.contains("gpui"), "{} imports GPUI", path.display());
+        if path != root.join("mod.rs")
+            && !path.components().any(|part| part.as_os_str() == "pipeline")
+        {
+            assert!(
+                !source.contains("pipeline::"),
+                "{} imports upward from pipeline",
+                path.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn pipeline_is_the_stable_rendering_entrypoint() {
+    let _constructor: fn(PathBuf, usize, usize, usize) -> pipeline::RenderPipeline =
+        pipeline::RenderPipeline::with_source_cache_capacity;
+    fn accepts_invocation(_: pipeline::RenderInvocation<'_>) {}
+    let _ = accepts_invocation;
 }

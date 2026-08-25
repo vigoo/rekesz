@@ -8,7 +8,7 @@ use crate::{
     rendering::develop::{actions, check},
 };
 
-pub(crate) struct Monochrome {
+pub(in crate::rendering::develop) struct Monochrome {
     pub parameters: MonochromeRecipe,
 }
 

@@ -8,7 +8,7 @@ use crate::{
     rendering::develop::{actions, check},
 };
 
-pub(crate) struct Grain {
+pub(in crate::rendering::develop) struct Grain {
     pub parameters: GrainRecipe,
 }
 

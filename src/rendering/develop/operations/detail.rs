@@ -8,7 +8,7 @@ use crate::{
     rendering::develop::{actions, cancellable_box_blur, check},
 };
 
-pub(crate) struct Detail {
+pub(in crate::rendering::develop) struct Detail {
     pub parameters: DetailRecipe,
 }
 

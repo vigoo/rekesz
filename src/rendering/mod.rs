@@ -1,13 +1,21 @@
-//! Blocking image rendering backend.
+//! Rendering core and blocking pipeline.
 //!
-//! The backend has no UI or cache knowledge. Requests and settings are value
-//! types so they can later become stable memory/disk-cache keys, while callers
-//! remain free to schedule work on any executor.
+//! UI code enters through [`pipeline::RenderPipeline`] with a
+//! [`pipeline::RenderInvocation`]. The pipeline compiles one validated plan,
+//! then drives cache lookup, decode, photographic RAW processing, develop
+//! actions, resizing, and optional persistence in that order. Lower layers do
+//! not depend on the pipeline or on preview/UI state; decoded data lives at a
+//! neutral boundary shared by decode, cache, and photographic processing.
 
-pub(crate) mod develop;
-mod disk_cache;
+mod cache;
+mod decode;
+mod decoded;
+mod develop;
 mod photographic;
-pub(crate) mod source;
+/// Scheduling and resource-management entry point for blocking renders.
+pub(crate) mod pipeline;
+mod plan;
+mod resize;
 
 use std::{
     path::PathBuf,
@@ -38,7 +46,7 @@ pub fn assert_hevc_decoder_available() -> anyhow::Result<()> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct RenderRequest {
+pub(crate) struct RenderRequest {
     pub path: PathBuf,
     pub variant: RenderVariant,
     pub identity: RenderIdentity,
@@ -129,7 +137,7 @@ pub struct DevelopRenderMetadata {
 }
 
 #[derive(Clone)]
-pub struct RenderedImage {
+pub(crate) struct RenderedImage {
     pub image: DynamicImage,
     pub metadata: RenderMetadata,
 }
@@ -142,28 +150,25 @@ pub struct SourceIdentity {
 }
 
 #[derive(Clone, Debug)]
-pub struct RenderBackend {
+struct RenderBackend {
     pub raw: PhotographicSettings,
-    disk_cache: disk_cache::DiskRenderCache,
+    disk_cache: cache::DiskRenderCache,
 }
 
 impl RenderBackend {
-    pub fn new(cache_root: PathBuf) -> Self {
+    fn new(cache_root: PathBuf) -> Self {
         Self {
             raw: PhotographicSettings::default(),
-            disk_cache: disk_cache::DiskRenderCache::new(cache_root),
+            disk_cache: cache::DiskRenderCache::new(cache_root),
         }
     }
 
     /// Filesystem cache lookup stage. This performs blocking metadata and file I/O.
-    pub fn source_identity(
-        &self,
-        request: &RenderRequest,
-    ) -> Result<Option<SourceIdentity>, String> {
-        disk_cache::source_identity(request)
+    fn source_identity(&self, request: &RenderRequest) -> Result<Option<SourceIdentity>, String> {
+        cache::source_identity(request)
     }
 
-    pub fn lookup_cache(
+    fn lookup_cache(
         &self,
         request: &RenderRequest,
         identity: Option<&SourceIdentity>,
@@ -180,25 +185,16 @@ impl RenderBackend {
     /// Source decode stage. This may be CPU and memory intensive.
     pub(crate) fn decode_source(
         &self,
-        request: &RenderRequest,
+        plan: &plan::RenderPlan,
         cancelled: &Arc<AtomicBool>,
-    ) -> image::ImageResult<Arc<source::DecodedSource>> {
-        source::decode(
-            &request.path,
-            &self.raw,
-            request.variant,
-            request.identity.mode == RenderMode::Developed,
-            cancelled,
-        )
-        .map(Arc::new)
+    ) -> image::ImageResult<Arc<decoded::DecodedSource>> {
+        decode::decode(plan, cancelled).map(Arc::new)
     }
 
     pub(crate) fn render_source(
         &self,
-        variant: RenderVariant,
-        request_identity: RenderIdentity,
-        recipe: Option<&DevelopRecipe>,
-        decoded: Arc<source::DecodedSource>,
+        plan: &plan::RenderPlan,
+        decoded: Arc<decoded::DecodedSource>,
         cancelled: &Arc<AtomicBool>,
     ) -> image::ImageResult<RenderedImage> {
         if cancelled.load(Ordering::Acquire) {
@@ -209,140 +205,26 @@ impl RenderBackend {
                 ),
             ));
         }
+        let request_identity = plan.request().identity;
+        let recipe = plan.recipe();
         let source_dimensions = decoded.source_dimensions;
         let (source_image, photographic, raw_preapplied, raw_fidelity) = match &decoded.raw_linear {
             Some(raw) => {
-                let (image, metadata) = photographic::render_raw(
-                    raw,
-                    &self.raw,
-                    (request_identity.mode == RenderMode::Developed)
-                        .then_some(recipe)
-                        .flatten(),
-                    cancelled,
-                )
-                .map_err(|error| {
-                    image::ImageError::Decoding(image::error::DecodingError::new(
-                        image::error::ImageFormatHint::Unknown,
-                        error,
-                    ))
-                })?;
-                let actions = recipe
-                    .filter(|_| request_identity.mode == RenderMode::Developed)
-                    .map(|recipe| {
-                        let mut actions = 0;
-                        if recipe.exposure_ev.is_some() {
-                            actions |= develop::actions::EXPOSURE;
-                        }
-                        if recipe.white_balance.is_some()
-                            || recipe.white_balance_increment.is_some()
-                        {
-                            actions |= develop::actions::WHITE_BALANCE;
-                        }
-                        if recipe.contrast.is_some()
-                            || recipe.highlights.is_some()
-                            || recipe.shadows.is_some()
-                            || recipe.whites.is_some()
-                            || recipe.blacks.is_some()
-                        {
-                            actions |= develop::actions::BASIC_TONE;
-                        }
-                        if recipe.saturation.is_some() || recipe.vibrance.is_some() {
-                            actions |= develop::actions::COLOR;
-                        }
-                        if recipe.tone_curve.is_some()
-                            || recipe.tone_curve_red.is_some()
-                            || recipe.tone_curve_green.is_some()
-                            || recipe.tone_curve_blue.is_some()
-                        {
-                            actions |= develop::actions::TONE_CURVE;
-                        }
-                        if recipe.detail.is_some() {
-                            actions |= develop::actions::DETAIL;
-                        }
-                        if recipe.texture.is_some() || recipe.dehaze.is_some() {
-                            actions |= develop::actions::TEXTURE_DEHAZE;
-                        }
-                        if recipe.monochrome.is_some() {
-                            actions |= develop::actions::MONOCHROME;
-                        }
-                        if recipe.parametric_curve.is_some() {
-                            actions |= develop::actions::PARAMETRIC_CURVE;
-                        }
-                        actions
-                    })
-                    .unwrap_or(0);
-                let approximate = recipe
-                    .filter(|_| request_identity.mode == RenderMode::Developed)
-                    .is_some_and(|recipe| {
-                        recipe.white_balance.is_some()
-                            || recipe.white_balance_increment.is_some()
-                            || recipe.contrast.is_some()
-                            || recipe.highlights.is_some()
-                            || recipe.shadows.is_some()
-                            || recipe.whites.is_some()
-                            || recipe.blacks.is_some()
-                            || recipe.saturation.is_some()
-                            || recipe.vibrance.is_some()
-                            || recipe.tone_curve.is_some()
-                            || recipe.tone_curve_red.is_some()
-                            || recipe.tone_curve_green.is_some()
-                            || recipe.tone_curve_blue.is_some()
-                            || recipe.detail.is_some()
-                            || recipe.texture.is_some()
-                            || recipe.dehaze.is_some()
-                            || recipe.monochrome.is_some()
-                            || recipe.parametric_curve.is_some()
-                    });
-                (
-                    image,
-                    Some(metadata),
-                    actions,
-                    if approximate {
-                        develop::warnings::APPROXIMATED
-                    } else {
-                        0
-                    },
-                )
+                let (image, metadata) =
+                    photographic::render_raw(raw, &self.raw, plan.raw_recipe(), cancelled)
+                        .map_err(|error| {
+                            image::ImageError::Decoding(image::error::DecodingError::new(
+                                image::error::ImageFormatHint::Unknown,
+                                error,
+                            ))
+                        })?;
+                let (actions, warnings) = plan.raw_metadata();
+                (image, Some(metadata), actions, warnings)
             }
             None => (decoded.image.clone(), decoded.photographic, 0, 0),
         };
-        let source_image = match (variant, recipe) {
-            (RenderVariant::Thumbnail { width }, None) => source_image.thumbnail(width, width),
-            (
-                RenderVariant::Preview {
-                    max_width,
-                    max_height,
-                },
-                None,
-            ) => source_image.thumbnail(max_width, max_height),
-            _ => source_image,
-        };
-        let post_recipe = recipe.map(|recipe| {
-            let mut recipe = recipe.clone();
-            if decoded.raw_linear.is_some() {
-                recipe.exposure_ev = None;
-                recipe.white_balance = None;
-                recipe.white_balance_increment = None;
-                recipe.contrast = None;
-                recipe.highlights = None;
-                recipe.shadows = None;
-                recipe.whites = None;
-                recipe.blacks = None;
-                recipe.saturation = None;
-                recipe.vibrance = None;
-                recipe.tone_curve = None;
-                recipe.tone_curve_red = None;
-                recipe.tone_curve_green = None;
-                recipe.tone_curve_blue = None;
-                recipe.detail = None;
-                recipe.texture = None;
-                recipe.dehaze = None;
-                recipe.monochrome = None;
-                recipe.parametric_curve = None;
-            }
-            recipe
-        });
-        let (developed, mut applied_actions, mut fidelity_warnings) = match post_recipe.as_ref() {
+        let source_image = resize::before_develop(source_image, plan.resize());
+        let (developed, mut applied_actions, mut fidelity_warnings) = match plan.post_recipe() {
             Some(recipe) if request_identity.mode == RenderMode::Developed => {
                 develop::apply(&source_image, recipe, cancelled)?
             }
@@ -350,14 +232,7 @@ impl RenderBackend {
         };
         applied_actions |= raw_preapplied;
         fidelity_warnings |= raw_fidelity;
-        let image = match variant {
-            RenderVariant::Full => developed,
-            RenderVariant::Thumbnail { width } => developed.thumbnail(width, width),
-            RenderVariant::Preview {
-                max_width,
-                max_height,
-            } => developed.thumbnail(max_width, max_height),
-        };
+        let image = resize::output(developed, plan.resize());
         if cancelled.load(Ordering::Acquire) {
             return Err(image::ImageError::Decoding(
                 image::error::DecodingError::new(
@@ -374,7 +249,7 @@ impl RenderBackend {
                 photographic,
                 source_dimensions,
                 output_dimensions,
-                variant,
+                variant: plan.request().variant,
                 orientation_applied: decoded.orientation_applied,
                 develop: (request_identity.mode == RenderMode::Developed).then_some(
                     DevelopRenderMetadata {
@@ -389,7 +264,7 @@ impl RenderBackend {
     }
 
     /// Persistent cache-write stage. Callers may defer this after publishing pixels.
-    pub fn store_cache(
+    fn store_cache(
         &self,
         request: &RenderRequest,
         identity: &SourceIdentity,

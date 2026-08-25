@@ -5,7 +5,7 @@ use image::RgbaImage;
 use super::DevelopAction;
 use crate::rendering::develop::{actions, check, linear_to_srgb, luminance, srgb_to_linear};
 
-pub(crate) struct ParametricCurve {
+pub(in crate::rendering::develop) struct ParametricCurve {
     pub controls: [f32; 4],
 }
 

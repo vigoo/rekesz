@@ -8,7 +8,7 @@ use crate::{
     rendering::develop::{actions, bilinear_sample, check},
 };
 
-pub(crate) struct Heal<'a> {
+pub(in crate::rendering::develop) struct Heal<'a> {
     pub spots: &'a [HealSpot],
 }
 

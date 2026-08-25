@@ -13,7 +13,7 @@ use std::{
 use image::DynamicImage;
 use image::ImageFormat;
 
-use super::{
+use crate::rendering::{
     PhotographicSettings, RenderMetadata, RenderRequest, RenderVariant, RenderedImage,
     SourceIdentity,
 };
@@ -23,7 +23,7 @@ const DEFAULT_CACHE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const CLEANUP_INTERVAL: u64 = 32;
 
 #[derive(Clone, Debug)]
-pub struct DiskRenderCache {
+pub(in crate::rendering) struct DiskRenderCache {
     root: PathBuf,
     max_bytes: u64,
     lock: Arc<RwLock<()>>,
@@ -31,7 +31,7 @@ pub struct DiskRenderCache {
 }
 
 impl DiskRenderCache {
-    pub fn new(root: PathBuf) -> Self {
+    pub(in crate::rendering) fn new(root: PathBuf) -> Self {
         Self {
             root,
             max_bytes: DEFAULT_CACHE_BYTES,
@@ -40,7 +40,7 @@ impl DiskRenderCache {
         }
     }
 
-    pub fn load(
+    pub(in crate::rendering) fn load(
         &self,
         request: &RenderRequest,
         identity: &SourceIdentity,
@@ -85,7 +85,7 @@ impl DiskRenderCache {
         Ok(Some(RenderedImage { image, metadata }))
     }
 
-    pub fn store(
+    pub(in crate::rendering) fn store(
         &self,
         request: &RenderRequest,
         identity: &SourceIdentity,
@@ -228,7 +228,9 @@ fn unix_timestamp_nanos() -> u128 {
         .as_nanos()
 }
 
-pub(super) fn source_identity(request: &RenderRequest) -> Result<Option<SourceIdentity>, String> {
+pub(in crate::rendering) fn source_identity(
+    request: &RenderRequest,
+) -> Result<Option<SourceIdentity>, String> {
     let source = match fs::metadata(&request.path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),

@@ -8,7 +8,7 @@ use crate::{
     rendering::develop::{actions, check, linear_to_srgb, luminance, sample_curve, srgb_to_linear},
 };
 
-pub(crate) struct Global<'a> {
+pub(in crate::rendering::develop) struct Global<'a> {
     pub exposure_ev: Option<f32>,
     pub contrast: Option<f32>,
     pub highlights: Option<f32>,
