@@ -13,7 +13,7 @@ use crate::rendering::pipeline::RenderPipeline as CoreRenderPipeline;
 use crate::rendering::{RenderIdentity, RenderVariant};
 
 use crate::rendering::pipeline::RenderInvocation;
-pub use cache::{DecodedPreview, PreviewCache, PreviewState};
+pub use cache::{DecodedPreview, PreviewCache, PreviewCacheStats, PreviewState};
 
 /// UI adapter around the renderer. Core execution returns a renderer-owned
 /// image; this layer performs the GPUI conversion and exposes preview state.
@@ -39,9 +39,16 @@ impl PreviewRenderer {
         }
     }
 
-    #[cfg(test)]
     pub fn stats(&self) -> crate::rendering::pipeline::PipelineStats {
         self.pipeline.stats()
+    }
+
+    pub fn disk_cache_usage(&self) -> Result<crate::rendering::pipeline::DiskCacheUsage, String> {
+        self.pipeline.disk_cache_usage()
+    }
+
+    pub fn set_source_cache_capacity(&self, capacity: usize) {
+        self.pipeline.set_source_cache_capacity(capacity);
     }
 
     #[cfg(test)]

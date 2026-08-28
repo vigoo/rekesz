@@ -35,6 +35,35 @@ fn stores_and_loads_an_image_with_its_render_metadata() {
 }
 
 #[test]
+fn usage_reports_complete_entries_and_the_cache_budget() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("cache");
+    let cache = DiskRenderCache::new(root.clone());
+    assert_eq!(
+        cache.usage().unwrap(),
+        DiskCacheUsage {
+            max_bytes: DEFAULT_CACHE_BYTES,
+            ..DiskCacheUsage::default()
+        }
+    );
+
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("entry.qoi"), [0_u8; 10]).unwrap();
+    fs::write(root.join("entry.json"), [0_u8; 20]).unwrap();
+    fs::write(root.join("entry.access"), [0_u8; 5]).unwrap();
+    fs::write(root.join("orphan.json"), [0_u8; 100]).unwrap();
+
+    assert_eq!(
+        cache.usage().unwrap(),
+        DiskCacheUsage {
+            used_bytes: 35,
+            max_bytes: DEFAULT_CACHE_BYTES,
+            entries: 1,
+        }
+    );
+}
+
+#[test]
 fn phase_d_recipe_and_action_metadata_round_trip() {
     let directory = tempfile::tempdir().unwrap();
     let source = directory.path().join("source.jpg");

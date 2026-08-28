@@ -22,6 +22,13 @@ const CACHE_VERSION: &str = "render-v2";
 const DEFAULT_CACHE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const CLEANUP_INTERVAL: u64 = 32;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DiskCacheUsage {
+    pub used_bytes: u64,
+    pub max_bytes: u64,
+    pub entries: u64,
+}
+
 #[derive(Clone, Debug)]
 pub(in crate::rendering) struct DiskRenderCache {
     root: PathBuf,
@@ -83,6 +90,53 @@ impl DiskRenderCache {
             );
         }
         Ok(Some(RenderedImage { image, metadata }))
+    }
+
+    pub(crate) fn usage(&self) -> Result<DiskCacheUsage, String> {
+        let _guard = self
+            .lock
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let directory = match fs::read_dir(&self.root) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(DiskCacheUsage {
+                    max_bytes: self.max_bytes,
+                    ..DiskCacheUsage::default()
+                });
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        let mut usage = DiskCacheUsage {
+            max_bytes: self.max_bytes,
+            ..DiskCacheUsage::default()
+        };
+        for entry in directory {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let path = entry.path();
+            if path
+                .extension()
+                .is_none_or(|extension| extension != "png" && extension != "qoi")
+            {
+                continue;
+            }
+            let key = path.file_stem().unwrap_or_default().to_string_lossy();
+            usage.used_bytes = usage
+                .used_bytes
+                .saturating_add(entry.metadata().map_err(|error| error.to_string())?.len())
+                .saturating_add(
+                    fs::metadata(self.root.join(format!("{key}.json")))
+                        .map(|metadata| metadata.len())
+                        .unwrap_or(0),
+                )
+                .saturating_add(
+                    fs::metadata(self.root.join(format!("{key}.access")))
+                        .map(|metadata| metadata.len())
+                        .unwrap_or(0),
+                );
+            usage.entries = usage.entries.saturating_add(1);
+        }
+        Ok(usage)
     }
 
     pub(in crate::rendering) fn store(

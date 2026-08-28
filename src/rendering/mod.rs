@@ -182,6 +182,10 @@ impl RenderBackend {
         self.disk_cache.load(request, identity, &self.raw)
     }
 
+    fn disk_cache_usage(&self) -> Result<cache::DiskCacheUsage, String> {
+        self.disk_cache.usage()
+    }
+
     /// Source decode stage. This may be CPU and memory intensive.
     pub(crate) fn decode_source(
         &self,

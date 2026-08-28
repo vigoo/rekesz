@@ -224,6 +224,14 @@ impl DirectoryModel {
         &self.nodes[id.0]
     }
 
+    pub fn node_id(&self, path: &Path) -> Option<NodeId> {
+        self.by_path.get(path).copied()
+    }
+
+    pub fn ensure_node(&mut self, path: PathBuf) -> NodeId {
+        self.insert_node(path)
+    }
+
     pub fn loaded(&self, id: NodeId) -> Option<&LoadedDirectory> {
         match &self.node(id).contents {
             DirectoryContents::Loaded(contents) => Some(contents),

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -390,6 +390,65 @@ pub fn load_recipes(root: &Path) -> Result<HashMap<PathBuf, RecipeEntry>> {
     Ok(recipes)
 }
 
+pub fn load_hidden_subtrees(root: &Path) -> Result<HashSet<PathBuf>> {
+    let path = catalog_path(root);
+    if !path.is_file() {
+        return Ok(HashSet::new());
+    }
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    validate_schema(&connection)?;
+    let table_exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='hidden_subtrees')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !table_exists {
+        return Ok(HashSet::new());
+    }
+    let mut query = connection.prepare("SELECT relative_path FROM hidden_subtrees")?;
+    let rows = query.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+    rows.map(|row| Ok(root.join(decode_relative_path(&row?)?)))
+        .collect()
+}
+
+pub fn save_hidden_subtrees(root: &Path, hidden_subtrees: &HashSet<PathBuf>) -> Result<()> {
+    let directory = root.join(CATALOG_DIR);
+    fs::create_dir_all(&directory)?;
+    let mut connection = Connection::open(catalog_path(root))?;
+    initialize_schema(&mut connection)?;
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS hidden_subtrees(\
+             relative_path BLOB PRIMARY KEY,\
+             hidden_at TEXT NOT NULL\
+         )",
+        [],
+    )?;
+    let transaction = connection.transaction()?;
+    transaction.execute("DELETE FROM hidden_subtrees", [])?;
+    for subtree in hidden_subtrees {
+        let relative = subtree.strip_prefix(root).with_context(|| {
+            format!(
+                "hidden subtree {} is outside library {}",
+                subtree.display(),
+                root.display()
+            )
+        })?;
+        if relative.as_os_str().is_empty() {
+            bail!("the library root cannot be hidden");
+        }
+        let encoded = encode_relative_path(relative)?;
+        transaction.execute(
+            "INSERT INTO hidden_subtrees(relative_path, hidden_at) VALUES (?1, datetime('now'))",
+            [&encoded],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
 #[cfg(test)]
 pub fn analyze_lightroom(root: &Path, lightroom_catalog: &Path) -> Result<ImportReport> {
     import_lightroom_inner(root, lightroom_catalog, false, CURRENT_IMPORT_CAPABILITIES)
@@ -593,6 +652,10 @@ fn initialize_schema(connection: &mut Connection) -> Result<()> {
              recipe_json TEXT NOT NULL,
              recipe_digest BLOB NOT NULL,
              imported_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS hidden_subtrees(
+             relative_path BLOB PRIMARY KEY,
+             hidden_at TEXT NOT NULL
          );
          INSERT INTO catalog_meta(id, schema_version, renderer_model, created_at)
          SELECT 1, {SCHEMA_VERSION}, {RENDERER_MODEL_VERSION}, datetime('now')

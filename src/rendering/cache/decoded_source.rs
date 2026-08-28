@@ -3,7 +3,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -26,7 +26,7 @@ pub(in crate::rendering) struct DecodedSourceCache {
     entries: Mutex<HashMap<DecodedSourceKey, DecodedSourceEntry>>,
     order: Mutex<VecDeque<DecodedSourceKey>>,
     wake: Condvar,
-    capacity: usize,
+    capacity: AtomicUsize,
     hits: AtomicU64,
 }
 
@@ -36,14 +36,25 @@ impl DecodedSourceCache {
             entries: Mutex::new(HashMap::new()),
             order: Mutex::new(VecDeque::new()),
             wake: Condvar::new(),
-            capacity: capacity.max(1),
+            capacity: AtomicUsize::new(capacity.max(1)),
             hits: AtomicU64::new(0),
         }
     }
 
-    #[cfg(test)]
     pub(in crate::rendering) fn hits(&self) -> u64 {
         self.hits.load(Ordering::Relaxed)
+    }
+
+    pub(in crate::rendering) fn set_capacity(&self, capacity: usize) {
+        let capacity = capacity.max(1);
+        self.capacity.store(capacity, Ordering::Relaxed);
+        let mut entries = self.entries.lock().unwrap();
+        let mut order = self.order.lock().unwrap();
+        while order.len() > capacity {
+            if let Some(oldest) = order.pop_front() {
+                entries.remove(&oldest);
+            }
+        }
     }
 
     pub(in crate::rendering) fn get_or_decode(
@@ -81,7 +92,7 @@ impl DecodedSourceCache {
                             let mut order = self.order.lock().unwrap();
                             order.retain(|candidate| candidate != &key);
                             order.push_back(key.clone());
-                            while order.len() > self.capacity {
+                            while order.len() > self.capacity.load(Ordering::Relaxed) {
                                 if let Some(oldest) = order.pop_front()
                                     && oldest != key
                                 {

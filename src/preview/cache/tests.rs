@@ -32,6 +32,42 @@ fn load(cache: &mut PreviewCache, path: &Path) {
 }
 
 #[test]
+fn stats_estimate_loaded_rgba_pixel_memory() {
+    let mut cache = PreviewCache::new(2);
+    load(&mut cache, Path::new("loaded.jpg"));
+    cache
+        .begin(Path::new("loading.jpg"), RenderVariant::Full)
+        .unwrap();
+
+    assert_eq!(
+        cache.stats(),
+        PreviewCacheStats {
+            capacity: 2,
+            loaded: 1,
+            loading: 1,
+            errors: 0,
+            estimated_memory_bytes: 4,
+        }
+    );
+}
+
+#[test]
+fn reducing_capacity_immediately_evicts_loaded_images() {
+    let mut cache = PreviewCache::new(2);
+    load(&mut cache, Path::new("first.jpg"));
+    load(&mut cache, Path::new("second.jpg"));
+
+    cache.set_capacity(1);
+
+    assert_eq!(cache.stats().capacity, 1);
+    assert_eq!(cache.stats().loaded, 1);
+    assert!(matches!(
+        cache.state(Path::new("first.jpg")),
+        PreviewState::Unloaded
+    ));
+}
+
+#[test]
 fn larger_preview_satisfies_smaller_request() {
     let mut cache = PreviewCache::new(1);
     let path = Path::new("raw.cr3");

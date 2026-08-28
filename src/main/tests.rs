@@ -1,6 +1,7 @@
 use super::*;
 use discovery::DirectoryScan;
 use futures::executor::block_on;
+use std::path::Path;
 use std::time::Instant;
 use test_r::test;
 
@@ -237,10 +238,45 @@ fn collapsing_a_branch_removes_all_descendant_rows() {
     );
 
     let mut expanded = HashSet::from([root, child]);
-    assert_eq!(visible_rows(&model, &expanded).len(), 3);
+    assert_eq!(
+        visible_rows(&model, &expanded, &HashSet::new(), true).len(),
+        3
+    );
     expanded.remove(&child);
-    assert_eq!(visible_rows(&model, &expanded).len(), 2);
+    assert_eq!(
+        visible_rows(&model, &expanded, &HashSet::new(), true).len(),
+        2
+    );
     assert_eq!(model.loaded(child).unwrap().children.len(), 1);
+}
+
+#[test]
+fn hidden_subtree_moves_to_the_virtual_bottom_section() {
+    let mut model = DirectoryModel::new(PathBuf::from("/pictures"));
+    let root = model.root();
+    let (request, _) = model.begin_load(root).unwrap();
+    model.finish_load(
+        root,
+        request,
+        Ok(DirectoryScan {
+            directories: vec![PathBuf::from("/pictures/a"), PathBuf::from("/pictures/z")],
+            images: Vec::new(),
+        }),
+    );
+    let hidden = HashSet::from([PathBuf::from("/pictures/a")]);
+    let rows = visible_rows(&model, &HashSet::from([root]), &hidden, true);
+
+    assert_eq!(rows.len(), 4);
+    assert_eq!(
+        model.node(rows[1].node).path.as_ref(),
+        Path::new("/pictures/z")
+    );
+    assert_eq!(rows[2].node, HIDDEN_NODE);
+    assert_eq!(
+        model.node(rows[3].node).path.as_ref(),
+        Path::new("/pictures/a")
+    );
+    assert_eq!(rows[3].depth, 1);
 }
 
 #[test]

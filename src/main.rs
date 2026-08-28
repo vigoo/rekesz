@@ -53,6 +53,7 @@ actions!(
         ToggleDeveloped,
         ToggleJobQueue,
         ToggleDevelopInspector,
+        OpenCacheStatistics,
         OpenSettings,
         ImportLightroom
     ]
@@ -94,6 +95,7 @@ const DEVELOP_PANEL_WIDTH: f32 = 320.0;
 const SCHEDULER_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 const USE_IN_WINDOW_MENU: bool = cfg!(target_os = "linux");
 const IMAGE_WHEEL_THRESHOLD_PX: f32 = 30.0;
+const HIDDEN_NODE: NodeId = NodeId(usize::MAX);
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct ImageSelection {
@@ -217,6 +219,8 @@ struct PictureBrowser {
     model: DirectoryModel,
     visible: Vec<VisibleRow>,
     expanded: HashSet<NodeId>,
+    hidden_subtrees: HashSet<PathBuf>,
+    hidden_expanded: bool,
     selected: NodeId,
     previews: PreviewCache,
     raw_previews: PreviewCache,
@@ -249,6 +253,8 @@ struct PictureBrowser {
     show_develop_inspector: bool,
     show_view_menu: bool,
     show_file_menu: bool,
+    show_cache_statistics: bool,
+    disk_cache_usage: Option<Result<rendering::pipeline::DiskCacheUsage, Arc<str>>>,
     settings: AppSettings,
     settings_path: PathBuf,
     settings_draft: Option<AppSettings>,
@@ -565,6 +571,7 @@ struct PathContextMenu {
     path: PathBuf,
     position: (f32, f32),
     exportable: bool,
+    directory: Option<NodeId>,
 }
 
 fn merge_grid_demand(slot: &mut Option<PendingGridDemand>, next: PendingGridDemand) {
@@ -645,6 +652,8 @@ impl PictureBrowser {
                 depth: 0,
             }],
             expanded: HashSet::from([root]),
+            hidden_subtrees: HashSet::new(),
+            hidden_expanded: true,
             selected: root,
             previews: PreviewCache::new(settings.image_cache_size),
             raw_previews: PreviewCache::new(settings.image_cache_size),
@@ -680,6 +689,8 @@ impl PictureBrowser {
             show_develop_inspector: false,
             show_view_menu: false,
             show_file_menu: false,
+            show_cache_statistics: false,
+            disk_cache_usage: None,
             settings: settings.clone(),
             settings_path: config.settings_path.clone(),
             settings_draft: None,
@@ -698,17 +709,29 @@ impl PictureBrowser {
         };
         let catalog_work = this.work.start("Loading develop catalog…");
         let catalog_root = settings.root.clone();
-        let loading = cx
-            .background_executor()
-            .spawn(async move { catalog::load_recipes(&catalog_root) });
+        let loading = cx.background_executor().spawn(async move {
+            let hidden = catalog::load_hidden_subtrees(&catalog_root)?;
+            let recipes = catalog::load_recipes(&catalog_root)?;
+            Ok::<_, anyhow::Error>((recipes, hidden))
+        });
         cx.spawn(async move |this, cx| {
             let result = loading.await;
             this.update(cx, |this, cx| {
                 this.work.finish(catalog_work);
-                this.recipes = Some(Arc::new(result.unwrap_or_else(|error| {
-                    eprintln!("cannot load Pics catalog: {error:#}");
-                    HashMap::new()
-                })));
+                match result {
+                    Ok((recipes, hidden)) => {
+                        this.recipes = Some(Arc::new(recipes));
+                        for path in &hidden {
+                            this.model.ensure_node(path.clone());
+                        }
+                        this.hidden_subtrees = hidden;
+                        this.rebuild_visible();
+                    }
+                    Err(error) => {
+                        eprintln!("cannot load Pics catalog: {error:#}");
+                        this.recipes = Some(Arc::new(HashMap::new()));
+                    }
+                }
                 cx.notify();
             })
             .ok();
@@ -1476,7 +1499,9 @@ impl PictureBrowser {
     fn select_row(&mut self, index: usize, strategy: ScrollStrategy, cx: &mut Context<Self>) {
         if let Some(row) = self.visible.get(index) {
             self.scroll.scroll_to_item(index, strategy);
-            self.select(row.node, cx);
+            if row.node != HIDDEN_NODE {
+                self.select(row.node, cx);
+            }
         }
     }
 
@@ -1488,13 +1513,20 @@ impl PictureBrowser {
     }
 
     fn tree_up(&mut self, _: &TreeUp, _: &mut Window, cx: &mut Context<Self>) {
-        let index = self.selected_row().saturating_sub(1);
-        self.select_row(index, ScrollStrategy::Top, cx);
+        if let Some(index) = (0..self.selected_row())
+            .rev()
+            .find(|index| self.visible[*index].node != HIDDEN_NODE)
+        {
+            self.select_row(index, ScrollStrategy::Top, cx);
+        }
     }
 
     fn tree_down(&mut self, _: &TreeDown, _: &mut Window, cx: &mut Context<Self>) {
-        let index = (self.selected_row() + 1).min(self.visible.len().saturating_sub(1));
-        self.select_row(index, ScrollStrategy::Bottom, cx);
+        if let Some(index) = (self.selected_row() + 1..self.visible.len())
+            .find(|index| self.visible[*index].node != HIDDEN_NODE)
+        {
+            self.select_row(index, ScrollStrategy::Bottom, cx);
+        }
     }
 
     fn tree_left(&mut self, _: &TreeLeft, _: &mut Window, cx: &mut Context<Self>) {
@@ -1508,7 +1540,13 @@ impl PictureBrowser {
             .iter()
             .rposition(|row| row.depth < depth)
         {
-            self.select_row(parent, ScrollStrategy::Top, cx);
+            if self.visible[parent].node == HIDDEN_NODE {
+                self.hidden_expanded = false;
+                self.rebuild_visible();
+                cx.notify();
+            } else {
+                self.select_row(parent, ScrollStrategy::Top, cx);
+            }
         }
     }
 
@@ -1539,6 +1577,12 @@ impl PictureBrowser {
     }
 
     fn toggle(&mut self, node: NodeId, cx: &mut Context<Self>) {
+        if node == HIDDEN_NODE {
+            self.hidden_expanded = !self.hidden_expanded;
+            self.rebuild_visible();
+            cx.notify();
+            return;
+        }
         if !self.expanded.remove(&node) {
             self.expanded.insert(node);
             self.ensure_directory_loaded(node, DirectoryScanPriority::Background, cx);
@@ -1919,6 +1963,7 @@ impl PictureBrowser {
                                             f32::from(event.position.y),
                                         ),
                                         exportable: true,
+                                        directory: None,
                                     });
                                     cx.stop_propagation();
                                     cx.notify();
@@ -1948,7 +1993,12 @@ impl PictureBrowser {
     /// Recreates only the flat rows that are actually exposed by expanded
     /// branches. Collapsed descendants have no row or GPUI element state.
     fn rebuild_visible(&mut self) {
-        self.visible = visible_rows(&self.model, &self.expanded);
+        self.visible = visible_rows(
+            &self.model,
+            &self.expanded,
+            &self.hidden_subtrees,
+            self.hidden_expanded,
+        );
     }
 
     fn render_rows(
@@ -1960,6 +2010,32 @@ impl PictureBrowser {
         range
             .map(|row_ix| {
                 let row = self.visible[row_ix];
+                if row.node == HIDDEN_NODE {
+                    return div()
+                        .id("hidden-subtrees-node")
+                        .flex()
+                        .items_center()
+                        .h(px(30.0))
+                        .pl(px(10.0))
+                        .pr_2()
+                        .text_sm()
+                        .text_color(rgb(0xaeb8c8))
+                        .hover(|this| this.bg(rgb(0x292d36)))
+                        .child(
+                            div()
+                                .w(px(20.0))
+                                .flex_none()
+                                .text_color(rgb(0x8d96a5))
+                                .child(if self.hidden_expanded { "▾" } else { "▸" }),
+                        )
+                        .child("Hidden")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.hidden_expanded = !this.hidden_expanded;
+                            this.rebuild_visible();
+                            cx.notify();
+                        }))
+                        .into_any_element();
+                }
                 let node = self.model.node(row.node);
                 let selected = row.node == self.selected;
                 let expanded = self.expanded.contains(&row.node);
@@ -2009,6 +2085,7 @@ impl PictureBrowser {
                                     f32::from(event.position.y),
                                 ),
                                 exportable: false,
+                                directory: Some(select_node),
                             });
                             cx.stop_propagation();
                             cx.notify();
@@ -2035,9 +2112,36 @@ impl PictureBrowser {
 
     fn open_settings(&mut self, _: &OpenSettings, _: &mut Window, cx: &mut Context<Self>) {
         self.settings_draft = Some(self.settings.clone());
+        self.show_cache_statistics = false;
         self.settings_status = None;
         self.show_file_menu = false;
         cx.notify();
+    }
+
+    fn open_cache_statistics(
+        &mut self,
+        _: &OpenCacheStatistics,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_cache_statistics = true;
+        self.disk_cache_usage = None;
+        self.settings_draft = None;
+        self.show_file_menu = false;
+        cx.notify();
+        let pipeline = self.render_pipeline.clone();
+        let usage = cx
+            .background_executor()
+            .spawn(async move { pipeline.disk_cache_usage().map_err(Arc::<str>::from) });
+        cx.spawn(async move |this, cx| {
+            let usage = usage.await;
+            this.update(cx, |this, cx| {
+                this.disk_cache_usage = Some(usage);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn save_settings(&mut self, cx: &mut Context<Self>) {
@@ -2046,12 +2150,21 @@ impl PictureBrowser {
         };
         match config::save(&self.settings_path, &draft) {
             Ok(()) => {
+                let cache_size_changed = draft.image_cache_size != self.settings.image_cache_size;
+                self.previews.set_capacity(draft.image_cache_size);
+                self.raw_previews.set_capacity(draft.image_cache_size);
+                self.thumbnails
+                    .set_capacity(draft.image_cache_size.saturating_mul(16).max(64));
+                self.render_pipeline
+                    .set_source_cache_capacity(draft.image_cache_size);
                 self.pair_preference = draft.pair_preference.into();
                 self.settings = draft;
                 self.settings_draft = None;
-                self.settings_status = Some(
-                    "Settings saved. Restart Pics to apply service and library changes.".into(),
-                );
+                self.settings_status = Some(if cache_size_changed {
+                    "Settings saved. Image cache size applied immediately; restart Pics to apply service and library changes."
+                } else {
+                    "Settings saved. Restart Pics to apply service and library changes."
+                }.into());
             }
             Err(error) => {
                 self.settings_status = Some(format!("Could not save settings: {error:#}"))
@@ -2184,6 +2297,41 @@ impl PictureBrowser {
         }
         self.path_context_menu = None;
         cx.notify();
+    }
+
+    fn set_subtree_hidden(&mut self, path: PathBuf, hidden: bool, cx: &mut Context<Self>) {
+        self.path_context_menu = None;
+        let mut desired = self.hidden_subtrees.clone();
+        if hidden {
+            if desired.iter().any(|ancestor| path.starts_with(ancestor)) {
+                cx.notify();
+                return;
+            }
+            desired.retain(|descendant| !descendant.starts_with(&path));
+            desired.insert(path);
+        } else {
+            desired.remove(&path);
+        }
+        let root = self.model.node(self.model.root()).path.to_path_buf();
+        let persisted = desired.clone();
+        let saving = cx
+            .background_executor()
+            .spawn(async move { catalog::save_hidden_subtrees(&root, &persisted) });
+        cx.spawn(async move |this, cx| {
+            let result = saving.await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => {
+                        this.hidden_subtrees = desired;
+                        this.rebuild_visible();
+                    }
+                    Err(error) => eprintln!("cannot save hidden subtrees: {error:#}"),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn export_image(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -2445,7 +2593,12 @@ impl PictureBrowser {
     }
 }
 
-fn visible_rows(model: &DirectoryModel, expanded: &HashSet<NodeId>) -> Vec<VisibleRow> {
+fn visible_rows(
+    model: &DirectoryModel,
+    expanded: &HashSet<NodeId>,
+    hidden_subtrees: &HashSet<PathBuf>,
+    hidden_expanded: bool,
+) -> Vec<VisibleRow> {
     fn append(
         model: &DirectoryModel,
         expanded: &HashSet<NodeId>,
@@ -2466,7 +2619,48 @@ fn visible_rows(model: &DirectoryModel, expanded: &HashSet<NodeId>) -> Vec<Visib
     }
 
     let mut rows = Vec::new();
-    append(model, expanded, model.root(), 0, &mut rows);
+    fn append_visible(
+        model: &DirectoryModel,
+        expanded: &HashSet<NodeId>,
+        hidden_subtrees: &HashSet<PathBuf>,
+        node: NodeId,
+        depth: usize,
+        rows: &mut Vec<VisibleRow>,
+    ) {
+        if node != model.root()
+            && hidden_subtrees
+                .iter()
+                .any(|hidden| model.node(node).path.starts_with(hidden))
+        {
+            return;
+        }
+        rows.push(VisibleRow { node, depth });
+        if let Some(contents) = expanded
+            .contains(&node)
+            .then(|| model.loaded(node))
+            .flatten()
+        {
+            for child in &contents.children {
+                append_visible(model, expanded, hidden_subtrees, *child, depth + 1, rows);
+            }
+        }
+    }
+    append_visible(model, expanded, hidden_subtrees, model.root(), 0, &mut rows);
+    if !hidden_subtrees.is_empty() {
+        rows.push(VisibleRow {
+            node: HIDDEN_NODE,
+            depth: 0,
+        });
+        if hidden_expanded {
+            let mut hidden = hidden_subtrees.iter().collect::<Vec<_>>();
+            hidden.sort();
+            for path in hidden {
+                if let Some(node) = model.node_id(path) {
+                    append(model, expanded, node, 1, &mut rows);
+                }
+            }
+        }
+    }
     rows
 }
 
@@ -2677,6 +2871,7 @@ impl Render for PictureBrowser {
                                         f32::from(event.position.y),
                                     ),
                                     exportable: true,
+                                    directory: None,
                                 });
                                 cx.stop_propagation();
                                 cx.notify();
@@ -3039,20 +3234,42 @@ impl Render for PictureBrowser {
         let path_context_menu = self.path_context_menu.as_ref().map(|menu| {
             let viewport = window.viewport_size();
             let can_export = menu.exportable;
+            let can_hide = menu.directory.is_some_and(|node| node != self.model.root());
             let left = menu
                 .position
                 .0
                 .min((f32::from(viewport.width) - 228.0).max(0.0));
-            let top = menu
-                .position
-                .1
-                .min((f32::from(viewport.height) - if can_export { 66.0 } else { 38.0 }).max(0.0));
-            (menu.path.clone(), left, top, can_export)
+            let top = menu.position.1.min(
+                (f32::from(viewport.height)
+                    - (38.0
+                        + if can_export { 28.0 } else { 0.0 }
+                        + if can_hide { 28.0 } else { 0.0 }))
+                .max(0.0),
+            );
+            let is_hidden_root = self.hidden_subtrees.contains(&menu.path);
+            (
+                menu.path.clone(),
+                left,
+                top,
+                can_export,
+                can_hide,
+                is_hidden_root,
+            )
         });
         let settings_dialog = self
             .settings_draft
             .clone()
             .map(|draft| render_settings_dialog(draft, self.settings_status.clone(), cx));
+        let cache_statistics_dialog = self.show_cache_statistics.then(|| {
+            render_cache_statistics_dialog(
+                self.render_pipeline.stats(),
+                self.previews.stats(),
+                self.raw_previews.stats(),
+                self.thumbnails.stats(),
+                self.disk_cache_usage.clone(),
+                cx,
+            )
+        });
         div()
             .size_full()
             .relative()
@@ -3063,6 +3280,7 @@ impl Render for PictureBrowser {
             .on_action(cx.listener(Self::toggle_develop_inspector))
             .on_action(cx.listener(Self::toggle_developed))
             .on_action(cx.listener(Self::open_settings))
+            .on_action(cx.listener(Self::open_cache_statistics))
             .on_action(cx.listener(Self::import_lightroom))
             .on_mouse_down(
                 MouseButton::Left,
@@ -3108,6 +3326,21 @@ impl Render for PictureBrowser {
                                 .child("Import Lightroom Catalog…")
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.import_lightroom(&ImportLightroom, window, cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("cache-statistics-menu-item")
+                                .h(px(28.0))
+                                .px_2()
+                                .flex()
+                                .items_center()
+                                .rounded_sm()
+                                .text_sm()
+                                .hover(|this| this.bg(rgb(0x3b4658)))
+                                .child("Cache Statistics…")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_cache_statistics(&OpenCacheStatistics, window, cx);
                                 })),
                         )
                         .child(
@@ -3184,51 +3417,34 @@ impl Render for PictureBrowser {
                         ),
                 )
             })
-            .when_some(path_context_menu, |this, (path, left, top, can_export)| {
-                let export_path = path.clone();
-                this.child(
-                    div()
-                        .absolute()
-                        .left(px(left))
-                        .top(px(top))
-                        .w(px(220.0))
-                        .p_1()
-                        .occlude()
-                        .bg(rgb(0x252932))
-                        .text_color(rgb(0xd8dde7))
-                        .border_1()
-                        .border_color(rgb(0x414754))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|_, _, _, cx| cx.stop_propagation()),
-                        )
-                        .on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(|_, _, _, cx| cx.stop_propagation()),
-                        )
-                        .child(
-                            div()
-                                .id("copy-absolute-path-menu-item")
-                                .h(px(28.0))
-                                .px_2()
-                                .flex()
-                                .items_center()
-                                .rounded_sm()
-                                .text_sm()
-                                .hover(|this| this.bg(rgb(0x3b4658)))
-                                .child("Copy Absolute Path")
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.copy_absolute_path(&path, cx);
-                                        cx.stop_propagation();
-                                    }),
-                                ),
-                        )
-                        .when(can_export, |this| {
-                            this.child(
+            .when_some(
+                path_context_menu,
+                |this, (path, left, top, can_export, is_directory, is_hidden_root)| {
+                    let export_path = path.clone();
+                    let hidden_path = path.clone();
+                    this.child(
+                        div()
+                            .absolute()
+                            .left(px(left))
+                            .top(px(top))
+                            .w(px(220.0))
+                            .p_1()
+                            .occlude()
+                            .bg(rgb(0x252932))
+                            .text_color(rgb(0xd8dde7))
+                            .border_1()
+                            .border_color(rgb(0x414754))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                            )
+                            .child(
                                 div()
-                                    .id("export-png-menu-item")
+                                    .id("copy-absolute-path-menu-item")
                                     .h(px(28.0))
                                     .px_2()
                                     .flex()
@@ -3236,19 +3452,70 @@ impl Render for PictureBrowser {
                                     .rounded_sm()
                                     .text_sm()
                                     .hover(|this| this.bg(rgb(0x3b4658)))
-                                    .child("Export PNG…")
+                                    .child("Copy Absolute Path")
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(move |this, _, _, cx| {
-                                            this.export_image(export_path.clone(), cx);
+                                            this.copy_absolute_path(&path, cx);
                                             cx.stop_propagation();
                                         }),
                                     ),
                             )
-                        }),
-                )
-            })
+                            .when(is_directory, |this| {
+                                this.child(
+                                    div()
+                                        .id("toggle-hidden-subtree-menu-item")
+                                        .h(px(28.0))
+                                        .px_2()
+                                        .flex()
+                                        .items_center()
+                                        .rounded_sm()
+                                        .text_sm()
+                                        .hover(|this| this.bg(rgb(0x3b4658)))
+                                        .child(if is_hidden_root {
+                                            "Unhide Subtree"
+                                        } else {
+                                            "Hide Subtree"
+                                        })
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.set_subtree_hidden(
+                                                    hidden_path.clone(),
+                                                    !is_hidden_root,
+                                                    cx,
+                                                );
+                                                cx.stop_propagation();
+                                            }),
+                                        ),
+                                )
+                            })
+                            .when(can_export, |this| {
+                                this.child(
+                                    div()
+                                        .id("export-png-menu-item")
+                                        .h(px(28.0))
+                                        .px_2()
+                                        .flex()
+                                        .items_center()
+                                        .rounded_sm()
+                                        .text_sm()
+                                        .hover(|this| this.bg(rgb(0x3b4658)))
+                                        .child("Export PNG…")
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.export_image(export_path.clone(), cx);
+                                                cx.stop_propagation();
+                                            }),
+                                        ),
+                                )
+                            }),
+                    )
+                },
+            )
             .when_some(settings_dialog, |this, dialog| this.child(dialog))
+            .when_some(cache_statistics_dialog, |this, dialog| this.child(dialog))
     }
 }
 
@@ -3331,7 +3598,9 @@ fn render_settings_dialog(
                         .text_sm()
                         .text_color(rgb(0x9da7b6))
                         .mb_3()
-                        .child("Worker, cache, and library changes take effect after restart."),
+                        .child(
+                            "Image cache size applies immediately. Worker, cache directory, and library changes require a restart.",
+                        ),
                 )
                 .child(
                     div()
@@ -3497,6 +3766,184 @@ fn render_settings_dialog(
         )
 }
 
+fn render_cache_statistics_dialog(
+    pipeline: rendering::pipeline::PipelineStats,
+    previews: preview::PreviewCacheStats,
+    raw_previews: preview::PreviewCacheStats,
+    thumbnails: preview::PreviewCacheStats,
+    disk_usage: Option<Result<rendering::pipeline::DiskCacheUsage, Arc<str>>>,
+    cx: &mut Context<PictureBrowser>,
+) -> gpui::Div {
+    let requests = pipeline.cache_hits + pipeline.cache_misses;
+    let hit_rate = if requests == 0 {
+        "—".to_owned()
+    } else {
+        format!(
+            "{:.1}%",
+            pipeline.cache_hits as f64 * 100.0 / requests as f64
+        )
+    };
+    let row = |label: &'static str, value: String| {
+        div()
+            .flex()
+            .justify_between()
+            .py_1()
+            .child(label)
+            .child(div().text_color(rgb(0xb7bfcc)).child(value))
+    };
+    let memory = |name: &'static str, stats: preview::PreviewCacheStats| {
+        row(
+            name,
+            format!(
+                "{} / {} loaded · ~{} · {} loading · {} errors",
+                stats.loaded,
+                stats.capacity,
+                format_byte_size(stats.estimated_memory_bytes),
+                stats.loading,
+                stats.errors
+            ),
+        )
+    };
+    let total_memory_bytes = previews
+        .estimated_memory_bytes
+        .saturating_add(raw_previews.estimated_memory_bytes)
+        .saturating_add(thumbnails.estimated_memory_bytes);
+    div()
+        .absolute()
+        .inset_0()
+        .occlude()
+        .bg(gpui::rgba(0x00000099))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            div()
+                .w(px(520.0))
+                .p_5()
+                .rounded_md()
+                .bg(rgb(0x252932))
+                .text_color(rgb(0xd8dde7))
+                .border_1()
+                .border_color(rgb(0x4a5260))
+                .child(div().text_xl().mb_3().child("Cache Statistics"))
+                .child(memory("Image previews", previews))
+                .child(memory("RAW previews", raw_previews))
+                .child(memory("Thumbnails", thumbnails))
+                .child(row(
+                    "Estimated image memory",
+                    format!("~{}", format_byte_size(total_memory_bytes)),
+                ))
+                .child(div().my_2().border_t_1().border_color(rgb(0x30343d)))
+                .child(render_disk_cache_usage(disk_usage))
+                .child(div().my_2().border_t_1().border_color(rgb(0x30343d)))
+                .child(row(
+                    "Persistent cache hits",
+                    pipeline.cache_hits.to_string(),
+                ))
+                .child(row(
+                    "Persistent cache misses",
+                    pipeline.cache_misses.to_string(),
+                ))
+                .child(row("Hit rate", hit_rate))
+                .child(row("Writes", pipeline.cache_writes.to_string()))
+                .child(row("Bypasses", pipeline.cache_bypasses.to_string()))
+                .child(row(
+                    "Read failures",
+                    pipeline.cache_read_failures.to_string(),
+                ))
+                .child(row(
+                    "Write failures",
+                    pipeline.failed_cache_writes.to_string(),
+                ))
+                .child(row(
+                    "Average lookup time",
+                    format!("{} µs", pipeline.cache_lookup.average_nanos() / 1_000),
+                ))
+                .child(
+                    div().mt_4().flex().justify_end().child(
+                        div()
+                            .id("cache-statistics-close")
+                            .px_4()
+                            .py_2()
+                            .rounded_sm()
+                            .bg(rgb(0x315b8f))
+                            .hover(|this| this.bg(rgb(0x3d6fa9)))
+                            .child("Close")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.show_cache_statistics = false;
+                                cx.notify();
+                            })),
+                    ),
+                ),
+        )
+}
+
+fn render_disk_cache_usage(
+    usage: Option<Result<rendering::pipeline::DiskCacheUsage, Arc<str>>>,
+) -> gpui::Div {
+    let Some(usage) = usage else {
+        return div()
+            .py_2()
+            .text_color(rgb(0xb7bfcc))
+            .child("Calculating disk cache usage…");
+    };
+    let Ok(usage) = usage else {
+        return div()
+            .py_2()
+            .text_color(rgb(0xf2b8b5))
+            .child(format!("Could not read disk cache: {}", usage.unwrap_err()));
+    };
+    let fraction = if usage.max_bytes == 0 {
+        0.0
+    } else {
+        (usage.used_bytes as f32 / usage.max_bytes as f32).clamp(0.0, 1.0)
+    };
+    div()
+        .py_1()
+        .child(div().flex().justify_between().child("Disk cache").child(
+            div().text_color(rgb(0xb7bfcc)).child(format!(
+                "{} of {} ({:.1}%)",
+                format_byte_size(usage.used_bytes),
+                format_byte_size(usage.max_bytes),
+                fraction * 100.0
+            )),
+        ))
+        .child(
+            div()
+                .mt_2()
+                .h(px(14.0))
+                .w_full()
+                .rounded_sm()
+                .bg(rgb(0x181a20))
+                .border_1()
+                .border_color(rgb(0x4a5260))
+                .child(
+                    div()
+                        .h_full()
+                        .w(relative(fraction))
+                        .rounded_sm()
+                        .bg(rgb(0x3d6fa9)),
+                ),
+        )
+        .child(
+            div()
+                .mt_1()
+                .text_sm()
+                .text_color(rgb(0x9da7b6))
+                .child(format!("{} cached derivatives", usage.entries)),
+        )
+}
+
+fn format_byte_size(bytes: u64) -> String {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const MIB: u64 = 1024 * 1024;
+    if bytes >= GIB {
+        format!("{:.2} GiB", bytes as f64 / GIB as f64)
+    } else {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    }
+}
+
 fn export_dialog_directory<'a>(
     last_export_directory: Option<&'a std::path::Path>,
     source: &'a std::path::Path,
@@ -3566,6 +4013,7 @@ fn main() -> Result<()> {
                 name: "File".into(),
                 items: vec![
                     MenuItem::action("Import Lightroom Catalog…", ImportLightroom),
+                    MenuItem::action("Cache Statistics…", OpenCacheStatistics),
                     MenuItem::action("Settings…", OpenSettings),
                 ],
             },

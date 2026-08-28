@@ -29,6 +29,15 @@ pub struct PreviewCache {
     access_clock: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PreviewCacheStats {
+    pub capacity: usize,
+    pub loaded: usize,
+    pub loading: usize,
+    pub errors: usize,
+    pub estimated_memory_bytes: u64,
+}
+
 impl PreviewCache {
     pub fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "preview cache capacity must be positive");
@@ -56,6 +65,36 @@ impl PreviewCache {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.last_used.clear();
+    }
+
+    pub fn set_capacity(&mut self, capacity: usize) {
+        assert!(capacity > 0, "preview cache capacity must be positive");
+        self.capacity = capacity;
+        self.evict_over_capacity();
+    }
+
+    pub fn stats(&self) -> PreviewCacheStats {
+        let mut stats = PreviewCacheStats {
+            capacity: self.capacity,
+            ..PreviewCacheStats::default()
+        };
+        for state in self.entries.values() {
+            match state {
+                PreviewState::Loaded(preview) => {
+                    stats.loaded += 1;
+                    let (width, height) = preview.metadata.output_dimensions;
+                    stats.estimated_memory_bytes = stats.estimated_memory_bytes.saturating_add(
+                        u64::from(width)
+                            .saturating_mul(u64::from(height))
+                            .saturating_mul(4),
+                    );
+                }
+                PreviewState::Loading(_) => stats.loading += 1,
+                PreviewState::Error(_) => stats.errors += 1,
+                PreviewState::Unloaded => {}
+            }
+        }
+        stats
     }
 
     #[cfg(test)]

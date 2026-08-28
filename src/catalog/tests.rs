@@ -535,3 +535,14 @@ fn conflicting_master_rows_are_reported_and_not_applied() {
 fn parser_rejects_trailing_garbage() {
     assert!(Parser::new("s={} garbage").parse_assignment().is_err());
 }
+
+#[test]
+fn hidden_subtrees_round_trip_without_develop_recipes() {
+    let root = tempfile::tempdir().unwrap();
+    let hidden = HashSet::from([root.path().join("private"), root.path().join("archive/old")]);
+
+    save_hidden_subtrees(root.path(), &hidden).unwrap();
+
+    assert_eq!(load_hidden_subtrees(root.path()).unwrap(), hidden);
+    assert!(load_recipes(root.path()).unwrap().is_empty());
+}

@@ -75,6 +75,8 @@ pub struct StageTiming {
     pub total_nanos: u64,
 }
 
+pub(crate) use crate::rendering::cache::DiskCacheUsage;
+
 impl StageTiming {
     pub fn average_nanos(self) -> u64 {
         self.total_nanos.checked_div(self.calls).unwrap_or(0)
@@ -372,12 +374,19 @@ impl RenderPipeline {
         }
     }
 
-    #[cfg(test)]
     pub fn stats(&self) -> PipelineStats {
         PipelineStats {
             decoded_source_hits: self.decoded_sources.hits(),
             ..self.metrics.snapshot()
         }
+    }
+
+    pub fn disk_cache_usage(&self) -> Result<DiskCacheUsage, String> {
+        self.backend.disk_cache_usage()
+    }
+
+    pub fn set_source_cache_capacity(&self, capacity: usize) {
+        self.decoded_sources.set_capacity(capacity);
     }
 
     #[cfg(test)]
