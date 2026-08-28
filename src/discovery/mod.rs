@@ -540,7 +540,7 @@ fn sort_key(path: &Path) -> String {
         .to_lowercase()
 }
 
-fn sort_metadata(metadata: &mut [ImageOrderingMetadata]) {
+pub(crate) fn sort_metadata(metadata: &mut [ImageOrderingMetadata]) {
     metadata.sort_by_cached_key(|entry| {
         (
             entry.capture_time.or(entry.fallback_time).is_none(),

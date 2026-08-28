@@ -221,6 +221,7 @@ struct PictureBrowser {
     expanded: HashSet<NodeId>,
     hidden_subtrees: HashSet<PathBuf>,
     hidden_expanded: bool,
+    recursive_grid: Option<RecursiveGridState>,
     selected: NodeId,
     previews: PreviewCache,
     raw_previews: PreviewCache,
@@ -567,6 +568,18 @@ struct PendingGridDemand {
     preview_variant: RenderVariant,
 }
 
+struct RecursiveGridState {
+    root: NodeId,
+    status: RecursiveGridStatus,
+    cancelled: Arc<AtomicBool>,
+}
+
+enum RecursiveGridStatus {
+    Loading,
+    Loaded(Vec<PathBuf>),
+    Error(Arc<str>),
+}
+
 struct PathContextMenu {
     path: PathBuf,
     position: (f32, f32),
@@ -654,6 +667,7 @@ impl PictureBrowser {
             expanded: HashSet::from([root]),
             hidden_subtrees: HashSet::new(),
             hidden_expanded: true,
+            recursive_grid: None,
             selected: root,
             previews: PreviewCache::new(settings.image_cache_size),
             raw_previews: PreviewCache::new(settings.image_cache_size),
@@ -1477,6 +1491,9 @@ impl PictureBrowser {
 
     fn select(&mut self, node: NodeId, cx: &mut Context<Self>) {
         let directory_changed = self.selected != node;
+        if directory_changed && let Some(recursive) = self.recursive_grid.take() {
+            recursive.cancelled.store(true, Ordering::Release);
+        }
         self.scheduler.clear_scope(GRID_SCOPE);
         self.scheduler.clear_scope(IMAGE_SCOPE);
         self.reset_grid_prediction();
@@ -1835,9 +1852,93 @@ impl PictureBrowser {
     }
 
     fn selected_images(&self) -> &[PathBuf] {
+        if let Some(RecursiveGridState {
+            root,
+            status: RecursiveGridStatus::Loaded(images),
+            ..
+        }) = &self.recursive_grid
+            && *root == self.selected
+        {
+            return images;
+        }
         self.model
             .loaded(self.selected)
             .map_or(&[], |contents| contents.images.as_slice())
+    }
+
+    fn start_recursive_grid(&mut self, cx: &mut Context<Self>) {
+        let node = self.selected;
+        let Some(contents) = self.model.loaded(node) else {
+            return;
+        };
+        if !contents.images.is_empty() || contents.children.is_empty() {
+            return;
+        }
+        let root = self.model.node(node).path.to_path_buf();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.recursive_grid = Some(RecursiveGridState {
+            root: node,
+            status: RecursiveGridStatus::Loading,
+            cancelled: cancelled.clone(),
+        });
+        self.reset_grid_prediction();
+        if let MainView::Dir(_, selection) = &mut self.main_view {
+            *selection = ImageSelection::default();
+        }
+        let work = self.work.start(format!(
+            "Scanning subdirectories of {}…",
+            path_display_name(&root)
+        ));
+        let scanner = self.directory_scanner.clone();
+        let metadata_loader = self.metadata_loader.clone();
+        let pair_preference = self.pair_preference;
+        let hidden = self.hidden_subtrees.clone();
+        let task_cancelled = cancelled.clone();
+        let loading = cx.background_executor().spawn(async move {
+            collect_recursive_images(
+                &scanner,
+                &metadata_loader,
+                root,
+                pair_preference,
+                &hidden,
+                task_cancelled,
+            )
+        });
+        cx.spawn(async move |this, cx| {
+            let result = loading.await;
+            this.update(cx, |this, cx| {
+                this.work.finish(work);
+                let is_active = this.recursive_grid.as_ref().is_some_and(|active| {
+                    active.root == node && Arc::ptr_eq(&active.cancelled, &cancelled)
+                });
+                if !is_active || cancelled.load(Ordering::Acquire) {
+                    cx.notify();
+                    return;
+                }
+                if let Some(active) = &mut this.recursive_grid {
+                    active.status = match result {
+                        Ok(images) => RecursiveGridStatus::Loaded(images),
+                        Err(error) => RecursiveGridStatus::Error(error.to_string().into()),
+                    };
+                }
+                this.reset_grid_prediction();
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn stop_recursive_grid(&mut self, cx: &mut Context<Self>) {
+        if let Some(recursive) = self.recursive_grid.take() {
+            recursive.cancelled.store(true, Ordering::Release);
+            self.reset_grid_prediction();
+            if let MainView::Dir(_, selection) = &mut self.main_view {
+                *selection = ImageSelection::default();
+            }
+            cx.notify();
+        }
     }
 
     fn render_thumbnail_rows(
@@ -2322,6 +2423,10 @@ impl PictureBrowser {
             this.update(cx, |this, cx| {
                 match result {
                     Ok(()) => {
+                        if let Some(recursive) = this.recursive_grid.take() {
+                            recursive.cancelled.store(true, Ordering::Release);
+                            this.reset_grid_prediction();
+                        }
                         this.hidden_subtrees = desired;
                         this.rebuild_visible();
                     }
@@ -2685,6 +2790,44 @@ fn visible_thumbnail_demands(
         .collect()
 }
 
+fn collect_recursive_images(
+    scanner: &DirectoryScanner,
+    metadata_loader: &MetadataLoader,
+    root: PathBuf,
+    pair_preference: RawJpegPreference,
+    hidden_subtrees: &HashSet<PathBuf>,
+    cancelled: Arc<AtomicBool>,
+) -> Result<Vec<PathBuf>, std::io::Error> {
+    let mut pending = vec![root];
+    let mut visited = HashSet::new();
+    let mut images = Vec::new();
+    while let Some(directory) = pending.pop() {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "recursive scan cancelled",
+            ));
+        }
+        if !visited.insert(directory.clone())
+            || hidden_subtrees
+                .iter()
+                .any(|hidden| directory.starts_with(hidden))
+        {
+            continue;
+        }
+        let scan = scanner.scan(
+            &directory,
+            pair_preference,
+            DirectoryScanPriority::Background,
+        )?;
+        images.extend(scan.images);
+        pending.extend(scan.directories);
+    }
+    let mut metadata = metadata_loader.load_directory(images, cancelled);
+    discovery::sort_metadata(&mut metadata);
+    Ok(metadata.into_iter().map(|entry| entry.path).collect())
+}
+
 fn speculative_indices(
     image_count: usize,
     visible: Range<usize>,
@@ -2886,33 +3029,25 @@ impl Render for PictureBrowser {
             }
             MainView::Dir(path, selection) => {
                 let count = self.selected_images().len();
-                let ordering_pending = self.model.loaded(self.selected).is_some_and(|contents| {
-                    contents.metadata_status != DirectoryMetadataStatus::Complete
-                        && !contents.images.is_empty()
-                });
-                let capture_order_available = self.model.has_pending_capture_order(self.selected);
+                let recursive = self
+                    .recursive_grid
+                    .as_ref()
+                    .filter(|recursive| recursive.root == self.selected);
+                let recursive_active = recursive.is_some();
+                let ordering_pending = !recursive_active
+                    && self.model.loaded(self.selected).is_some_and(|contents| {
+                        contents.metadata_status != DirectoryMetadataStatus::Complete
+                            && !contents.images.is_empty()
+                    });
+                let capture_order_available =
+                    !recursive_active && self.model.has_pending_capture_order(self.selected);
                 let ordering_suffix = if ordering_pending {
                     " · loading capture metadata…"
                 } else {
                     ""
                 };
-                let grid_content = match &self.model.node(self.selected).contents {
-                    DirectoryContents::Error(error) => div()
-                        .p_6()
-                        .text_sm()
-                        .child(error.to_string())
-                        .into_any_element(),
-                    DirectoryContents::Unloaded | DirectoryContents::Loading(_) => div()
-                        .p_6()
-                        .text_sm()
-                        .child("Loading directory…")
-                        .into_any_element(),
-                    DirectoryContents::Loaded(_) if count == 0 => div()
-                        .p_6()
-                        .text_sm()
-                        .child("No images in this directory")
-                        .into_any_element(),
-                    DirectoryContents::Loaded(_) => uniform_list(
+                let thumbnail_grid = || {
+                    uniform_list(
                         "thumbnail-rows",
                         count.div_ceil(self.grid_columns),
                         cx.processor(Self::render_thumbnail_rows),
@@ -2920,12 +3055,110 @@ impl Render for PictureBrowser {
                     .size_full()
                     .track_scroll(self.thumbnail_scroll.clone())
                     .with_sizing_behavior(ListSizingBehavior::Auto)
-                    .into_any_element(),
+                    .into_any_element()
+                };
+                let grid_content = if let Some(recursive) = recursive {
+                    match &recursive.status {
+                        RecursiveGridStatus::Loading => div()
+                            .p_6()
+                            .text_sm()
+                            .child("Scanning subdirectories and ordering images…")
+                            .into_any_element(),
+                        RecursiveGridStatus::Error(error) => div()
+                            .p_6()
+                            .text_sm()
+                            .text_color(rgb(0xf2b8b5))
+                            .child(format!("Could not load recursive view: {error}"))
+                            .into_any_element(),
+                        RecursiveGridStatus::Loaded(_) if count == 0 => div()
+                            .p_6()
+                            .text_sm()
+                            .child("No images in this subtree")
+                            .into_any_element(),
+                        RecursiveGridStatus::Loaded(_) => thumbnail_grid(),
+                    }
+                } else {
+                    match &self.model.node(self.selected).contents {
+                        DirectoryContents::Error(error) => div()
+                            .p_6()
+                            .text_sm()
+                            .child(error.to_string())
+                            .into_any_element(),
+                        DirectoryContents::Unloaded | DirectoryContents::Loading(_) => div()
+                            .p_6()
+                            .text_sm()
+                            .child("Loading directory…")
+                            .into_any_element(),
+                        DirectoryContents::Loaded(contents)
+                            if count == 0 && !contents.children.is_empty() =>
+                        {
+                            div()
+                                .size_full()
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .justify_center()
+                                .gap_3()
+                                .text_sm()
+                                .child("No images directly in this directory")
+                                .child(
+                                    div()
+                                        .id("show-images-recursively")
+                                        .px_4()
+                                        .py_2()
+                                        .rounded_sm()
+                                        .bg(rgb(0x315b8f))
+                                        .hover(|this| this.bg(rgb(0x3d6fa9)))
+                                        .cursor_pointer()
+                                        .child("Show images from all subdirectories")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.start_recursive_grid(cx);
+                                        })),
+                                )
+                                .into_any_element()
+                        }
+                        DirectoryContents::Loaded(_) if count == 0 => div()
+                            .p_6()
+                            .text_sm()
+                            .child("No images in this directory")
+                            .into_any_element(),
+                        DirectoryContents::Loaded(_) => thumbnail_grid(),
+                    }
                 };
                 let content = div()
                     .size_full()
                     .flex()
                     .flex_col()
+                    .when(recursive_active, |this| {
+                        this.child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .px_4()
+                                .py_2()
+                                .bg(rgb(0x242b37))
+                                .border_b_1()
+                                .border_color(rgb(0x3b4658))
+                                .text_sm()
+                                .child(format!("Recursive view · {count} images"))
+                                .child(
+                                    div()
+                                        .id("exit-recursive-grid")
+                                        .px_3()
+                                        .py_1()
+                                        .rounded_sm()
+                                        .bg(rgb(0x3b4658))
+                                        .hover(|this| this.bg(rgb(0x52617a)))
+                                        .cursor_pointer()
+                                        .child("Exit recursive view")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.stop_recursive_grid(cx);
+                                        })),
+                                ),
+                        )
+                    })
                     .when(capture_order_available, |this| {
                         this.child(
                             div()

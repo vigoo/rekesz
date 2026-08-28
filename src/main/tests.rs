@@ -280,6 +280,40 @@ fn hidden_subtree_moves_to_the_virtual_bottom_section() {
 }
 
 #[test]
+fn recursive_grid_collects_globally_sorted_images_and_excludes_hidden_subtrees() {
+    let root = tempfile::tempdir().unwrap();
+    let visible = root.path().join("visible");
+    let hidden = root.path().join("hidden");
+    std::fs::create_dir_all(&visible).unwrap();
+    std::fs::create_dir_all(&hidden).unwrap();
+    std::fs::write(visible.join("z.jpg"), b"not a real jpeg").unwrap();
+    std::fs::write(visible.join("a.jpg"), b"not a real jpeg").unwrap();
+    std::fs::write(hidden.join("hidden.jpg"), b"not a real jpeg").unwrap();
+    for name in ["a.jpg", "z.jpg"] {
+        std::fs::File::open(visible.join(name))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
+            .unwrap();
+    }
+    let cache = tempfile::tempdir().unwrap();
+    let limiter = JobLimiter::new(2);
+    let scanner = DirectoryScanner::new(2, limiter.clone());
+    let metadata_loader = MetadataLoader::new(cache.path().to_path_buf(), 2, limiter);
+
+    let images = collect_recursive_images(
+        &scanner,
+        &metadata_loader,
+        root.path().to_path_buf(),
+        RawJpegPreference::Raw,
+        &HashSet::from([hidden]),
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+
+    assert_eq!(images, [visible.join("a.jpg"), visible.join("z.jpg")]);
+}
+
+#[test]
 fn thumbnail_selection_supports_replace_toggle_and_ranges() {
     let mut selection = ImageSelection::default();
     selection.select(2, false, false);
