@@ -98,14 +98,15 @@ fn from_args_with_dirs(
 
 fn from_cli(cli: Cli, dirs: directories::ProjectDirs) -> Result<Config> {
     let settings_path = dirs.config_dir().join("settings.json");
-    let mut settings = if settings_path.exists() {
-        serde_json::from_slice::<AppSettings>(&fs::read(&settings_path).with_context(|| {
-            format!("cannot read settings from {}", settings_path.display())
-        })?)
-        .with_context(|| format!("invalid settings in {}", settings_path.display()))?
-    } else {
-        defaults(&dirs)?
-    };
+    let mut settings =
+        if settings_path.exists() {
+            serde_json::from_slice::<AppSettings>(&fs::read(&settings_path).with_context(|| {
+                format!("cannot read settings from {}", settings_path.display())
+            })?)
+            .with_context(|| format!("invalid settings in {}", settings_path.display()))?
+        } else {
+            defaults(&dirs)?
+        };
 
     if let Some(root) = cli.root {
         settings.root = absolute(root)?;
