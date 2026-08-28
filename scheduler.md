@@ -195,7 +195,7 @@ The two-stage implementation publishes the modification-time grid in about
 21 ms, completes a fresh authoritative-XMP enrichment in about 119 ms, and
 reloads the persistent metadata cache in about 70 ms (debug build, warm mount).
 
-Set `PICS_DIAGNOSTICS=1` to print aggregate scheduler and cache metrics at
+Set `REKESZ_DIAGNOSTICS=1` to print aggregate scheduler and cache metrics at
 shutdown. Scheduler snapshots retain queue/execution latency and completion /
 cancellation counts; the render pipeline separately counts cache hits, misses,
 intentional bypasses, read failures, completed/rejected/failed writes, and writes
@@ -216,7 +216,7 @@ metadata, and access-sidecar group together.
 
 The `vigoo/dnglab` fork now exposes a cache-key-independent cancellation token,
 a generic cancellable decoder boundary, internal Canon CR3/CRX tile, plane, and
-integration checkpoints, and cancellable RAW-development stage boundaries. Pics
+integration checkpoints, and cancellable RAW-development stage boundaries. Rekesz
 pins that revision and shares the scheduler's atomic cancellation flag directly
 with rawler. Other decoder implementations receive safe before/after checks and
 can add deeper format-specific checkpoints incrementally. Image/HEIF decode,
@@ -365,6 +365,6 @@ stages. Entropy decoding within one plane, individual demosaic/calibration
 operators, and third-party image/HEIF operations remain monolithic boundaries,
 so cancellation is cooperative rather than instantaneous. Other RAW decoders
 currently use the generic before/after boundary and can gain format-specific
-internal checkpoints without changing Pics. Resource reservation ensures these
+internal checkpoints without changing Rekesz. Resource reservation ensures these
 bounded operations do not consume the interactive slot when parallelism is
 greater than one.

@@ -140,7 +140,7 @@ fn export_fixed_reference_renders() {
         let stem = path.file_stem().unwrap().to_string_lossy();
         save_preview_as_png(
             rendered,
-            &PathBuf::from(format!("/tmp/pics-fixed-{stem}.png")),
+            &PathBuf::from(format!("/tmp/rekesz-fixed-{stem}.png")),
         )
         .unwrap();
     }

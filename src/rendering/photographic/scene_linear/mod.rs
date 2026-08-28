@@ -14,7 +14,7 @@ pub(super) fn apply_recipe_scene_linear(
     cancelled: &AtomicBool,
 ) -> Result<f32, String> {
     // A catalog recipe represents an intentional developed rendering. Keep the
-    // mandatory RAW development stages, but do not stack Pics' aesthetic auto
+    // mandatory RAW development stages, but do not stack Rekesz's aesthetic auto
     // exposure on top of those authored controls.
     let automatic = if recipe.is_some() {
         1.0

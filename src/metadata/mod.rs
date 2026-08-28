@@ -37,7 +37,7 @@ impl MetadataLoader {
     pub fn new(cache_root: PathBuf, parallelism: usize, limiter: JobLimiter) -> Self {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(parallelism.max(1))
-            .thread_name(|index| format!("pics-metadata-{index}"))
+            .thread_name(|index| format!("rekesz-metadata-{index}"))
             .build()
             .expect("failed to create metadata worker pool");
         let cache = open_cache(&cache_root.join(format!("{CACHE_VERSION}.sqlite3")))

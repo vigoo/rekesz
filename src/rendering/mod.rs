@@ -40,7 +40,7 @@ pub fn assert_hevc_decoder_available() -> anyhow::Result<()> {
     let decoders = libheif.decoder_descriptors(1, Some(CompressionFormat::Hevc));
     anyhow::ensure!(
         !decoders.is_empty(),
-        "this Pics build has no HEVC decoder registered with libheif; rebuild it with an embedded libde265 decoder"
+        "this Rekesz build has no HEVC decoder registered with libheif; rebuild it with an embedded libde265 decoder"
     );
     Ok(())
 }
@@ -130,7 +130,7 @@ pub struct DevelopRenderMetadata {
     pub identity: RenderIdentity,
     /// Exact normalized controls used to produce this cached derivative.
     pub recipe: DevelopRecipe,
-    /// Stable bitset of normalized Pics actions applied by this renderer model.
+    /// Stable bitset of normalized Rekesz actions applied by this renderer model.
     pub applied_actions: u64,
     /// Stable bitset of approximated, clamped, or skipped recipe behavior.
     pub fidelity_warnings: u64,

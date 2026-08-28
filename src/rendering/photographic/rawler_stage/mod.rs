@@ -11,7 +11,7 @@ pub(super) struct LinearRgb {
 }
 
 /// Runs the indivisible Rawler-owned photographic stage and crosses from
-/// Rawler's intermediate representation into Pics' scene-linear RGB boundary.
+/// Rawler's intermediate representation into Rekesz's scene-linear RGB boundary.
 pub(super) fn develop_linear(
     raw: &rawler::RawImage,
     cancelled: &Arc<AtomicBool>,

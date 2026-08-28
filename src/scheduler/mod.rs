@@ -12,6 +12,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub(crate) fn diagnostics_enabled() -> bool {
+    std::env::var_os("REKESZ_DIAGNOSTICS").is_some()
+}
+
 use futures::channel::oneshot;
 use priority_queue::PriorityQueue;
 
@@ -242,7 +246,7 @@ impl RenderScheduler {
                 // scope and cooperatively cancels the thumbnail if necessary.
                 let foreground_only = parallelism > 1 && index == 0;
                 thread::Builder::new()
-                    .name(format!("pics-render-{index}"))
+                    .name(format!("rekesz-render-{index}"))
                     .spawn(move || worker_loop(shared, foreground_only))
                     .expect("failed to start render worker")
             })
@@ -475,7 +479,7 @@ fn preempt_one_lower_priority(state: &mut State, incoming: JobPriority) {
 
 impl Drop for RenderScheduler {
     fn drop(&mut self) {
-        let diagnostics = std::env::var_os("PICS_DIAGNOSTICS").is_some();
+        let diagnostics = diagnostics_enabled();
         {
             let mut state = self.shared.state.lock().unwrap();
             state.cancelled += state.queue.len() as u64 + state.pending.len() as u64;
@@ -494,7 +498,7 @@ impl Drop for RenderScheduler {
             // blocking window shutdown on a currently non-preemptible RAW call.
             let shared = self.shared.clone();
             let _ = thread::Builder::new()
-                .name("pics-render-reaper".into())
+                .name("rekesz-render-reaper".into())
                 .spawn(move || {
                     for worker in workers {
                         let _ = worker.join();
@@ -502,7 +506,7 @@ impl Drop for RenderScheduler {
                     if diagnostics {
                         let state = shared.state.lock().unwrap();
                         eprintln!(
-                            "pics scheduler: completed={}, cancelled={}, queue-ms={}, execution-ms={}",
+                            "rekesz scheduler: completed={}, cancelled={}, queue-ms={}, execution-ms={}",
                             state.completed,
                             state.cancelled,
                             state.total_queue_latency.as_millis(),

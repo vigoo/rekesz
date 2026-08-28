@@ -8,7 +8,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OpenFlags, params};
 use serde::{Deserialize, Serialize};
 
-pub const CATALOG_DIR: &str = ".pics";
+pub const CATALOG_DIR: &str = ".rekesz";
 const CATALOG_FILE: &str = "catalog.sqlite3";
 const SCHEMA_VERSION: i64 = 1;
 const SQLITE_APPLICATION_ID: i64 = 0x5049_4353;
@@ -551,40 +551,43 @@ fn import_lightroom_inner(
         bail!("refusing to import recipes with conflicting Lightroom source rows");
     }
     if destination.exists() {
-        let mut pics = Connection::open(&destination)
-            .with_context(|| format!("cannot open Pics catalog {}", destination.display()))?;
-        initialize_schema(&mut pics)?;
-        write_planned_recipes(&mut pics, &planned)?;
+        let mut rekesz = Connection::open(&destination)
+            .with_context(|| format!("cannot open Rekesz catalog {}", destination.display()))?;
+        initialize_schema(&mut rekesz)?;
+        write_planned_recipes(&mut rekesz, &planned)?;
     } else if planned.is_empty() {
-        // There is nothing to persist. In particular, do not create a Pics
+        // There is nothing to persist. In particular, do not create a Rekesz
         // catalog merely to record that every Lightroom image is unedited.
         return Ok(report);
     } else {
         let temporary = tempfile::NamedTempFile::new_in(&root)?;
         let temporary = temporary.into_temp_path();
         {
-            let mut pics = Connection::open(&temporary)?;
-            initialize_schema(&mut pics)?;
-            write_planned_recipes(&mut pics, &planned)?;
-            pics.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")?;
+            let mut rekesz = Connection::open(&temporary)?;
+            initialize_schema(&mut rekesz)?;
+            write_planned_recipes(&mut rekesz, &planned)?;
+            rekesz.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")?;
         }
         let parent = destination.parent().expect("catalog path has a parent");
         fs::create_dir_all(parent).with_context(|| {
-            format!("cannot create Pics catalog directory {}", parent.display())
+            format!(
+                "cannot create Rekesz catalog directory {}",
+                parent.display()
+            )
         })?;
         temporary
             .persist(&destination)
             .map_err(|error| error.error)
-            .with_context(|| format!("cannot install Pics catalog {}", destination.display()))?;
+            .with_context(|| format!("cannot install Rekesz catalog {}", destination.display()))?;
     }
     Ok(report)
 }
 
 fn write_planned_recipes(
-    pics: &mut Connection,
+    rekesz: &mut Connection,
     planned: &BTreeMap<Vec<u8>, DevelopRecipe>,
 ) -> Result<()> {
-    let transaction = pics.transaction()?;
+    let transaction = rekesz.transaction()?;
     transaction.execute("DELETE FROM develop_recipes", [])?;
     transaction.execute("DELETE FROM assets", [])?;
     for (relative_key, recipe) in planned {
@@ -623,7 +626,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<()> {
         |row| row.get(0),
     )?;
     if tables > 0 && application_id != SQLITE_APPLICATION_ID {
-        bail!("refusing to initialize a database that is not a Pics catalog");
+        bail!("refusing to initialize a database that is not a Rekesz catalog");
     }
     if tables > 0 {
         // Probe and reject an unsupported owned schema before any PRAGMA or DDL
@@ -669,11 +672,11 @@ fn validate_schema(connection: &Connection) -> Result<()> {
     let application_id: i64 =
         connection.query_row("PRAGMA application_id", [], |row| row.get(0))?;
     if application_id != SQLITE_APPLICATION_ID {
-        bail!("database is not a Pics catalog");
+        bail!("database is not a Rekesz catalog");
     }
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version != SCHEMA_VERSION {
-        bail!("unsupported Pics catalog schema {version}; expected {SCHEMA_VERSION}");
+        bail!("unsupported Rekesz catalog schema {version}; expected {SCHEMA_VERSION}");
     }
     let (rows, metadata_version, renderer_model): (i64, i64, i64) = connection.query_row(
         "SELECT count(*), min(schema_version), min(renderer_model) FROM catalog_meta",
@@ -685,7 +688,7 @@ fn validate_schema(connection: &Connection) -> Result<()> {
         || renderer_model <= 0
         || renderer_model > i64::from(RENDERER_MODEL_VERSION)
     {
-        bail!("Pics catalog metadata is inconsistent with its schema");
+        bail!("Rekesz catalog metadata is inconsistent with its schema");
     }
     Ok(())
 }

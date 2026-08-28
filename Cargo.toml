@@ -1,5 +1,5 @@
 [package]
-name = "pics"
+name = "rekesz"
 version = "0.1.0"
 edition = "2024"
 
@@ -28,7 +28,7 @@ serde_json = "1"
 tempfile = "3"
 
 [[bin]]
-name = "pics"
+name = "rekesz"
 path = "src/main.rs"
 harness = false
 

@@ -31,7 +31,7 @@ pub mod actions {
 }
 
 pub mod warnings {
-    /// Pics implements a visually similar operator rather than Adobe's private one.
+    /// Rekesz implements a visually similar operator rather than Adobe's private one.
     pub const APPROXIMATED: u64 = 1 << 0;
 }
 

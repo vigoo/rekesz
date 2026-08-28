@@ -1,4 +1,4 @@
-# pics
+# Rekesz
 
 A small GPUI directory image browser. The left panel contains directories only;
 selecting one displays a virtual thumbnail grid ordered by capture time.
@@ -16,21 +16,21 @@ visible virtual-grid thumbnails are ordered center-first, and obsolete queued
 thumbnail demand is cancelled when scrolling or changing directories.
 
 Thumbnails and RAW fit-window previews are persisted in the operating system's
-application cache directory (`~/.cache/pics` on Linux). Use
+application cache directory (`~/.cache/rekesz` on Linux). Use
 `--cache-root /path/to/cache` to override it. Entries are keyed by source path,
 modification time, file size, render dimensions, and rendering recipe; cached
 pixels and their transformation metadata are written atomically as PNG/JSON
 pairs by a deferred maintenance writer and reused by later sessions. The disk
 cache uses access sidecars and a 10 GiB least-recently-used budget.
 
-Set `PICS_DIAGNOSTICS=1` to print aggregate scheduling latency, cancellation,
+Set `REKESZ_DIAGNOSTICS=1` to print aggregate scheduling latency, cancellation,
 and persistent-cache activity when the application shuts down.
 
 When a directory contains matching `name.CR3` and `name.JPG` files, the grid
 shows one item and uses CR3 by default. Pass `--cr3-jpeg-preference jpeg` to use
 the JPEG instead.
 
-When the path is omitted, `pics` uses the current directory. Directory symlinks
+When the path is omitted, `rekesz` uses the current directory. Directory symlinks
 are intentionally not traversed. Supported formats include AVIF, BMP, DDS, EXR,
 Farbfeld, GIF, HDR, ICO, JPEG, PNG, PNM, QOI, TGA, TIFF, and WebP (subject to
 the platform renderer's support), plus Nikon NEF and Canon CR3 RAW files and

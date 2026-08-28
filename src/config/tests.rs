@@ -22,7 +22,7 @@ fn persisted_settings_are_loaded_and_cli_values_override_them() {
     save(&path, &stored).unwrap();
     let config = from_args_with_dirs(
         [
-            "pics",
+            "rekesz",
             "--image-cache-size",
             "3",
             "--cr3-jpeg-preference",
@@ -56,13 +56,15 @@ fn clap_rejects_zero_and_unknown_options() {
     let (_temp, project_dirs) = dirs();
     assert!(
         from_args_with_dirs(
-            ["pics", "--job-parallelism", "0"].map(OsString::from),
+            ["rekesz", "--job-parallelism", "0"].map(OsString::from),
             project_dirs,
         )
         .is_err()
     );
     let (_temp, project_dirs) = dirs();
-    assert!(from_args_with_dirs(["pics", "--unknown"].map(OsString::from), project_dirs,).is_err());
+    assert!(
+        from_args_with_dirs(["rekesz", "--unknown"].map(OsString::from), project_dirs,).is_err()
+    );
 }
 
 #[test]

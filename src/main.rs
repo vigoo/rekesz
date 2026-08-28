@@ -48,7 +48,7 @@ use scheduler::{
 };
 
 actions!(
-    pics,
+    rekesz,
     [
         ToggleDeveloped,
         ToggleJobQueue,
@@ -742,7 +742,7 @@ impl PictureBrowser {
                         this.rebuild_visible();
                     }
                     Err(error) => {
-                        eprintln!("cannot load Pics catalog: {error:#}");
+                        eprintln!("cannot load Rekesz catalog: {error:#}");
                         this.recipes = Some(Arc::new(HashMap::new()));
                     }
                 }
@@ -2262,9 +2262,9 @@ impl PictureBrowser {
                 self.settings = draft;
                 self.settings_draft = None;
                 self.settings_status = Some(if cache_size_changed {
-                    "Settings saved. Image cache size applied immediately; restart Pics to apply service and library changes."
+                    "Settings saved. Image cache size applied immediately; restart Rekesz to apply service and library changes."
                 } else {
-                    "Settings saved. Restart Pics to apply service and library changes."
+                    "Settings saved. Restart Rekesz to apply service and library changes."
                 }.into());
             }
             Err(error) => {

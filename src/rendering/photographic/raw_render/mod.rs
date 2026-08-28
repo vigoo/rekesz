@@ -9,7 +9,7 @@ use super::{
 };
 use crate::{catalog::DevelopRecipe, rendering::decoded::DecodedRaw};
 
-/// Coordinates the decoded RAW source, Rawler's compound stage, and Pics-owned
+/// Coordinates the decoded RAW source, Rawler's compound stage, and Rekesz-owned
 /// scene-linear, exposure, colour, tone, and orientation stages.
 pub(in crate::rendering) fn render_raw(
     decoded: &DecodedRaw,

@@ -192,10 +192,10 @@ impl Drop for CacheWriter {
         if let Some(worker) = self.worker.get_mut().unwrap().take() {
             let _ = worker.join();
         }
-        if std::env::var_os("PICS_DIAGNOSTICS").is_some() {
+        if crate::scheduler::diagnostics_enabled() {
             let stats = self.metrics.snapshot();
             eprintln!(
-                "pics cache: hits={}, misses={}, bypasses={}, read-failures={}, writes={}, dropped={}, rejected={}, write-failures={}; average-us: identity={}, cache-lookup={}, source-decode={}, derivative-transform={}, cache-write={}",
+                "rekesz cache: hits={}, misses={}, bypasses={}, read-failures={}, writes={}, dropped={}, rejected={}, write-failures={}; average-us: identity={}, cache-lookup={}, source-decode={}, derivative-transform={}, cache-write={}",
                 stats.cache_hits,
                 stats.cache_misses,
                 stats.cache_bypasses,
@@ -308,7 +308,7 @@ impl RenderPipeline {
         let writer_backend = backend.clone();
         let writer_metrics = metrics.clone();
         let worker = thread::Builder::new()
-            .name("pics-cache-writer".into())
+            .name("rekesz-cache-writer".into())
             .spawn(move || {
                 while let Ok(write) = receiver.recv() {
                     let started = Instant::now();
@@ -366,7 +366,7 @@ impl RenderPipeline {
                             .map(usize::from)
                             .unwrap_or(1),
                     )
-                    .thread_name(|index| format!("pics-raw-{index}"))
+                    .thread_name(|index| format!("rekesz-raw-{index}"))
                     .build()
                     .expect("failed to start RAW processing pool"),
             ),
