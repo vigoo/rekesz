@@ -53,7 +53,6 @@ impl PreviewCache {
             .unwrap_or(PreviewState::Unloaded)
     }
 
-    #[cfg(test)]
     pub fn clear(&mut self) {
         self.entries.clear();
         self.last_used.clear();

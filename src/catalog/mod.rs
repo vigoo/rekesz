@@ -390,6 +390,7 @@ pub fn load_recipes(root: &Path) -> Result<HashMap<PathBuf, RecipeEntry>> {
     Ok(recipes)
 }
 
+#[cfg(test)]
 pub fn analyze_lightroom(root: &Path, lightroom_catalog: &Path) -> Result<ImportReport> {
     import_lightroom_inner(root, lightroom_catalog, false, CURRENT_IMPORT_CAPABILITIES)
 }

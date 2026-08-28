@@ -4610,6 +4610,7 @@ dependencies = [
  "arboard",
  "blake3",
  "chrono",
+ "clap",
  "directories",
  "futures",
  "gpui",

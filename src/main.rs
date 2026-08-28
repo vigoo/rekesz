@@ -4,8 +4,6 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    env,
-    ffi::OsString,
     ops::Range,
     path::PathBuf,
     sync::{
@@ -19,12 +17,13 @@ use anyhow::Result;
 use gpui::{
     AnyElement, App, AppContext as _, Application, Bounds, ClickEvent, ClipboardItem, Context,
     CursorStyle, FocusHandle, KeyBinding, ListSizingBehavior, Menu, MenuItem, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, ScrollStrategy, ScrollWheelEvent,
-    SharedString, UniformListScrollHandle, Window, WindowBounds, WindowOptions, actions, canvas,
-    div, img, point, prelude::*, px, relative, rgb, size, uniform_list,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Render, ScrollStrategy,
+    ScrollWheelEvent, SharedString, UniformListScrollHandle, Window, WindowBounds, WindowOptions,
+    actions, canvas, div, img, point, prelude::*, px, relative, rgb, size, uniform_list,
 };
 
 mod catalog;
+mod config;
 mod discovery;
 mod formats;
 mod jobs;
@@ -33,6 +32,7 @@ mod preview;
 mod rendering;
 mod scheduler;
 
+use config::{AppSettings, Config};
 use discovery::{
     DirectoryContents, DirectoryMetadataStatus, DirectoryModel, DirectoryScanPriority,
     DirectoryScanner, NodeId, RawJpegPreference,
@@ -49,7 +49,13 @@ use scheduler::{
 
 actions!(
     pics,
-    [ToggleDeveloped, ToggleJobQueue, ToggleDevelopInspector]
+    [
+        ToggleDeveloped,
+        ToggleJobQueue,
+        ToggleDevelopInspector,
+        OpenSettings,
+        ImportLightroom
+    ]
 );
 
 actions!(
@@ -242,6 +248,11 @@ struct PictureBrowser {
     show_job_queue: bool,
     show_develop_inspector: bool,
     show_view_menu: bool,
+    show_file_menu: bool,
+    settings: AppSettings,
+    settings_path: PathBuf,
+    settings_draft: Option<AppSettings>,
+    settings_status: Option<String>,
     job_queue_snapshot: SchedulerSnapshot,
     job_queue_scroll: UniformListScrollHandle,
     scheduler_refresh_scheduled: bool,
@@ -259,6 +270,13 @@ struct PictureBrowser {
 enum ScrollbarTarget {
     Tree,
     Grid,
+}
+
+#[derive(Clone, Copy)]
+enum SettingsNumber {
+    ImageCacheSize,
+    JobParallelism,
+    RawParallelism,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -580,25 +598,26 @@ impl PictureBrowser {
     }
 
     fn new(config: &Config, cx: &mut Context<Self>) -> Self {
-        let model = DirectoryModel::new(config.root.clone());
+        let settings = &config.settings;
+        let model = DirectoryModel::new(settings.root.clone());
         let root = model.root();
         let root_path = model.node(root).path.to_path_buf();
-        let job_limiter = JobLimiter::new(config.job_parallelism);
+        let job_limiter = JobLimiter::new(settings.job_parallelism);
         let render_pipeline = PreviewRenderer::with_source_cache_capacity(
-            config.cache_root.clone(),
-            config.job_parallelism,
-            config.raw_parallelism,
-            config.image_cache_size,
+            settings.cache_root.clone(),
+            settings.job_parallelism,
+            settings.raw_parallelism,
+            settings.image_cache_size,
         );
         let metadata_loader = MetadataLoader::new(
-            config.cache_root.clone(),
-            config.job_parallelism,
+            settings.cache_root.clone(),
+            settings.job_parallelism,
             job_limiter.clone(),
         );
         let render_job_limiter = job_limiter.clone();
         let scheduler_pipeline = render_pipeline.clone();
         let scheduler = RenderScheduler::new(
-            config.job_parallelism,
+            settings.job_parallelism,
             Arc::new(move |key, priority, cancelled| {
                 let Some(_permit) = render_job_limiter.acquire(
                     priority.class >= scheduler::PriorityClass::Visible,
@@ -627,9 +646,9 @@ impl PictureBrowser {
             }],
             expanded: HashSet::from([root]),
             selected: root,
-            previews: PreviewCache::new(config.image_cache_size),
-            raw_previews: PreviewCache::new(config.image_cache_size),
-            thumbnails: PreviewCache::new(config.image_cache_size.saturating_mul(16).max(64)),
+            previews: PreviewCache::new(settings.image_cache_size),
+            raw_previews: PreviewCache::new(settings.image_cache_size),
+            thumbnails: PreviewCache::new(settings.image_cache_size.saturating_mul(16).max(64)),
             main_view: MainView::Dir(root_path, ImageSelection::default()),
             saved_selection: ImageSelection::default(),
             thumbnail_width: DEFAULT_THUMBNAIL_WIDTH,
@@ -640,11 +659,11 @@ impl PictureBrowser {
             main_focus: cx.focus_handle(),
             sidebar_width: 300.0,
             resizing_sidebar: false,
-            pair_preference: config.pair_preference,
+            pair_preference: settings.pair_preference.into(),
             work: WorkProgress::default(),
             render_pipeline,
             scheduler,
-            directory_scanner: DirectoryScanner::new(config.job_parallelism, job_limiter.clone()),
+            directory_scanner: DirectoryScanner::new(settings.job_parallelism, job_limiter.clone()),
             grid_demand_epoch: 0,
             grid_prediction: None,
             scroll_direction: 1,
@@ -660,6 +679,11 @@ impl PictureBrowser {
             show_job_queue: false,
             show_develop_inspector: false,
             show_view_menu: false,
+            show_file_menu: false,
+            settings: settings.clone(),
+            settings_path: config.settings_path.clone(),
+            settings_draft: None,
+            settings_status: None,
             job_queue_snapshot: SchedulerSnapshot::default(),
             job_queue_scroll: UniformListScrollHandle::new(),
             scheduler_refresh_scheduled: false,
@@ -673,7 +697,7 @@ impl PictureBrowser {
             developed: true,
         };
         let catalog_work = this.work.start("Loading develop catalog…");
-        let catalog_root = config.root.clone();
+        let catalog_root = settings.root.clone();
         let loading = cx
             .background_executor()
             .spawn(async move { catalog::load_recipes(&catalog_root) });
@@ -2009,6 +2033,139 @@ impl PictureBrowser {
         cx.notify();
     }
 
+    fn open_settings(&mut self, _: &OpenSettings, _: &mut Window, cx: &mut Context<Self>) {
+        self.settings_draft = Some(self.settings.clone());
+        self.settings_status = None;
+        self.show_file_menu = false;
+        cx.notify();
+    }
+
+    fn save_settings(&mut self, cx: &mut Context<Self>) {
+        let Some(draft) = self.settings_draft.clone() else {
+            return;
+        };
+        match config::save(&self.settings_path, &draft) {
+            Ok(()) => {
+                self.pair_preference = draft.pair_preference.into();
+                self.settings = draft;
+                self.settings_draft = None;
+                self.settings_status = Some(
+                    "Settings saved. Restart Pics to apply service and library changes.".into(),
+                );
+            }
+            Err(error) => {
+                self.settings_status = Some(format!("Could not save settings: {error:#}"))
+            }
+        }
+        cx.notify();
+    }
+
+    fn adjust_setting(&mut self, field: SettingsNumber, delta: isize, cx: &mut Context<Self>) {
+        let Some(draft) = &mut self.settings_draft else {
+            return;
+        };
+        let value = match field {
+            SettingsNumber::ImageCacheSize => &mut draft.image_cache_size,
+            SettingsNumber::JobParallelism => &mut draft.job_parallelism,
+            SettingsNumber::RawParallelism => &mut draft.raw_parallelism,
+        };
+        *value = value.saturating_add_signed(delta).max(1);
+        if draft.raw_parallelism > draft.job_parallelism {
+            draft.raw_parallelism = draft.job_parallelism;
+        }
+        cx.notify();
+    }
+
+    fn choose_settings_directory(&mut self, choose_root: bool, cx: &mut Context<Self>) {
+        let selection = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(
+                if choose_root {
+                    "Choose picture library"
+                } else {
+                    "Choose cache directory"
+                }
+                .into(),
+            ),
+        });
+        cx.spawn(async move |this, cx| {
+            let path = match selection.await {
+                Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                _ => None,
+            };
+            if let Some(path) = path {
+                this.update(cx, |this, cx| {
+                    if let Some(draft) = &mut this.settings_draft {
+                        if choose_root {
+                            draft.root = path;
+                        } else {
+                            draft.cache_root = path;
+                        }
+                    }
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    fn import_lightroom(&mut self, _: &ImportLightroom, _: &mut Window, cx: &mut Context<Self>) {
+        self.show_file_menu = false;
+        let selection = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Import Lightroom catalog".into()),
+        });
+        let root = self.model.node(self.model.root()).path.to_path_buf();
+        let background = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            let catalog_path = match selection.await {
+                Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                _ => None,
+            };
+            let Some(catalog_path) = catalog_path else {
+                return;
+            };
+            let work = this
+                .update(cx, |this, cx| {
+                    let id = this.work.start(format!(
+                        "Importing Lightroom catalog {}…",
+                        path_display_name(&catalog_path)
+                    ));
+                    cx.notify();
+                    id
+                })
+                .ok()
+                .unwrap_or_default();
+            let import_root = root.clone();
+            let result = background
+                .spawn(async move {
+                    catalog::import_lightroom(&import_root, &catalog_path)?;
+                    catalog::load_recipes(&import_root)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.work.finish(work);
+                match result {
+                    Ok(recipes) => {
+                        this.recipes = Some(Arc::new(recipes));
+                        this.previews.clear();
+                        this.raw_previews.clear();
+                        this.thumbnails.clear();
+                    }
+                    Err(error) => eprintln!("cannot import Lightroom catalog: {error:#}"),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn copy_absolute_path(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
         let text = path.to_string_lossy().into_owned();
         cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
@@ -2806,6 +2963,24 @@ impl Render for PictureBrowser {
             .border_color(rgb(0x30343d))
             .child(
                 div()
+                    .id("file-menu-button")
+                    .h(px(24.0))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .rounded_sm()
+                    .text_sm()
+                    .hover(|this| this.bg(rgb(0x343943)))
+                    .when(self.show_file_menu, |this| this.bg(rgb(0x343943)))
+                    .child("File")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_file_menu = !this.show_file_menu;
+                        this.show_view_menu = false;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
                     .id("view-menu-button")
                     .h(px(24.0))
                     .px_2()
@@ -2818,6 +2993,7 @@ impl Render for PictureBrowser {
                     .child("View")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.show_view_menu = !this.show_view_menu;
+                        this.show_file_menu = false;
                         cx.notify();
                     })),
             );
@@ -2873,6 +3049,10 @@ impl Render for PictureBrowser {
                 .min((f32::from(viewport.height) - if can_export { 66.0 } else { 38.0 }).max(0.0));
             (menu.path.clone(), left, top, can_export)
         });
+        let settings_dialog = self
+            .settings_draft
+            .clone()
+            .map(|draft| render_settings_dialog(draft, self.settings_status.clone(), cx));
         div()
             .size_full()
             .relative()
@@ -2882,6 +3062,8 @@ impl Render for PictureBrowser {
             .on_action(cx.listener(Self::toggle_job_queue))
             .on_action(cx.listener(Self::toggle_develop_inspector))
             .on_action(cx.listener(Self::toggle_developed))
+            .on_action(cx.listener(Self::open_settings))
+            .on_action(cx.listener(Self::import_lightroom))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
@@ -2900,6 +3082,51 @@ impl Render for PictureBrowser {
             )
             .when(USE_IN_WINDOW_MENU, |this| this.child(menu_bar))
             .child(content)
+            .when(USE_IN_WINDOW_MENU && self.show_file_menu, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .left(px(8.0))
+                        .top(px(29.0))
+                        .w(px(230.0))
+                        .p_1()
+                        .occlude()
+                        .bg(rgb(0x252932))
+                        .text_color(rgb(0xd8dde7))
+                        .border_1()
+                        .border_color(rgb(0x30343d))
+                        .child(
+                            div()
+                                .id("import-lightroom-menu-item")
+                                .h(px(28.0))
+                                .px_2()
+                                .flex()
+                                .items_center()
+                                .rounded_sm()
+                                .text_sm()
+                                .hover(|this| this.bg(rgb(0x3b4658)))
+                                .child("Import Lightroom Catalog…")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.import_lightroom(&ImportLightroom, window, cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("settings-menu-item")
+                                .h(px(28.0))
+                                .px_2()
+                                .flex()
+                                .items_center()
+                                .rounded_sm()
+                                .text_sm()
+                                .hover(|this| this.bg(rgb(0x3b4658)))
+                                .child("Settings…")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_settings(&OpenSettings, window, cx);
+                                })),
+                        ),
+                )
+            })
             .when(USE_IN_WINDOW_MENU && self.show_view_menu, |this| {
                 this.child(
                     div()
@@ -3021,7 +3248,253 @@ impl Render for PictureBrowser {
                         }),
                 )
             })
+            .when_some(settings_dialog, |this, dialog| this.child(dialog))
     }
+}
+
+fn settings_number_row(
+    label: &'static str,
+    value: usize,
+    field: SettingsNumber,
+    cx: &mut Context<PictureBrowser>,
+) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .py_2()
+        .border_b_1()
+        .border_color(rgb(0x30343d))
+        .child(label)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .id(SharedString::from(format!("settings-minus-{label}")))
+                        .px_3()
+                        .py_1()
+                        .rounded_sm()
+                        .bg(rgb(0x343943))
+                        .hover(|this| this.bg(rgb(0x465064)))
+                        .child("−")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.adjust_setting(field, -1, cx);
+                        })),
+                )
+                .child(div().w(px(42.0)).text_center().child(value.to_string()))
+                .child(
+                    div()
+                        .id(SharedString::from(format!("settings-plus-{label}")))
+                        .px_3()
+                        .py_1()
+                        .rounded_sm()
+                        .bg(rgb(0x343943))
+                        .hover(|this| this.bg(rgb(0x465064)))
+                        .child("+")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.adjust_setting(field, 1, cx);
+                        })),
+                ),
+        )
+}
+
+fn render_settings_dialog(
+    draft: AppSettings,
+    status: Option<String>,
+    cx: &mut Context<PictureBrowser>,
+) -> gpui::Div {
+    let preference = draft.pair_preference;
+    div()
+        .absolute()
+        .inset_0()
+        .occlude()
+        .bg(gpui::rgba(0x00000099))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            div()
+                .w(px(620.0))
+                .max_h(px(680.0))
+                .p_5()
+                .rounded_md()
+                .bg(rgb(0x252932))
+                .text_color(rgb(0xd8dde7))
+                .border_1()
+                .border_color(rgb(0x4a5260))
+                .child(div().text_xl().mb_2().child("Settings"))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(0x9da7b6))
+                        .mb_3()
+                        .child("Worker, cache, and library changes take effect after restart."),
+                )
+                .child(
+                    div()
+                        .py_2()
+                        .border_b_1()
+                        .border_color(rgb(0x30343d))
+                        .child("Picture library")
+                        .child(
+                            div()
+                                .mt_1()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .max_w(px(470.0))
+                                        .truncate()
+                                        .text_sm()
+                                        .text_color(rgb(0xb7bfcc))
+                                        .child(draft.root.to_string_lossy().into_owned()),
+                                )
+                                .child(
+                                    div()
+                                        .id("settings-browse-root")
+                                        .px_3()
+                                        .py_1()
+                                        .rounded_sm()
+                                        .bg(rgb(0x343943))
+                                        .hover(|this| this.bg(rgb(0x465064)))
+                                        .child("Browse…")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.choose_settings_directory(true, cx);
+                                        })),
+                                ),
+                        ),
+                )
+                .child(settings_number_row(
+                    "Image cache entries",
+                    draft.image_cache_size,
+                    SettingsNumber::ImageCacheSize,
+                    cx,
+                ))
+                .child(settings_number_row(
+                    "Worker threads",
+                    draft.job_parallelism,
+                    SettingsNumber::JobParallelism,
+                    cx,
+                ))
+                .child(settings_number_row(
+                    "RAW worker threads",
+                    draft.raw_parallelism,
+                    SettingsNumber::RawParallelism,
+                    cx,
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .py_2()
+                        .border_b_1()
+                        .border_color(rgb(0x30343d))
+                        .child("RAW/JPEG pair preference")
+                        .child(
+                            div()
+                                .id("settings-pair-preference")
+                                .px_3()
+                                .py_1()
+                                .rounded_sm()
+                                .bg(rgb(0x343943))
+                                .hover(|this| this.bg(rgb(0x465064)))
+                                .child(match preference {
+                                    config::PairPreference::Raw => "RAW",
+                                    config::PairPreference::Jpeg => "JPEG",
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(draft) = &mut this.settings_draft {
+                                        draft.pair_preference = match draft.pair_preference {
+                                            config::PairPreference::Raw => {
+                                                config::PairPreference::Jpeg
+                                            }
+                                            config::PairPreference::Jpeg => {
+                                                config::PairPreference::Raw
+                                            }
+                                        };
+                                    }
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(
+                    div().py_2().child("Cache directory").child(
+                        div()
+                            .mt_1()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .max_w(px(470.0))
+                                    .truncate()
+                                    .text_sm()
+                                    .text_color(rgb(0xb7bfcc))
+                                    .child(draft.cache_root.to_string_lossy().into_owned()),
+                            )
+                            .child(
+                                div()
+                                    .id("settings-browse-cache")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .bg(rgb(0x343943))
+                                    .hover(|this| this.bg(rgb(0x465064)))
+                                    .child("Browse…")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.choose_settings_directory(false, cx);
+                                    })),
+                            ),
+                    ),
+                )
+                .when_some(status, |this, status| {
+                    this.child(
+                        div()
+                            .mt_2()
+                            .text_sm()
+                            .text_color(rgb(0xf2b8b5))
+                            .child(status),
+                    )
+                })
+                .child(
+                    div()
+                        .mt_4()
+                        .flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            div()
+                                .id("settings-cancel")
+                                .px_4()
+                                .py_2()
+                                .rounded_sm()
+                                .bg(rgb(0x343943))
+                                .hover(|this| this.bg(rgb(0x465064)))
+                                .child("Cancel")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.settings_draft = None;
+                                    this.settings_status = None;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("settings-save")
+                                .px_4()
+                                .py_2()
+                                .rounded_sm()
+                                .bg(rgb(0x315b8f))
+                                .hover(|this| this.bg(rgb(0x3d6fa9)))
+                                .child("Save")
+                                .on_click(cx.listener(|this, _, _, cx| this.save_settings(cx))),
+                        ),
+                ),
+        )
 }
 
 fn export_dialog_directory<'a>(
@@ -3064,170 +3537,10 @@ fn bgra_to_rgba(pixels: &mut [u8]) {
     }
 }
 
-const DEFAULT_IMAGE_CACHE_SIZE: usize = 8;
-const RAW_MEMORY_RESERVE_BYTES: u64 = 1024 * 1024 * 1024;
-const ESTIMATED_RAW_WORKING_SET_BYTES: u64 = 768 * 1024 * 1024;
-
-struct Config {
-    root: PathBuf,
-    image_cache_size: usize,
-    pair_preference: RawJpegPreference,
-    cache_root: PathBuf,
-    job_parallelism: usize,
-    raw_parallelism: usize,
-    import_lightroom: Option<PathBuf>,
-    apply_lightroom_import: bool,
-}
-
-fn config_from_args(args: impl IntoIterator<Item = OsString>) -> Result<Config> {
-    let mut args = args.into_iter();
-    let _program = args.next();
-    let mut requested_root = None;
-    let mut image_cache_size = DEFAULT_IMAGE_CACHE_SIZE;
-    let mut pair_preference = RawJpegPreference::Raw;
-    let mut requested_cache_root = None;
-    let mut job_parallelism = std::thread::available_parallelism()
-        .map(|count| count.get().min(8))
-        .unwrap_or(1);
-    let mut requested_raw_parallelism = None;
-    let mut import_lightroom = None;
-    let mut apply_lightroom_import = false;
-    while let Some(argument) = args.next() {
-        if argument == "--image-cache-size" {
-            let value = args
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("--image-cache-size requires a value"))?;
-            image_cache_size = value
-                .to_string_lossy()
-                .parse::<usize>()
-                .map_err(|_| anyhow::anyhow!("image cache size must be a positive integer"))?;
-            if image_cache_size == 0 {
-                anyhow::bail!("image cache size must be at least 1");
-            }
-        } else if argument == "--job-parallelism" || argument == "--render-parallelism" {
-            let value = args
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("--job-parallelism requires a value"))?;
-            job_parallelism = value
-                .to_string_lossy()
-                .parse::<usize>()
-                .map_err(|_| anyhow::anyhow!("job parallelism must be a positive integer"))?;
-            if job_parallelism == 0 {
-                anyhow::bail!("job parallelism must be at least 1");
-            }
-        } else if argument == "--raw-parallelism" {
-            let value = args
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("--raw-parallelism requires a value"))?;
-            let raw_parallelism = value
-                .to_string_lossy()
-                .parse::<usize>()
-                .map_err(|_| anyhow::anyhow!("RAW parallelism must be a positive integer"))?;
-            if raw_parallelism == 0 {
-                anyhow::bail!("RAW parallelism must be at least 1");
-            }
-            requested_raw_parallelism = Some(raw_parallelism);
-        } else if argument == "--cache-root" {
-            requested_cache_root =
-                Some(PathBuf::from(args.next().ok_or_else(|| {
-                    anyhow::anyhow!("--cache-root requires a directory")
-                })?));
-        } else if argument == "--import-lightroom" {
-            import_lightroom =
-                Some(PathBuf::from(args.next().ok_or_else(|| {
-                    anyhow::anyhow!("--import-lightroom requires a .lrcat path")
-                })?));
-        } else if argument == "--apply-lightroom-import" {
-            apply_lightroom_import = true;
-        } else if argument == "--cr3-jpeg-preference" {
-            let value = args
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("--cr3-jpeg-preference requires cr3 or jpeg"))?;
-            pair_preference = match value.to_string_lossy().to_ascii_lowercase().as_str() {
-                "cr3" | "raw" => RawJpegPreference::Raw,
-                "jpg" | "jpeg" => RawJpegPreference::Jpeg,
-                _ => anyhow::bail!("--cr3-jpeg-preference must be cr3 or jpeg"),
-            };
-        } else if requested_root.is_none() {
-            requested_root = Some(PathBuf::from(argument));
-        } else {
-            anyhow::bail!("unexpected argument: {}", argument.to_string_lossy());
-        }
-    }
-    let requested = requested_root.unwrap_or(env::current_dir()?);
-    let root = if requested.is_absolute() {
-        requested
-    } else {
-        env::current_dir()?.join(requested)
-    };
-    let cache_root = requested_cache_root.unwrap_or(
-        directories::ProjectDirs::from("", "", "pics")
-            .ok_or_else(|| anyhow::anyhow!("cannot determine the platform cache directory"))?
-            .cache_dir()
-            .to_path_buf(),
-    );
-    let cache_root = if cache_root.is_absolute() {
-        cache_root
-    } else {
-        env::current_dir()?.join(cache_root)
-    };
-    let raw_parallelism = requested_raw_parallelism
-        .unwrap_or_else(|| default_raw_parallelism(job_parallelism))
-        .min(job_parallelism);
-    Ok(Config {
-        root,
-        image_cache_size,
-        pair_preference,
-        cache_root,
-        job_parallelism,
-        raw_parallelism,
-        import_lightroom,
-        apply_lightroom_import,
-    })
-}
-
-fn default_raw_parallelism(job_parallelism: usize) -> usize {
-    let system = sysinfo::System::new_all();
-    recommended_raw_parallelism(
-        system.cpus().len(),
-        system.available_memory(),
-        job_parallelism,
-    )
-}
-
-fn recommended_raw_parallelism(
-    logical_cpus: usize,
-    available_memory_bytes: u64,
-    job_parallelism: usize,
-) -> usize {
-    let cpu_limit = logical_cpus.max(1).div_ceil(2);
-    let memory_limit = available_memory_bytes
-        .saturating_sub(RAW_MEMORY_RESERVE_BYTES)
-        .checked_div(ESTIMATED_RAW_WORKING_SET_BYTES)
-        .unwrap_or(0)
-        .max(1) as usize;
-    cpu_limit.min(memory_limit).min(job_parallelism).max(1)
-}
-
 #[cfg(not(test))]
 fn main() -> Result<()> {
+    let config = config::from_env()?;
     rendering::assert_hevc_decoder_available()?;
-    let config = config_from_args(env::args_os())?;
-    if let Some(lightroom) = &config.import_lightroom {
-        let report = if config.apply_lightroom_import {
-            catalog::import_lightroom(&config.root, lightroom)?
-        } else {
-            catalog::analyze_lightroom(&config.root, lightroom)?
-        };
-        println!("{}", serde_json::to_string_pretty(&report)?);
-        if !config.apply_lightroom_import {
-            eprintln!("dry run only; repeat with --apply-lightroom-import to commit this import");
-        }
-        return Ok(());
-    }
-    if config.apply_lightroom_import {
-        anyhow::bail!("--apply-lightroom-import requires --import-lightroom PATH");
-    }
     Application::new().run(move |cx: &mut App| {
         cx.bind_keys([
             KeyBinding::new("up", TreeUp, Some("DirectoryTree")),
@@ -3248,14 +3561,23 @@ fn main() -> Result<()> {
             KeyBinding::new("ctrl-shift-j", ToggleJobQueue, None),
             KeyBinding::new("d", ToggleDeveloped, Some("MainView")),
         ]);
-        cx.set_menus(vec![Menu {
-            name: "View".into(),
-            items: vec![
-                MenuItem::action("Developed / Baseline", ToggleDeveloped),
-                MenuItem::action("Develop Edits", ToggleDevelopInspector),
-                MenuItem::action("Job Queue", ToggleJobQueue),
-            ],
-        }]);
+        cx.set_menus(vec![
+            Menu {
+                name: "File".into(),
+                items: vec![
+                    MenuItem::action("Import Lightroom Catalog…", ImportLightroom),
+                    MenuItem::action("Settings…", OpenSettings),
+                ],
+            },
+            Menu {
+                name: "View".into(),
+                items: vec![
+                    MenuItem::action("Developed / Baseline", ToggleDeveloped),
+                    MenuItem::action("Develop Edits", ToggleDevelopInspector),
+                    MenuItem::action("Job Queue", ToggleJobQueue),
+                ],
+            },
+        ]);
         let bounds = Bounds::centered(None, size(px(1100.0), px(720.0)), cx);
         cx.open_window(
             WindowOptions {
