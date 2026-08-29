@@ -62,6 +62,27 @@ Ctrl-click (Command-click on macOS) to toggle items, and Shift-click to select a
 range. Double-click a thumbnail or press Enter to open it; press Escape or use
 the Back button to return to the directory.
 
+The directory header can switch between the thumbnail grid and a map of photos
+that contain GPS metadata. Rekesz reads coordinates from XMP sidecars and
+embedded EXIF metadata in supported standard, HEIF, and RAW images; it does not
+write location metadata back to files. The initial world map is bundled and
+works without a network connection. Selecting an empty directory can include
+its recursively discovered descendants in either grid or map mode. Clicking a
+map cluster opens a paged thumbnail gallery; individual thumbnails open their
+photo, and expandable clusters offer a zoom action.
+
+At higher zoom levels Rekesz can optionally download vector-map detail from
+OpenFreeMap. The application asks before the first map request and remembers the
+choice. A request contains only the map tile coordinates for the area being
+viewed—photos, filenames, paths, and photo metadata are never sent. Downloaded
+tiles are stored beneath the application cache directory and can be reused
+offline. Online detail, its cache budget, and the grid/map switcher placement
+can be changed in Settings; downloaded tiles can be cleared from Cache
+Statistics, where a capacity bar shows used space against the configured map
+cache budget. Active map rendering and visible-tile downloading also appear in
+the normal progress strip and job-queue panel. Map attribution and third-party asset licenses are recorded in
+`assets/map/LICENSE.md`.
+
 Directories are discovered lazily and cached after their first request. All
 directory reads and image decoding run on GPUI's background executor. The tree
 uses GPUI's virtual `uniform_list`, and collapsing a branch removes all of its
@@ -69,9 +90,9 @@ descendants from the visible row projection. Revisiting a directory does not
 rescan it or decode the same preview again.
 
 A progress overlay at the bottom tracks currently active foreground directory
-scans and image/visible-thumbnail renders without changing the virtual grid's
-layout. Near-viewport and idle prediction remain deliberately absent from the
-foreground count.
+scans, image/visible-thumbnail renders, and map rendering or tile downloads
+without changing the virtual grid's layout. Near-viewport and idle prediction
+remain deliberately absent from the foreground count.
 
 Successfully decoded images use a bounded least-recently-used cache. The
 default holds 8 images and can be changed with `--image-cache-size N`. Evicted

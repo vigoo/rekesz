@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "name": "Rekesz bundled overview",
+  "background": "#172b36",
+  "land": "#31483f",
+  "water": "#173440",
+  "coastline": { "color": "#8ba096", "width": 0.9 },
+  "boundary": { "color": "#75837d", "width": 0.7 },
+  "place": { "color": "#d6c4a2", "radius": 2.5, "maximum_scalerank": 3 },
+  "font_stack": "Noto Sans Regular",
+  "glyphs": "glyphs/{fontstack}/{range}.pbf",
+  "sprite": "sprites/rekesz"
+}

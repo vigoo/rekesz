@@ -18,6 +18,9 @@ fn persisted_settings_are_loaded_and_cli_values_override_them() {
         cache_root: "/stored-cache".into(),
         job_parallelism: 6,
         raw_parallelism: 2,
+        online_map_permission: OnlineMapPermission::Unknown,
+        map_cache_bytes: DEFAULT_MAP_CACHE_BYTES,
+        map_switcher_placement: MapSwitcherPlacement::Header,
     };
     save(&path, &stored).unwrap();
     let config = from_args_with_dirs(
@@ -49,6 +52,43 @@ fn save_creates_the_platform_configuration_directory() {
         serde_json::from_slice::<AppSettings>(&fs::read(path).unwrap()).unwrap(),
         settings
     );
+}
+
+#[test]
+fn legacy_settings_receive_private_map_defaults() {
+    let (_temp, dirs) = dirs();
+    let path = dirs.config_dir().join("settings.json");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        &path,
+        br#"{
+            "root": "/pictures",
+            "image_cache_size": 8,
+            "pair_preference": "raw",
+            "cache_root": "/cache",
+            "job_parallelism": 4,
+            "raw_parallelism": 2
+        }"#,
+    )
+    .unwrap();
+    let config = from_args_with_dirs(["rekesz"].map(OsString::from), dirs).unwrap();
+    assert_eq!(
+        config.settings.online_map_permission,
+        OnlineMapPermission::Unknown
+    );
+    assert_eq!(config.settings.map_cache_bytes, DEFAULT_MAP_CACHE_BYTES);
+    assert_eq!(
+        config.settings.map_switcher_placement,
+        MapSwitcherPlacement::Header
+    );
+}
+
+#[test]
+fn rejects_an_empty_map_cache() {
+    let (_temp, dirs) = dirs();
+    let mut settings = defaults(&dirs).unwrap();
+    settings.map_cache_bytes = 0;
+    assert!(save(&dirs.config_dir().join("settings.json"), &settings).is_err());
 }
 
 #[test]

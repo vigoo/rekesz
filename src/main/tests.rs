@@ -5,6 +5,683 @@ use std::path::Path;
 use std::time::Instant;
 use test_r::test;
 
+fn gpui_test_config(root: &Path, cache: &Path) -> Config {
+    Config {
+        settings: AppSettings {
+            root: root.to_path_buf(),
+            image_cache_size: 2,
+            pair_preference: config::PairPreference::Raw,
+            cache_root: cache.to_path_buf(),
+            job_parallelism: 1,
+            raw_parallelism: 1,
+            online_map_permission: config::OnlineMapPermission::Disabled,
+            map_cache_bytes: 1024 * 1024,
+            map_switcher_placement: config::MapSwitcherPlacement::Header,
+        },
+        settings_path: root.join("settings.json"),
+    }
+}
+
+fn write_photo_stub(root: &Path, name: &str, latitude: f64, longitude: f64) -> PathBuf {
+    let path = root.join(format!("{name}.jpg"));
+    image::RgbImage::from_pixel(8, 8, image::Rgb([32, 96, 160]))
+        .save(&path)
+        .unwrap();
+    std::fs::write(
+        root.join(format!("{name}.xmp")),
+        format!(
+            "<rdf:Description exif:GPSLatitude=\"{latitude}\" exif:GPSLongitude=\"{longitude}\"/>"
+        ),
+    )
+    .unwrap();
+    path
+}
+
+fn double_click(cx: &mut gpui::VisualTestContext, position: gpui::Point<gpui::Pixels>) {
+    let modifiers = gpui::Modifiers::none();
+    cx.simulate_event(MouseDownEvent {
+        position,
+        modifiers,
+        button: MouseButton::Left,
+        click_count: 2,
+        first_mouse: false,
+    });
+    cx.simulate_event(MouseUpEvent {
+        position,
+        modifiers,
+        button: MouseButton::Left,
+        click_count: 2,
+    });
+}
+
+#[gpui::test]
+fn gpui_native_test_context_can_paint_and_click(cx: &mut gpui::TestAppContext) {
+    #[derive(Default)]
+    struct ClickHarness {
+        clicked: bool,
+    }
+
+    impl gpui::Render for ClickHarness {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            div().size_full().child(
+                div()
+                    .size(px(80.0))
+                    .debug_selector(|| "#gpui-test-button".to_owned())
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.clicked = true;
+                            cx.notify();
+                        }),
+                    ),
+            )
+        }
+    }
+
+    let (view, cx) = cx.add_window_view(|_, _| ClickHarness::default());
+    cx.update(|window, _| window.refresh());
+    cx.run_until_parked();
+    let bounds = cx.debug_bounds("#gpui-test-button").unwrap();
+    cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+    assert!(view.read_with(cx, |view, _| view.clicked));
+}
+
+#[gpui::test]
+fn gpui_thumbnail_grid_selects_extends_toggles_opens_and_closes(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    for index in 0..4 {
+        write_photo_stub(root.path(), &format!("photo-{index}"), 47.5, 19.05);
+    }
+    let config = gpui_test_config(root.path(), cache.path());
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+
+    let first = cx.debug_bounds("#thumbnail-0").unwrap();
+    cx.simulate_click(first.center(), gpui::Modifiers::none());
+    let second = cx.debug_bounds("#thumbnail-1").unwrap();
+    cx.simulate_click(
+        second.center(),
+        gpui::Modifiers {
+            control: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        view.read_with(&*cx, |view, _| match &view.main_view {
+            MainView::Dir(_, selection) => selection.indices.clone(),
+            MainView::Image(_) => unreachable!(),
+        }),
+        BTreeSet::from([0, 1])
+    );
+
+    let fourth = cx.debug_bounds("#thumbnail-3").unwrap();
+    cx.simulate_click(
+        fourth.center(),
+        gpui::Modifiers {
+            shift: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        view.read_with(&*cx, |view, _| match &view.main_view {
+            MainView::Dir(_, selection) => selection.indices.clone(),
+            MainView::Image(_) => unreachable!(),
+        }),
+        BTreeSet::from([1, 2, 3])
+    );
+
+    double_click(cx, fourth.center());
+    assert!(view.read_with(&*cx, |view, _| matches!(
+        &view.main_view,
+        MainView::Image(state) if state.path.ends_with("photo-3.jpg")
+    )));
+    cx.dispatch_action(CloseImage);
+    assert!(view.read_with(&*cx, |view, _| matches!(
+        view.main_view,
+        MainView::Dir(_, _)
+    )));
+}
+
+#[gpui::test]
+fn gpui_grid_keyboard_actions_move_extend_and_open_selection(cx: &mut gpui::TestAppContext) {
+    cx.update(bind_picture_browser_keys);
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    for index in 0..4 {
+        write_photo_stub(root.path(), &format!("photo-{index}"), 47.5, 19.05);
+    }
+    let config = gpui_test_config(root.path(), cache.path());
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+    let first = cx.debug_bounds("#thumbnail-0").unwrap();
+    cx.simulate_click(first.center(), gpui::Modifiers::none());
+
+    cx.simulate_keystrokes("right shift-right");
+    assert_eq!(
+        view.read_with(&*cx, |view, _| match &view.main_view {
+            MainView::Dir(_, selection) => selection.indices.clone(),
+            MainView::Image(_) => unreachable!(),
+        }),
+        BTreeSet::from([1, 2])
+    );
+    cx.simulate_keystrokes("enter");
+    assert!(view.read_with(&*cx, |view, _| matches!(view.main_view, MainView::Image(_))));
+    cx.simulate_keystrokes("escape");
+    assert!(view.read_with(&*cx, |view, _| matches!(
+        view.main_view,
+        MainView::Dir(_, _)
+    )));
+}
+
+#[gpui::test]
+fn gpui_image_view_double_clicks_zooms_and_drag_pans(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write_photo_stub(root.path(), "photo", 47.5, 19.05);
+    let config = gpui_test_config(root.path(), cache.path());
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+    let thumbnail = cx.debug_bounds("#thumbnail-0").unwrap();
+    double_click(cx, thumbnail.center());
+    cx.run_until_parked();
+    assert!(view.read_with(&*cx, |view, _| {
+        let MainView::Image(state) = &view.main_view else {
+            return false;
+        };
+        matches!(
+            view.previews
+                .state_for(&state.path, view.render_identity_for(&state.path)),
+            PreviewState::Loaded(_)
+        )
+    }));
+
+    let viewport = cx.debug_bounds("#image-viewport").unwrap();
+    double_click(cx, viewport.center());
+    assert!(view.read_with(&*cx, |view, _| matches!(
+        &view.main_view,
+        MainView::Image(state) if state.zoom == ZoomLevel::ActualSize
+    )));
+    let start = viewport.center();
+    let end = point(start.x + px(20.0), start.y + px(15.0));
+    cx.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::none());
+    cx.simulate_mouse_move(end, MouseButton::Left, gpui::Modifiers::none());
+    assert!(view.read_with(&*cx, |view, _| matches!(
+        &view.main_view,
+        MainView::Image(state) if state.drag_last.is_some()
+    )));
+    cx.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::none());
+    assert!(view.read_with(&*cx, |view, _| matches!(
+        &view.main_view,
+        MainView::Image(state) if state.drag_last.is_none()
+    )));
+    double_click(cx, viewport.center());
+    assert!(view.read_with(&*cx, |view, _| matches!(
+        &view.main_view,
+        MainView::Image(state) if state.zoom == ZoomLevel::FitWindow && state.pan == (0.0, 0.0)
+    )));
+}
+
+#[gpui::test]
+fn gpui_grid_recursive_controls_enter_and_exit_recursive_mode(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("trip")).unwrap();
+    write_photo_stub(&root.path().join("trip"), "photo", 47.5, 19.05);
+    let config = gpui_test_config(root.path(), cache.path());
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+
+    let enter = cx.debug_bounds("#show-images-recursively").unwrap();
+    cx.simulate_click(enter.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert!(view.read_with(&*cx, |view, _| view.recursive_grid.is_some()));
+    assert!(view.read_with(&*cx, |view, _| matches!(
+        view.recursive_grid.as_ref().map(|state| &state.status),
+        Some(RecursiveGridStatus::Loaded(images)) if images.paths.len() == 1
+    )));
+    assert!(cx.debug_bounds("#thumbnail-0").is_some());
+    let exit = cx.debug_bounds("#exit-recursive-grid").unwrap();
+    cx.simulate_click(exit.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert!(view.read_with(&*cx, |view, _| view.recursive_grid.is_none()));
+    assert!(cx.debug_bounds("#show-images-recursively").is_some());
+}
+
+#[gpui::test]
+fn gpui_settings_dialog_cancels_and_saves_painted_control_changes(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let config = gpui_test_config(root.path(), cache.path());
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.simulate_resize(size(px(1200.0), px(900.0)));
+    cx.run_until_parked();
+    let root_row = cx.debug_bounds("#directory-0").unwrap();
+    cx.simulate_click(root_row.center(), gpui::Modifiers::none());
+    cx.dispatch_action(OpenSettings);
+    cx.run_until_parked();
+
+    let pair = cx.debug_bounds("#settings-pair-preference").unwrap();
+    cx.simulate_click(pair.center(), gpui::Modifiers::none());
+    let cancel = cx.debug_bounds("#settings-cancel").unwrap();
+    cx.simulate_click(cancel.center(), gpui::Modifiers::none());
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.settings.pair_preference),
+        config::PairPreference::Raw
+    );
+    assert!(view.read_with(&*cx, |view, _| view.settings_draft.is_none()));
+
+    cx.dispatch_action(OpenSettings);
+    cx.run_until_parked();
+    let pair = cx.debug_bounds("#settings-pair-preference").unwrap();
+    cx.simulate_click(pair.center(), gpui::Modifiers::none());
+    let online = cx.debug_bounds("#settings-online-map").unwrap();
+    cx.simulate_click(online.center(), gpui::Modifiers::none());
+    let save = cx.debug_bounds("#settings-save").unwrap();
+    cx.simulate_click(save.center(), gpui::Modifiers::none());
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.settings.pair_preference),
+        config::PairPreference::Jpeg
+    );
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.settings.online_map_permission),
+        config::OnlineMapPermission::Enabled
+    );
+    assert!(view.read_with(&*cx, |view, _| view.settings_draft.is_none()));
+    let saved: AppSettings =
+        serde_json::from_slice(&std::fs::read(&config.settings_path).unwrap()).unwrap();
+    assert_eq!(saved.pair_preference, config::PairPreference::Jpeg);
+    assert_eq!(
+        saved.online_map_permission,
+        config::OnlineMapPermission::Enabled
+    );
+}
+
+#[gpui::test]
+fn gpui_directory_tree_click_and_keyboard_navigation_select_and_expand(
+    cx: &mut gpui::TestAppContext,
+) {
+    cx.update(bind_picture_browser_keys);
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("alpha/nested")).unwrap();
+    std::fs::create_dir(root.path().join("beta")).unwrap();
+    let config = gpui_test_config(root.path(), cache.path());
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+
+    let alpha = cx.debug_bounds("#directory-1").unwrap();
+    cx.simulate_click(alpha.center(), gpui::Modifiers::none());
+    assert!(view.read_with(&*cx, |view, _| {
+        view.model.node(view.selected).path.ends_with("alpha")
+    }));
+
+    cx.simulate_keystrokes("right");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("#directory-2").is_some());
+    cx.simulate_keystrokes("down");
+    assert!(view.read_with(&*cx, |view, _| {
+        view.model.node(view.selected).path.ends_with("nested")
+    }));
+    cx.simulate_keystrokes("left");
+    assert!(view.read_with(&*cx, |view, _| {
+        view.model.node(view.selected).path.ends_with("alpha")
+    }));
+    cx.simulate_keystrokes("left");
+    cx.run_until_parked();
+    assert_eq!(view.read_with(&*cx, |view, _| view.visible.len()), 3);
+}
+
+#[gpui::test]
+fn gpui_path_context_menu_copies_image_path_and_hides_directory(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let trip = root.path().join("trip");
+    std::fs::create_dir(&trip).unwrap();
+    let photo = write_photo_stub(root.path(), "photo", 47.5, 19.05);
+    let config = gpui_test_config(root.path(), cache.path());
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+
+    let thumbnail = cx.debug_bounds("#thumbnail-0").unwrap();
+    cx.simulate_mouse_down(
+        thumbnail.center(),
+        MouseButton::Right,
+        gpui::Modifiers::none(),
+    );
+    let copy = cx.debug_bounds("#copy-absolute-path-menu-item").unwrap();
+    cx.simulate_mouse_down(copy.center(), MouseButton::Left, gpui::Modifiers::none());
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|item| item.text()),
+        Some(photo.to_string_lossy().into_owned())
+    );
+    assert!(view.read_with(&*cx, |view, _| view.path_context_menu.is_none()));
+
+    let directory = cx.debug_bounds("#directory-1").unwrap();
+    cx.simulate_mouse_down(
+        directory.center(),
+        MouseButton::Right,
+        gpui::Modifiers::none(),
+    );
+    let hide = cx.debug_bounds("#toggle-hidden-subtree-menu-item").unwrap();
+    cx.simulate_mouse_down(hide.center(), MouseButton::Left, gpui::Modifiers::none());
+    assert!(view.read_with(&*cx, |view, _| view.hidden_subtrees.contains(&trip)));
+}
+
+#[gpui::test]
+fn gpui_linux_file_menu_opens_cache_dialog_and_close_button_closes_it(
+    cx: &mut gpui::TestAppContext,
+) {
+    if !USE_IN_WINDOW_MENU {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let config = gpui_test_config(root.path(), cache.path());
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+    let file = cx.debug_bounds("#file-menu-button").unwrap();
+    cx.simulate_click(file.center(), gpui::Modifiers::none());
+    let cache_item = cx.debug_bounds("#cache-statistics-menu-item").unwrap();
+    cx.simulate_click(cache_item.center(), gpui::Modifiers::none());
+    assert!(view.read_with(&*cx, |view, _| view.show_cache_statistics));
+    let close = cx.debug_bounds("#cache-statistics-close").unwrap();
+    cx.simulate_click(close.center(), gpui::Modifiers::none());
+    assert!(!view.read_with(&*cx, |view, _| view.show_cache_statistics));
+}
+
+#[gpui::test]
+fn gpui_cache_dialog_clear_button_removes_downloaded_map_cache(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    std::fs::create_dir(cache.path().join("map")).unwrap();
+    let map_cache = cache.path().join("map/ambient.sqlite3");
+    std::fs::write(&map_cache, b"cached tiles").unwrap();
+    let config = gpui_test_config(root.path(), cache.path());
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.update_entity(&view, |view, cx| {
+        view.show_cache_statistics = true;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let clear = cx.debug_bounds("#clear-downloaded-map-tiles").unwrap();
+    cx.simulate_click(clear.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert!(!map_cache.exists());
+    assert!(!view.read_with(&*cx, |view, _| view.map_cache_clearing));
+}
+
+#[gpui::test]
+fn gpui_cluster_gallery_paginates_and_zoom_action_updates_the_view(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let config = gpui_test_config(root.path(), cache.path());
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    let coordinate = metadata::GeoCoordinate::new(47.5, 19.05).unwrap();
+    cx.update_entity(&view, |view, cx| {
+        view.directory_view_mode = DirectoryViewMode::Map;
+        view.map_render_size = (1280, 800);
+        view.map_camera.zoom = 3.0;
+        view.map_card = MapCard::new(
+            coordinate,
+            (0..6)
+                .map(|index| MapCardItem {
+                    path: root.path().join(format!("{index}.jpg")),
+                })
+                .collect(),
+            7,
+            None,
+            Some(8),
+        );
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    let next = cx.debug_bounds("#map-card-next").unwrap();
+    cx.simulate_click(next.center(), gpui::Modifiers::none());
+    assert_eq!(
+        view.read_with(cx, |view, _| view.map_card.as_ref().unwrap().page),
+        1
+    );
+
+    let zoom = cx.debug_bounds("#map-card-zoom").unwrap();
+    cx.simulate_click(zoom.center(), gpui::Modifiers::none());
+    assert!(view.read_with(cx, |view, _| view.map_card.is_none()));
+    assert!(view.read_with(cx, |view, _| view.map_camera.zoom > 3.0));
+}
+
+#[gpui::test]
+fn gpui_map_cache_bar_and_map_job_use_the_regular_ui(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    std::fs::create_dir(cache.path().join("map")).unwrap();
+    std::fs::write(cache.path().join("map/ambient.sqlite3"), vec![0_u8; 512]).unwrap();
+    let mut config = gpui_test_config(root.path(), cache.path());
+    config.settings.map_cache_bytes = 1024;
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.update_entity(&view, |view, cx| {
+        view.directory_view_mode = DirectoryViewMode::Map;
+        view.map_job = Some(MapJob {
+            epoch: 42,
+            label: "Rendering map and downloading visible tiles…".to_owned(),
+            status: MapJobStatus::Running,
+        });
+        view.show_job_queue = true;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("#map-job-queue-row").is_some());
+    assert!(cx.debug_bounds("#background-progress").is_some());
+    let grid = cx.debug_bounds("#show-grid-view").unwrap();
+    cx.simulate_click(grid.center(), gpui::Modifiers::none());
+    assert!(view.read_with(cx, |view, _| view.map_job.is_none()));
+
+    cx.update_entity(&view, |view, cx| {
+        view.show_cache_statistics = true;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let bar = cx.debug_bounds("#map-cache-capacity-bar").unwrap();
+    let fill = cx.debug_bounds("#map-cache-capacity-fill").unwrap();
+    assert!(f32::from(bar.size.width) > 100.0);
+    assert!(f32::from(bar.size.height) > 0.0);
+    assert!((f32::from(fill.size.width) / f32::from(bar.size.width) - 0.5).abs() < 0.01);
+}
+
+#[gpui::test]
+fn gpui_empty_map_offers_and_starts_recursive_mode(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("trip")).unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let config = gpui_test_config(root.path(), cache.path());
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+    cx.update_entity(&view, |view, cx| {
+        view.directory_view_mode = DirectoryViewMode::Map;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let button = cx.debug_bounds("#map-show-images-recursively").unwrap();
+    cx.simulate_click(button.center(), gpui::Modifiers::none());
+    assert!(view.read_with(cx, |view, _| view.recursive_grid.is_some()));
+}
+
+#[gpui::test]
+fn gpui_outer_zoom_cluster_click_opens_all_cluster_photos(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    for (name, latitude, longitude) in
+        [("one", "47.500N", "19.050E"), ("two", "47.501N", "19.051E")]
+    {
+        std::fs::write(root.path().join(format!("{name}.jpg")), b"").unwrap();
+        std::fs::write(
+            root.path().join(format!("{name}.xmp")),
+            format!(
+                "<rdf:Description exif:GPSLatitude=\"{latitude}\" exif:GPSLongitude=\"{longitude}\"/>"
+            ),
+        )
+        .unwrap();
+    }
+    let cache = tempfile::tempdir().unwrap();
+    let config = gpui_test_config(root.path(), cache.path());
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+    cx.update_entity(&view, |view, cx| {
+        view.directory_view_mode = DirectoryViewMode::Map;
+        view.map_camera = map::Camera {
+            center: metadata::GeoCoordinate::new(47.5, 19.05).unwrap(),
+            zoom: 2.0,
+        };
+        view.map_pending_fit = None;
+        view.map_fit_node = None;
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    let marker = cx.debug_bounds("#map-marker-0").unwrap();
+    cx.simulate_click(marker.center(), gpui::Modifiers::none());
+    assert_eq!(
+        view.read_with(cx, |view, _| view.map_card.as_ref().unwrap().items.len()),
+        2
+    );
+    assert!(cx.debug_bounds("#map-card-zoom").is_some());
+    let thumbnail = cx.debug_bounds("#map-gallery-item-0").unwrap();
+    cx.simulate_click(thumbnail.center(), gpui::Modifiers::none());
+    assert!(view.read_with(cx, |view, _| matches!(view.main_view, MainView::Image(_))));
+}
+
+#[gpui::test]
+fn gpui_map_surface_drag_and_wheel_update_camera_during_real_events(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write_photo_stub(root.path(), "photo", 47.5, 19.05);
+    let config = gpui_test_config(root.path(), cache.path());
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+    cx.update_entity(&view, |view, cx| {
+        view.directory_view_mode = DirectoryViewMode::Map;
+        view.map_camera = map::Camera {
+            center: metadata::GeoCoordinate::new(47.5, 19.05).unwrap(),
+            zoom: 5.0,
+        };
+        view.map_pending_fit = None;
+        view.map_fit_node = None;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let surface = cx.debug_bounds("#map-view").unwrap();
+    let start = point(surface.origin.x + px(40.0), surface.origin.y + px(40.0));
+    let end = point(start.x + px(80.0), start.y + px(40.0));
+    let before = view.read_with(&*cx, |view, _| view.map_camera);
+    cx.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::none());
+    cx.simulate_mouse_move(end, MouseButton::Left, gpui::Modifiers::none());
+    let during = view.read_with(&*cx, |view, _| view.map_camera);
+    assert_ne!(during.center, before.center);
+    cx.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::none());
+    assert!(view.read_with(&*cx, |view, _| view.map_drag_last.is_none()));
+
+    cx.simulate_event(ScrollWheelEvent {
+        position: end,
+        delta: gpui::ScrollDelta::Lines(point(0.0, -3.0)),
+        modifiers: gpui::Modifiers::none(),
+        touch_phase: gpui::TouchPhase::Moved,
+    });
+    assert!(view.read_with(&*cx, |view, _| view.map_camera.zoom > during.zoom));
+}
+
+#[gpui::test]
+fn gpui_map_switcher_consent_and_zoom_controls_drive_the_painted_ui(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write_photo_stub(root.path(), "photo", 47.5, 19.05);
+    let mut config = gpui_test_config(root.path(), cache.path());
+    config.settings.online_map_permission = config::OnlineMapPermission::Unknown;
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+
+    let show_map = cx.debug_bounds("#show-map-view").unwrap();
+    cx.simulate_click(show_map.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.directory_view_mode),
+        DirectoryViewMode::Map
+    );
+    let offline = cx.debug_bounds("#keep-map-offline").unwrap();
+    cx.simulate_click(offline.center(), gpui::Modifiers::none());
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.settings.online_map_permission),
+        config::OnlineMapPermission::Disabled
+    );
+
+    let before = view.read_with(&*cx, |view, _| view.map_camera.zoom);
+    let zoom_in = cx.debug_bounds("#map-zoom-in").unwrap();
+    cx.simulate_mouse_down(zoom_in.center(), MouseButton::Left, gpui::Modifiers::none());
+    assert!(view.read_with(&*cx, |view, _| view.map_camera.zoom > before));
+    let zoomed = view.read_with(&*cx, |view, _| view.map_camera.zoom);
+    let fit = cx.debug_bounds("#map-fit").unwrap();
+    cx.simulate_mouse_down(fit.center(), MouseButton::Left, gpui::Modifiers::none());
+    assert_ne!(view.read_with(&*cx, |view, _| view.map_camera.zoom), zoomed);
+
+    let grid = cx.debug_bounds("#show-grid-view").unwrap();
+    cx.simulate_click(grid.center(), gpui::Modifiers::none());
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.directory_view_mode),
+        DirectoryViewMode::Grid
+    );
+}
+
+#[gpui::test]
+fn gpui_real_large_cluster_fetches_and_paints_the_second_gallery_page(
+    cx: &mut gpui::TestAppContext,
+) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    for index in 0..7 {
+        write_photo_stub(root.path(), &format!("photo-{index}"), 47.5, 19.05);
+    }
+    let config = gpui_test_config(root.path(), cache.path());
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+    cx.update_entity(&view, |view, cx| {
+        view.directory_view_mode = DirectoryViewMode::Map;
+        view.map_camera.zoom = 2.0;
+        view.map_pending_fit = None;
+        view.map_fit_node = None;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let marker = cx.debug_bounds("#map-marker-0").unwrap();
+    cx.simulate_click(marker.center(), gpui::Modifiers::none());
+    let first_page = view.read_with(&*cx, |view, _| {
+        view.map_card
+            .as_ref()
+            .unwrap()
+            .page_items()
+            .iter()
+            .map(|item| item.path.clone())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(first_page.len(), 6);
+    let next = cx.debug_bounds("#map-card-next").unwrap();
+    cx.simulate_click(next.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let second_page = view.read_with(&*cx, |view, _| {
+        view.map_card
+            .as_ref()
+            .unwrap()
+            .page_items()
+            .iter()
+            .map(|item| item.path.clone())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(second_page.len(), 1);
+    assert!(!first_page.contains(&second_page[0]));
+    assert!(cx.debug_bounds("#map-gallery-item-0").is_some());
+}
+
 #[test]
 fn converts_gpui_bgra_pixels_to_png_rgba_order() {
     let mut pixels = [3, 2, 1, 4, 30, 20, 10, 40];
@@ -35,6 +712,175 @@ fn full_screen_wheel_navigation_stops_at_directory_edges() {
     assert_eq!(adjacent_image_index(0, 3, -1), None);
     assert_eq!(adjacent_image_index(2, 3, 1), None);
     assert_eq!(adjacent_image_index(0, 0, 1), None);
+}
+
+#[test]
+fn map_marker_card_requires_photos_and_wraps_cluster_navigation() {
+    let coordinate = metadata::GeoCoordinate::new(47.5, 19.05).unwrap();
+    assert!(MapCard::new(coordinate, Vec::new(), 0, None, None).is_none());
+    let items = (0..6)
+        .map(|index| MapCardItem {
+            path: PathBuf::from(format!("{index}.jpg")),
+        })
+        .collect::<Vec<_>>();
+    let mut card = MapCard::new(coordinate, items, 7, None, Some(8)).unwrap();
+    assert_eq!(card.page_count(), 2);
+    assert_eq!(card.page_items().len(), 6);
+    assert_eq!(card.page, 0);
+    card.navigate(-1);
+    assert_eq!(card.page, 1);
+    card.navigate(1);
+    assert_eq!(card.page, 0);
+}
+
+#[test]
+fn map_surface_geometry_is_identity_for_the_rendered_camera() {
+    let camera = map::Camera {
+        center: metadata::GeoCoordinate::new(47.5, 19.0).unwrap(),
+        zoom: 8.25,
+    };
+    assert_eq!(
+        map_surface_geometry(camera, camera, (1200, 800), (1200, 800)),
+        MapSurfaceGeometry {
+            left: 0.0,
+            top: 0.0,
+            width: 1200.0,
+            height: 800.0,
+        }
+    );
+}
+
+#[test]
+fn transformed_raster_and_live_markers_share_the_same_camera() {
+    let rendered = map::Camera {
+        center: metadata::GeoCoordinate::new(47.4979, 19.0402).unwrap(),
+        zoom: 7.0,
+    };
+    let current = map::Camera {
+        center: metadata::GeoCoordinate::new(47.55, 19.12).unwrap(),
+        zoom: 8.35,
+    };
+    let viewport = (1280, 720);
+    let geometry = map_surface_geometry(rendered, current, viewport, viewport);
+    for coordinate in [
+        metadata::GeoCoordinate::new(47.4979, 19.0402).unwrap(),
+        metadata::GeoCoordinate::new(47.62, 18.91).unwrap(),
+    ] {
+        let rendered_position = map_screen_position(coordinate, rendered, viewport).unwrap();
+        let transformed_x = geometry.left + rendered_position.0 * geometry.width;
+        let transformed_y = geometry.top + rendered_position.1 * geometry.height;
+        let current_position = map_screen_position(coordinate, current, viewport).unwrap();
+        assert!((transformed_x - current_position.0 * viewport.0 as f32).abs() < 0.01);
+        assert!((transformed_y - current_position.1 * viewport.1 as f32).abs() < 0.01);
+    }
+}
+
+#[test]
+fn oversized_map_raster_covers_short_pans_without_blank_edges() {
+    let rendered = map::Camera::default();
+    let mut current = rendered;
+    let viewport = (1000, 700);
+    let raster = (
+        viewport.0 + MAP_RENDER_OVERSCAN * 2,
+        viewport.1 + MAP_RENDER_OVERSCAN * 2,
+    );
+    let (center_x, center_y) = map::mercator_project(current.center);
+    let world = 256.0 * 2_f64.powf(current.zoom);
+    current.center =
+        map::mercator_unproject(center_x + 60.0 / world, center_y - 40.0 / world).unwrap();
+    let geometry = map_surface_geometry(rendered, current, viewport, raster);
+    assert!(geometry.left <= 0.0);
+    assert!(geometry.top <= 0.0);
+    assert!(geometry.left + geometry.width >= viewport.0 as f32);
+    assert!(geometry.top + geometry.height >= viewport.1 as f32);
+}
+
+#[test]
+fn map_surface_transform_remains_aligned_across_the_antimeridian() {
+    let rendered = map::Camera {
+        center: metadata::GeoCoordinate::new(70.0, 179.9).unwrap(),
+        zoom: 6.5,
+    };
+    let current = map::Camera {
+        center: metadata::GeoCoordinate::new(70.1, -179.9).unwrap(),
+        zoom: 7.25,
+    };
+    let viewport = (900, 600);
+    let geometry = map_surface_geometry(rendered, current, viewport, viewport);
+    let coordinate = metadata::GeoCoordinate::new(70.05, 179.98).unwrap();
+    let old = map_screen_position(coordinate, rendered, viewport).unwrap();
+    let live = map_screen_position(coordinate, current, viewport).unwrap();
+    assert!((geometry.left + old.0 * geometry.width - live.0 * viewport.0 as f32).abs() < 0.01);
+    assert!((geometry.top + old.1 * geometry.height - live.1 * viewport.1 as f32).abs() < 0.01);
+}
+
+#[test]
+fn cursor_anchored_map_zoom_preserves_the_coordinate_under_the_pointer() {
+    let viewport = (1200, 800);
+    let anchor = (930.0, 210.0);
+    let camera = map::Camera {
+        center: metadata::GeoCoordinate::new(47.5, 19.05).unwrap(),
+        zoom: 7.0,
+    };
+    let (center_x, center_y) = map::mercator_project(camera.center);
+    let world = 256.0 * 2_f64.powf(camera.zoom);
+    let anchored_coordinate = map::mercator_unproject(
+        center_x + (anchor.0 - f64::from(viewport.0) / 2.0) / world,
+        center_y + (anchor.1 - f64::from(viewport.1) / 2.0) / world,
+    )
+    .unwrap();
+    let zoomed = zoom_map_camera(camera, 1.0, anchor, viewport);
+    let position = map_screen_position(anchored_coordinate, zoomed, viewport).unwrap();
+    assert!((position.0 * viewport.0 as f32 - anchor.0 as f32).abs() < 0.01);
+    assert!((position.1 * viewport.1 as f32 - anchor.1 as f32).abs() < 0.01);
+}
+
+#[test]
+fn repeated_map_zoom_steps_have_exact_bounded_final_zoom() {
+    let mut camera = map::Camera::default();
+    for _ in 0..50 {
+        camera = zoom_map_camera(camera, 1.0, (400.0, 300.0), (800, 600));
+    }
+    assert_eq!(camera.zoom, 20.0);
+    for _ in 0..50 {
+        camera = zoom_map_camera(camera, -1.0, (400.0, 300.0), (800, 600));
+    }
+    assert_eq!(camera.zoom, 0.0);
+}
+
+#[test]
+fn map_detail_status_distinguishes_loading_from_completed_empty_detail() {
+    assert_eq!(
+        map_detail_status(8.0, config::OnlineMapPermission::Enabled, true, None),
+        "Bundled map · loading online detail"
+    );
+    assert_eq!(
+        map_detail_status(
+            8.0,
+            config::OnlineMapPermission::Enabled,
+            false,
+            Some((0, None)),
+        ),
+        "Bundled map · no supported detail in visible tiles"
+    );
+    assert_eq!(
+        map_detail_status(
+            8.0,
+            config::OnlineMapPermission::Enabled,
+            false,
+            Some((3, None)),
+        ),
+        "Detailed map · 3 vector tiles"
+    );
+}
+
+#[test]
+fn map_cache_capacity_progress_is_bounded_and_handles_zero_capacity() {
+    assert_eq!(cache_capacity_fraction(0, 100), 0.0);
+    assert_eq!(cache_capacity_fraction(25, 100), 0.25);
+    assert_eq!(cache_capacity_fraction(100, 100), 1.0);
+    assert_eq!(cache_capacity_fraction(150, 100), 1.0);
+    assert_eq!(cache_capacity_fraction(1, 0), 0.0);
 }
 
 #[test]
@@ -310,7 +1156,7 @@ fn recursive_grid_collects_globally_sorted_images_and_excludes_hidden_subtrees()
     )
     .unwrap();
 
-    assert_eq!(images, [visible.join("a.jpg"), visible.join("z.jpg")]);
+    assert_eq!(images.paths, [visible.join("a.jpg"), visible.join("z.jpg")]);
 }
 
 #[test]

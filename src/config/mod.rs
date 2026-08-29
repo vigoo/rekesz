@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::discovery::RawJpegPreference;
 
 pub(crate) const DEFAULT_IMAGE_CACHE_SIZE: usize = 8;
+pub(crate) const DEFAULT_MAP_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
 const RAW_MEMORY_RESERVE_BYTES: u64 = 1024 * 1024 * 1024;
 const ESTIMATED_RAW_WORKING_SET_BYTES: u64 = 768 * 1024 * 1024;
 
@@ -18,6 +19,23 @@ const ESTIMATED_RAW_WORKING_SET_BYTES: u64 = 768 * 1024 * 1024;
 pub(crate) enum PairPreference {
     Raw,
     Jpeg,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum OnlineMapPermission {
+    #[default]
+    Unknown,
+    Enabled,
+    Disabled,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum MapSwitcherPlacement {
+    #[default]
+    Header,
+    Floating,
 }
 
 impl From<PairPreference> for RawJpegPreference {
@@ -46,6 +64,12 @@ pub(crate) struct AppSettings {
     pub cache_root: PathBuf,
     pub job_parallelism: usize,
     pub raw_parallelism: usize,
+    #[serde(default)]
+    pub online_map_permission: OnlineMapPermission,
+    #[serde(default = "default_map_cache_bytes")]
+    pub map_cache_bytes: u64,
+    #[serde(default)]
+    pub map_switcher_placement: MapSwitcherPlacement,
 }
 
 #[derive(Clone, Debug)]
@@ -160,6 +184,9 @@ fn defaults(dirs: &directories::ProjectDirs) -> Result<AppSettings> {
         cache_root: dirs.cache_dir().to_path_buf(),
         job_parallelism,
         raw_parallelism: default_raw_parallelism(job_parallelism),
+        online_map_permission: OnlineMapPermission::Unknown,
+        map_cache_bytes: DEFAULT_MAP_CACHE_BYTES,
+        map_switcher_placement: MapSwitcherPlacement::Header,
     })
 }
 
@@ -173,10 +200,17 @@ fn validate(settings: &mut AppSettings) -> Result<()> {
     if settings.raw_parallelism == 0 {
         bail!("RAW parallelism must be at least 1");
     }
+    if settings.map_cache_bytes == 0 {
+        bail!("map cache size must be at least 1 byte");
+    }
     settings.raw_parallelism = settings.raw_parallelism.min(settings.job_parallelism);
     settings.root = absolute(settings.root.clone())?;
     settings.cache_root = absolute(settings.cache_root.clone())?;
     Ok(())
+}
+
+const fn default_map_cache_bytes() -> u64 {
+    DEFAULT_MAP_CACHE_BYTES
 }
 
 fn absolute(path: PathBuf) -> Result<PathBuf> {

@@ -163,14 +163,20 @@ fn newly_loaded_metadata_proposes_order_without_applying_it() {
                 path: PathBuf::from("/pictures/later.jpg"),
                 capture_time: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
                 fallback_time: None,
+                coordinate: GeoCoordinate::new(47.5, 19.05),
             },
             ImageOrderingMetadata {
                 path: PathBuf::from("/pictures/earlier.jpg"),
                 capture_time: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
                 fallback_time: None,
+                coordinate: None,
             },
         ],
     ));
+    assert_eq!(
+        model.coordinate(root, Path::new("/pictures/later.jpg")),
+        GeoCoordinate::new(47.5, 19.05)
+    );
     assert_eq!(
         model.loaded(root).unwrap().images,
         vec![
@@ -212,11 +218,13 @@ fn cached_metadata_is_applied_to_the_initial_order() {
                 path: PathBuf::from("/pictures/later.jpg"),
                 capture_time: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
                 fallback_time: None,
+                coordinate: None,
             },
             ImageOrderingMetadata {
                 path: PathBuf::from("/pictures/earlier.jpg"),
                 capture_time: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
                 fallback_time: None,
+                coordinate: None,
             },
         ],
         Vec::new(),
@@ -255,11 +263,13 @@ fn metadata_that_keeps_the_current_order_does_not_offer_apply() {
                 path: earlier,
                 capture_time: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
                 fallback_time: None,
+                coordinate: None,
             },
             ImageOrderingMetadata {
                 path: later,
                 capture_time: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
                 fallback_time: None,
+                coordinate: None,
             },
         ],
     ));

@@ -8,7 +8,7 @@ use std::{
 
 use crate::{
     jobs::JobLimiter,
-    metadata::ImageOrderingMetadata,
+    metadata::{GeoCoordinate, ImageOrderingMetadata},
     rendering::{RenderMetadata, RenderVariant},
 };
 
@@ -173,9 +173,15 @@ pub struct LoadedDirectory {
     pub images: Vec<PathBuf>,
     pub metadata_status: DirectoryMetadataStatus,
     metadata_pending: Vec<PathBuf>,
-    ordering_metadata:
-        HashMap<PathBuf, (Option<std::time::SystemTime>, Option<std::time::SystemTime>)>,
+    ordering_metadata: HashMap<PathBuf, OrderingMetadata>,
     pending_capture_order: Option<Vec<PathBuf>>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct OrderingMetadata {
+    capture_time: Option<std::time::SystemTime>,
+    fallback_time: Option<std::time::SystemTime>,
+    coordinate: Option<GeoCoordinate>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -324,7 +330,11 @@ impl DirectoryModel {
         for entry in &metadata {
             contents.ordering_metadata.insert(
                 entry.path.clone(),
-                (entry.capture_time, entry.fallback_time),
+                OrderingMetadata {
+                    capture_time: entry.capture_time,
+                    fallback_time: entry.fallback_time,
+                    coordinate: entry.coordinate,
+                },
             );
         }
         sort_metadata(&mut metadata);
@@ -359,23 +369,29 @@ impl DirectoryModel {
             return false;
         }
         for entry in metadata {
-            contents
-                .ordering_metadata
-                .insert(entry.path, (entry.capture_time, entry.fallback_time));
+            contents.ordering_metadata.insert(
+                entry.path,
+                OrderingMetadata {
+                    capture_time: entry.capture_time,
+                    fallback_time: entry.fallback_time,
+                    coordinate: entry.coordinate,
+                },
+            );
         }
         let mut proposed = contents
             .images
             .iter()
             .map(|path| {
-                let (capture_time, fallback_time) = contents
+                let metadata = contents
                     .ordering_metadata
                     .get(path)
                     .copied()
-                    .unwrap_or((None, None));
+                    .unwrap_or_default();
                 ImageOrderingMetadata {
                     path: path.clone(),
-                    capture_time,
-                    fallback_time,
+                    capture_time: metadata.capture_time,
+                    fallback_time: metadata.fallback_time,
+                    coordinate: metadata.coordinate,
                 }
             })
             .collect::<Vec<_>>();
@@ -393,6 +409,13 @@ impl DirectoryModel {
     pub fn has_pending_capture_order(&self, id: NodeId) -> bool {
         self.loaded(id)
             .is_some_and(|contents| contents.pending_capture_order.is_some())
+    }
+
+    pub fn coordinate(&self, id: NodeId, path: &Path) -> Option<GeoCoordinate> {
+        self.loaded(id)?
+            .ordering_metadata
+            .get(path)
+            .and_then(|metadata| metadata.coordinate)
     }
 
     pub fn apply_pending_capture_order(&mut self, id: NodeId) -> bool {

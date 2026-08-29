@@ -13,6 +13,9 @@ blake3 = "1"
 kamadak-exif = "0.6.1"
 gpui = "0.2.2"
 futures = "0.3"
+fast-mvt = { version = "0.6.2", default-features = false, features = ["reader"] }
+geojson = "0.24"
+tiny-skia = "0.11"
 libheif-rs = { version = "3", features = ["embedded-libheif"] }
 image = { version = "0.25", features = ["avif", "bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp"] }
 jpeg-decoder = "0.3.2"
@@ -20,8 +23,10 @@ moxcms = "0.8.1"
 rawler = { git = "https://github.com/vigoo/dnglab.git", rev = "e7a2ad7fb627a99a1e846d02bca8993371fd90fa" }
 priority-queue = "2"
 rayon = "1"
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "rustls", "json", "gzip"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 smallvec = "1"
+supercluster = { version = "3.0.8", features = ["cluster_metadata"] }
 sysinfo = { version = "0.31.4", default-features = false, features = ["system"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -38,4 +43,5 @@ path = "src/bin/lightroom_inventory.rs"
 harness = false
 
 [dev-dependencies]
+gpui = { version = "0.2.2", features = ["test-support"] }
 test-r = { version = "3.0.10", default-features = false }

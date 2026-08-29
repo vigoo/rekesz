@@ -13,13 +13,41 @@ use crate::jobs::JobLimiter;
 use chrono::{Local, NaiveDateTime, TimeZone as _};
 use rayon::prelude::*;
 
-const CACHE_VERSION: &str = "metadata-v1";
+const CACHE_VERSION: &str = "metadata-v3";
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GeoCoordinate {
+    latitude: f64,
+    longitude: f64,
+}
+
+impl GeoCoordinate {
+    pub fn new(latitude: f64, longitude: f64) -> Option<Self> {
+        (latitude.is_finite()
+            && longitude.is_finite()
+            && (-90.0..=90.0).contains(&latitude)
+            && (-180.0..=180.0).contains(&longitude))
+        .then_some(Self {
+            latitude,
+            longitude,
+        })
+    }
+
+    pub fn latitude(self) -> f64 {
+        self.latitude
+    }
+
+    pub fn longitude(self) -> f64 {
+        self.longitude
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ImageOrderingMetadata {
     pub path: PathBuf,
     pub capture_time: Option<SystemTime>,
     pub fallback_time: Option<SystemTime>,
+    pub coordinate: Option<GeoCoordinate>,
 }
 
 #[derive(Clone)]
@@ -31,6 +59,7 @@ pub struct MetadataLoader {
 
 struct CachedMetadata {
     capture_unix_seconds: Option<u64>,
+    coordinate: Option<GeoCoordinate>,
 }
 
 impl MetadataLoader {
@@ -121,6 +150,13 @@ impl MetadataLoader {
                 embedded_capture_time(&path)
             }
         });
+        let coordinate = xmp_path.as_deref().and_then(xmp_coordinate).or_else(|| {
+            if cancelled.load(Ordering::Acquire) {
+                None
+            } else {
+                embedded_coordinate(&path)
+            }
+        });
         let pending = (!cancelled.load(Ordering::Acquire))
             .then(|| {
                 key.map(|key| {
@@ -128,6 +164,7 @@ impl MetadataLoader {
                         key,
                         CachedMetadata {
                             capture_unix_seconds: capture_time.and_then(to_unix_seconds),
+                            coordinate,
                         },
                     )
                 })
@@ -138,6 +175,7 @@ impl MetadataLoader {
                 path,
                 capture_time,
                 fallback_time,
+                coordinate,
             },
             pending,
         )
@@ -156,6 +194,7 @@ impl MetadataLoader {
                     path,
                     capture_time: cached.capture_unix_seconds.map(unix_time),
                     fallback_time,
+                    coordinate: cached.coordinate,
                 },
                 true,
             );
@@ -165,6 +204,7 @@ impl MetadataLoader {
                 path,
                 capture_time: None,
                 fallback_time,
+                coordinate: None,
             },
             false,
         )
@@ -174,13 +214,19 @@ impl MetadataLoader {
         let cache = self.cache.as_ref()?.lock().ok()?;
         cache
             .query_row(
-                "SELECT capture_unix_seconds FROM image_metadata WHERE identity = ?1",
+                "SELECT capture_unix_seconds, latitude, longitude FROM image_metadata WHERE identity = ?1",
                 [key],
                 |row| {
                     Ok(CachedMetadata {
                         capture_unix_seconds: row
                             .get::<_, Option<i64>>(0)?
                             .and_then(|value| value.try_into().ok()),
+                        coordinate: match (row.get(1)?, row.get(2)?) {
+                            (Some(latitude), Some(longitude)) => {
+                                GeoCoordinate::new(latitude, longitude)
+                            }
+                            _ => None,
+                        },
                     })
                 },
             )
@@ -199,8 +245,9 @@ impl MetadataLoader {
         };
         {
             let Ok(mut statement) = transaction.prepare_cached(
-                "INSERT INTO image_metadata(identity, capture_unix_seconds) VALUES (?1, ?2) \
-                 ON CONFLICT(identity) DO UPDATE SET capture_unix_seconds = excluded.capture_unix_seconds",
+                "INSERT INTO image_metadata(identity, capture_unix_seconds, latitude, longitude) VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(identity) DO UPDATE SET capture_unix_seconds = excluded.capture_unix_seconds, \
+                 latitude = excluded.latitude, longitude = excluded.longitude",
             ) else {
                 return;
             };
@@ -209,7 +256,9 @@ impl MetadataLoader {
                     key,
                     metadata
                         .capture_unix_seconds
-                        .and_then(|value| i64::try_from(value).ok())
+                        .and_then(|value| i64::try_from(value).ok()),
+                    metadata.coordinate.map(GeoCoordinate::latitude),
+                    metadata.coordinate.map(GeoCoordinate::longitude),
                 ]);
             }
         }
@@ -226,7 +275,9 @@ fn open_cache(path: &Path) -> Option<rusqlite::Connection> {
              PRAGMA synchronous=NORMAL;
              CREATE TABLE IF NOT EXISTS image_metadata (
                  identity TEXT PRIMARY KEY NOT NULL,
-                 capture_unix_seconds INTEGER
+                 capture_unix_seconds INTEGER,
+                 latitude REAL,
+                 longitude REAL
              ) WITHOUT ROWID;",
         )
         .ok()?;
@@ -278,12 +329,213 @@ fn xmp_capture_time(path: &Path) -> Option<SystemTime> {
     parse_exif_time(value)
 }
 
+fn xmp_coordinate(path: &Path) -> Option<GeoCoordinate> {
+    let text = fs::read_to_string(path).ok()?;
+    let latitude = xmp_attribute(&text, "exif:GPSLatitude")?;
+    let longitude = xmp_attribute(&text, "exif:GPSLongitude")?;
+    GeoCoordinate::new(
+        parse_xmp_angle(latitude, ['N', 'S'])?,
+        parse_xmp_angle(longitude, ['E', 'W'])?,
+    )
+}
+
+fn xmp_attribute<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    text.split_once(&format!("{name}=\""))?
+        .1
+        .split_once('"')
+        .map(|v| v.0)
+}
+
+fn parse_xmp_angle(value: &str, allowed_directions: [char; 2]) -> Option<f64> {
+    let value = value.trim();
+    let direction = value.chars().last().filter(|c| "NSEWnsew".contains(*c));
+    let unsigned = direction
+        .map_or(value, |_| &value[..value.len() - 1])
+        .trim();
+    let parts = unsigned
+        .split([',', ' '])
+        .filter(|part| !part.is_empty())
+        .map(str::parse::<f64>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    let first = *parts.first()?;
+    if parts.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    if direction.is_some_and(|value| {
+        !allowed_directions.contains(&value.to_ascii_uppercase()) || first.is_sign_negative()
+    }) {
+        return None;
+    }
+    let magnitude = match parts.as_slice() {
+        [decimal] => decimal.abs(),
+        [degrees, minutes] if (0.0..60.0).contains(minutes) => degrees.abs() + minutes / 60.0,
+        [degrees, minutes, seconds]
+            if (0.0..60.0).contains(minutes) && (0.0..60.0).contains(seconds) =>
+        {
+            degrees.abs() + minutes / 60.0 + seconds / 3600.0
+        }
+        _ => return None,
+    };
+    let sign = match direction.map(|c| c.to_ascii_uppercase()) {
+        Some('S' | 'W') => -1.0,
+        Some('N' | 'E') => 1.0,
+        None if first.is_sign_negative() => -1.0,
+        None => 1.0,
+        _ => return None,
+    };
+    Some(sign * magnitude)
+}
+
 fn embedded_capture_time(path: &Path) -> Option<SystemTime> {
     if crate::formats::is_raw(path) {
         raw_capture_time(path).or_else(|| exif_capture_time(path))
     } else {
         exif_capture_time(path)
     }
+}
+
+fn embedded_coordinate(path: &Path) -> Option<GeoCoordinate> {
+    if crate::formats::is_raw(path) {
+        raw_coordinate(path).or_else(|| exif_coordinate(path))
+    } else if path
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "heic" | "heif"))
+    {
+        heif_coordinate(path).or_else(|| exif_coordinate(path))
+    } else {
+        exif_coordinate(path)
+    }
+}
+
+fn heif_coordinate(path: &Path) -> Option<GeoCoordinate> {
+    let bytes = fs::read(path).ok()?;
+    let context = libheif_rs::HeifContext::read_from_bytes(&bytes).ok()?;
+    let handle = context.primary_image_handle().ok()?;
+    let mut ids = vec![0; handle.number_of_metadata_blocks(b"Exif").max(0) as usize];
+    let count = handle.metadata_block_ids(&mut ids, b"Exif");
+    ids.truncate(count);
+    ids.into_iter()
+        .find_map(|id| heif_exif_coordinate(&handle.metadata(id).ok()?))
+}
+
+fn heif_exif_coordinate(data: &[u8]) -> Option<GeoCoordinate> {
+    let offset = u32::from_be_bytes(data.get(..4)?.try_into().ok()?) as usize;
+    let tiff = data.get(4_usize.checked_add(offset)?..)?;
+    let exif = exif::Reader::new().read_raw(tiff.to_vec()).ok()?;
+    coordinate_from_exif(&exif)
+}
+
+fn raw_coordinate(path: &Path) -> Option<GeoCoordinate> {
+    use rawler::{decoders::RawDecodeParams, rawsource::RawSource};
+
+    let source = RawSource::new(path).ok()?;
+    let decoder = rawler::global_loader().get_decoder(&source).ok()?;
+    let metadata = decoder
+        .raw_metadata(&source, &RawDecodeParams::default())
+        .ok()?;
+    let gps = metadata.exif.gps?;
+    let latitude = raw_dms(
+        gps.gps_latitude?,
+        gps.gps_latitude_ref.as_deref()?,
+        ['N', 'S'],
+    )?;
+    let longitude = raw_dms(
+        gps.gps_longitude?,
+        gps.gps_longitude_ref.as_deref()?,
+        ['E', 'W'],
+    )?;
+    GeoCoordinate::new(latitude, longitude)
+}
+
+fn raw_dms(
+    values: [rawler::formats::tiff::Rational; 3],
+    direction: &str,
+    allowed_directions: [char; 2],
+) -> Option<f64> {
+    let values = values
+        .into_iter()
+        .map(|value| f32::try_from(value).ok().map(f64::from))
+        .collect::<Option<Vec<_>>>()?
+        .try_into()
+        .ok()?;
+    dms_coordinate(values, direction, allowed_directions)
+}
+
+fn exif_coordinate(path: &Path) -> Option<GeoCoordinate> {
+    let file = fs::File::open(path).ok()?;
+    let exif = exif::Reader::new()
+        .read_from_container(&mut BufReader::new(file))
+        .ok()?;
+    coordinate_from_exif(&exif)
+}
+
+fn coordinate_from_exif(exif: &exif::Exif) -> Option<GeoCoordinate> {
+    let latitude = exif_dms(
+        exif,
+        exif::Tag::GPSLatitude,
+        exif::Tag::GPSLatitudeRef,
+        ['N', 'S'],
+    )?;
+    let longitude = exif_dms(
+        exif,
+        exif::Tag::GPSLongitude,
+        exif::Tag::GPSLongitudeRef,
+        ['E', 'W'],
+    )?;
+    GeoCoordinate::new(latitude, longitude)
+}
+
+fn exif_dms(
+    exif: &exif::Exif,
+    tag: exif::Tag,
+    reference: exif::Tag,
+    allowed_directions: [char; 2],
+) -> Option<f64> {
+    let exif::Value::Rational(values) = &exif.get_field(tag, exif::In::PRIMARY)?.value else {
+        return None;
+    };
+    let values: [f64; 3] = values
+        .iter()
+        .take(3)
+        .map(|value| value.to_f64())
+        .collect::<Vec<_>>()
+        .try_into()
+        .ok()?;
+    let direction = exif
+        .get_field(reference, exif::In::PRIMARY)?
+        .display_value()
+        .to_string();
+    dms_coordinate(
+        values,
+        direction.trim_matches(['\"', '\0', ' ']),
+        allowed_directions,
+    )
+}
+
+fn dms_coordinate(values: [f64; 3], direction: &str, allowed_directions: [char; 2]) -> Option<f64> {
+    if values
+        .iter()
+        .any(|value| !value.is_finite() || *value < 0.0)
+        || values[1] >= 60.0
+        || values[2] >= 60.0
+    {
+        return None;
+    }
+    let direction = direction.trim().to_ascii_uppercase();
+    if !allowed_directions
+        .iter()
+        .any(|allowed| direction == allowed.to_string())
+    {
+        return None;
+    }
+    let sign = match direction.as_str() {
+        "N" | "E" => 1.0,
+        "S" | "W" => -1.0,
+        _ => return None,
+    };
+    Some(sign * (values[0] + values[1] / 60.0 + values[2] / 3600.0))
 }
 
 fn raw_capture_time(path: &Path) -> Option<SystemTime> {

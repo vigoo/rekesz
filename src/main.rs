@@ -3,7 +3,9 @@
 #![cfg_attr(test, allow(dead_code, unused_imports))]
 
 use std::{
+    cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    hash::{Hash, Hasher},
     ops::Range,
     path::PathBuf,
     sync::{
@@ -27,10 +29,31 @@ mod config;
 mod discovery;
 mod formats;
 mod jobs;
+mod map;
 mod metadata;
 mod preview;
 mod rendering;
 mod scheduler;
+
+static MAP_RENDER_BUSY: AtomicBool = AtomicBool::new(false);
+static MAP_CLUSTER_BUSY: AtomicBool = AtomicBool::new(false);
+const MAP_RENDER_OVERSCAN: u32 = 128;
+
+struct MapRenderGuard;
+
+impl Drop for MapRenderGuard {
+    fn drop(&mut self) {
+        MAP_RENDER_BUSY.store(false, Ordering::Release);
+    }
+}
+
+struct MapClusterGuard;
+
+impl Drop for MapClusterGuard {
+    fn drop(&mut self) {
+        MAP_CLUSTER_BUSY.store(false, Ordering::Release);
+    }
+}
 
 use config::{AppSettings, Config};
 use discovery::{
@@ -87,6 +110,8 @@ const NEAR_GRID_SCOPE: DemandScopeId = DemandScopeId(3);
 const IDLE_PREFETCH_SCOPE: DemandScopeId = DemandScopeId(4);
 const FOCUSED_PREFETCH_SCOPE: DemandScopeId = DemandScopeId(5);
 const IMAGE_PREFETCH_SCOPE: DemandScopeId = DemandScopeId(6);
+const MAP_CARD_SCOPE: DemandScopeId = DemandScopeId(7);
+const MAP_GALLERY_PAGE_SIZE: usize = 6;
 const IDLE_PREFETCH_DELAY: Duration = Duration::from_millis(400);
 const IDLE_PREFETCH_BATCH: usize = 64;
 const IMAGE_PREFETCH_COUNT: usize = 4;
@@ -161,6 +186,13 @@ impl ImageViewState {
 enum MainView {
     Image(ImageViewState),
     Dir(PathBuf, ImageSelection),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum DirectoryViewMode {
+    #[default]
+    Grid,
+    Map,
 }
 
 #[derive(Clone, Copy)]
@@ -271,6 +303,87 @@ struct PictureBrowser {
     scrollbar_drag: Option<ScrollbarDrag>,
     recipes: Option<Arc<HashMap<PathBuf, catalog::RecipeEntry>>>,
     developed: bool,
+    directory_view_mode: DirectoryViewMode,
+    map_camera: map::Camera,
+    map_fit_node: Option<NodeId>,
+    map_pending_fit: Option<NodeId>,
+    map_render: MapRenderState,
+    map_render_epoch: u64,
+    map_render_generation: Arc<std::sync::atomic::AtomicU64>,
+    map_render_size: (u32, u32),
+    map_view_origin: (f32, f32),
+    map_drag_last: Option<(f32, f32)>,
+    map_drag_moved: bool,
+    map_clusters: RefCell<Option<(u64, Option<map::PhotoClusters>)>>,
+    map_cluster_pending_key: Cell<Option<u64>>,
+    map_cluster_generation: Arc<std::sync::atomic::AtomicU64>,
+    map_network_stats: map::network::NetworkStatsSnapshot,
+    map_card: Option<MapCard>,
+    map_job: Option<MapJob>,
+    map_cache_clearing: bool,
+    hidden_subtrees_loaded: bool,
+    hidden_save_in_flight: bool,
+}
+
+enum MapRenderState {
+    Empty,
+    Loading,
+    Loaded {
+        image: Arc<gpui::RenderImage>,
+        camera: map::Camera,
+        size: (u32, u32),
+        detail_tiles: usize,
+        detail_error: Option<Arc<str>>,
+    },
+    Error(Arc<str>),
+}
+
+#[derive(Clone)]
+struct MapCard {
+    items: Vec<MapCardItem>,
+    page: usize,
+    total: usize,
+    cluster_id: Option<usize>,
+    direct_indices: Option<Vec<usize>>,
+    coordinate: metadata::GeoCoordinate,
+    expansion_zoom: Option<u8>,
+}
+
+#[derive(Clone)]
+struct MapCardItem {
+    path: PathBuf,
+}
+
+impl MapCard {
+    fn new(
+        coordinate: metadata::GeoCoordinate,
+        items: Vec<MapCardItem>,
+        total: usize,
+        cluster_id: Option<usize>,
+        expansion_zoom: Option<u8>,
+    ) -> Option<Self> {
+        (!items.is_empty()).then_some(Self {
+            items,
+            page: 0,
+            total,
+            cluster_id,
+            direct_indices: None,
+            coordinate,
+            expansion_zoom,
+        })
+    }
+
+    fn page_count(&self) -> usize {
+        self.total.div_ceil(MAP_GALLERY_PAGE_SIZE)
+    }
+
+    fn page_items(&self) -> &[MapCardItem] {
+        &self.items
+    }
+
+    fn navigate(&mut self, delta: isize) {
+        self.page = ((self.page as isize + delta).rem_euclid(self.page_count() as isize)) as usize;
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -284,12 +397,33 @@ enum SettingsNumber {
     ImageCacheSize,
     JobParallelism,
     RawParallelism,
+    MapCacheGiB,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct ScrollbarDrag {
     target: ScrollbarTarget,
     pointer_offset: gpui::Pixels,
+}
+
+#[derive(Clone, Copy)]
+struct MapCacheStatistics {
+    usage: u64,
+    capacity: u64,
+    network: map::network::NetworkStatsSnapshot,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MapJob {
+    epoch: u64,
+    label: String,
+    status: MapJobStatus,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MapJobStatus {
+    Queued,
+    Running,
 }
 
 fn has_develop_recipe(
@@ -304,6 +438,107 @@ fn path_display_name(path: &std::path::Path) -> String {
         .unwrap_or(path.as_os_str())
         .to_string_lossy()
         .into_owned()
+}
+
+fn map_screen_position(
+    coordinate: metadata::GeoCoordinate,
+    camera: map::Camera,
+    viewport: (u32, u32),
+) -> Option<(f32, f32)> {
+    fn mercator(coordinate: metadata::GeoCoordinate) -> (f64, f64) {
+        let latitude = coordinate
+            .latitude()
+            .clamp(-85.051_13, 85.051_13)
+            .to_radians();
+        (
+            (coordinate.longitude() + 180.0) / 360.0,
+            (1.0 - latitude.tan().asinh() / std::f64::consts::PI) / 2.0,
+        )
+    }
+    let (point_x, point_y) = mercator(coordinate);
+    let (center_x, center_y) = mercator(camera.center);
+    let world_pixels = 256.0 * 2_f64.powf(camera.zoom);
+    let wrapped_x = (point_x - center_x + 0.5).rem_euclid(1.0) - 0.5;
+    let x = 0.5 + wrapped_x * world_pixels / f64::from(viewport.0.max(1));
+    let y = 0.5 + (point_y - center_y) * world_pixels / f64::from(viewport.1.max(1));
+    (x.is_finite() && y.is_finite()).then_some((x as f32, y as f32))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MapSurfaceGeometry {
+    left: f32,
+    top: f32,
+    width: f32,
+    height: f32,
+}
+
+fn map_surface_geometry(
+    rendered: map::Camera,
+    current: map::Camera,
+    viewport: (u32, u32),
+    raster: (u32, u32),
+) -> MapSurfaceGeometry {
+    let width = viewport.0.max(1) as f32;
+    let height = viewport.1.max(1) as f32;
+    let scale = 2_f64.powf(current.zoom - rendered.zoom) as f32;
+    let (rendered_x, rendered_y) = map::mercator_project(rendered.center);
+    let (current_x, current_y) = map::mercator_project(current.center);
+    let wrapped_x = (rendered_x - current_x + 0.5).rem_euclid(1.0) - 0.5;
+    let world = 256.0 * 2_f64.powf(current.zoom);
+    MapSurfaceGeometry {
+        left: width / 2.0 - raster.0 as f32 * scale / 2.0 + (wrapped_x * world) as f32,
+        top: height / 2.0 - raster.1 as f32 * scale / 2.0
+            + ((rendered_y - current_y) * world) as f32,
+        width: raster.0 as f32 * scale,
+        height: raster.1 as f32 * scale,
+    }
+}
+
+fn zoom_map_camera(
+    mut camera: map::Camera,
+    zoom_delta: f64,
+    anchor: (f64, f64),
+    viewport: (u32, u32),
+) -> map::Camera {
+    let old_zoom = camera.zoom;
+    camera.zoom_by(zoom_delta);
+    let offset_x = anchor.0 - f64::from(viewport.0) / 2.0;
+    let offset_y = anchor.1 - f64::from(viewport.1) / 2.0;
+    let old_world = 256.0 * 2_f64.powf(old_zoom);
+    let new_world = 256.0 * 2_f64.powf(camera.zoom);
+    let (center_x, center_y) = map::mercator_project(camera.center);
+    if let Some(center) = map::mercator_unproject(
+        center_x + offset_x / old_world - offset_x / new_world,
+        center_y + offset_y / old_world - offset_y / new_world,
+    ) {
+        camera.center = center;
+    }
+    camera
+}
+
+fn map_detail_status(
+    zoom: f64,
+    permission: config::OnlineMapPermission,
+    loading: bool,
+    completed: Option<(usize, Option<&str>)>,
+) -> String {
+    if let Some((tiles, error)) = completed {
+        if tiles > 0 {
+            return format!("Detailed map · {tiles} vector tiles");
+        }
+        if let Some(error) = error {
+            return format!("Bundled map · online detail unavailable: {error}");
+        }
+    }
+    if zoom <= map::BUNDLED_DETAIL_MAX_ZOOM {
+        "Bundled map · zoom in for detail".to_owned()
+    } else if permission != config::OnlineMapPermission::Enabled {
+        "Bundled map · online detail disabled".to_owned()
+    } else if loading {
+        "Bundled map · loading online detail".to_owned()
+    } else {
+        "Bundled map · no supported detail in visible tiles".to_owned()
+    }
 }
 
 fn adjacent_image_index(current: usize, image_count: usize, delta: isize) -> Option<usize> {
@@ -393,6 +628,13 @@ fn scheduler_progress_label(snapshot: &SchedulerSnapshot) -> Option<String> {
         label.push_str(&format!(" ({} more)", jobs.len() - 1));
     }
     Some(label)
+}
+
+fn map_job_progress_label(job: &MapJob) -> String {
+    match job.status {
+        MapJobStatus::Queued => job.label.replacen("Rendering", "Preparing", 1),
+        MapJobStatus::Running => job.label.clone(),
+    }
 }
 
 fn format_develop_edits(recipe: &catalog::DevelopRecipe) -> Vec<(String, String)> {
@@ -576,8 +818,13 @@ struct RecursiveGridState {
 
 enum RecursiveGridStatus {
     Loading,
-    Loaded(Vec<PathBuf>),
+    Loaded(RecursiveImages),
     Error(Arc<str>),
+}
+
+struct RecursiveImages {
+    paths: Vec<PathBuf>,
+    coordinates: HashMap<PathBuf, metadata::GeoCoordinate>,
 }
 
 struct PathContextMenu {
@@ -720,31 +967,79 @@ impl PictureBrowser {
             scrollbar_drag: None,
             recipes: None,
             developed: true,
+            directory_view_mode: DirectoryViewMode::Grid,
+            map_camera: map::Camera::default(),
+            map_fit_node: None,
+            map_pending_fit: Some(root),
+            map_render: MapRenderState::Empty,
+            map_render_epoch: 0,
+            map_render_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            map_render_size: (1280, 800),
+            map_view_origin: (0.0, 0.0),
+            map_drag_last: None,
+            map_drag_moved: false,
+            map_clusters: RefCell::new(None),
+            map_cluster_pending_key: Cell::new(None),
+            map_cluster_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            map_network_stats: Default::default(),
+            map_card: None,
+            map_job: None,
+            map_cache_clearing: false,
+            hidden_subtrees_loaded: false,
+            hidden_save_in_flight: false,
         };
         let catalog_work = this.work.start("Loading develop catalog…");
         let catalog_root = settings.root.clone();
-        let loading = cx.background_executor().spawn(async move {
-            let hidden = catalog::load_hidden_subtrees(&catalog_root)?;
-            let recipes = catalog::load_recipes(&catalog_root)?;
-            Ok::<_, anyhow::Error>((recipes, hidden))
-        });
+        let recipe_root = catalog_root.clone();
+        let recipe_loading = cx
+            .background_executor()
+            .spawn(async move { catalog::load_recipes(&recipe_root) });
+        let hidden_loading = cx
+            .background_executor()
+            .spawn(async move { catalog::load_hidden_subtrees(&catalog_root) });
         cx.spawn(async move |this, cx| {
-            let result = loading.await;
+            let recipes = recipe_loading.await;
+            let hidden = hidden_loading.await;
             this.update(cx, |this, cx| {
                 this.work.finish(catalog_work);
-                match result {
-                    Ok((recipes, hidden)) => {
-                        this.recipes = Some(Arc::new(recipes));
+                match recipes {
+                    Ok(recipes) => this.recipes = Some(Arc::new(recipes)),
+                    Err(error) => {
+                        eprintln!("cannot load Rekesz recipes: {error:#}");
+                        this.recipes = Some(Arc::new(HashMap::new()));
+                    }
+                }
+                match hidden {
+                    Ok(hidden) => {
                         for path in &hidden {
                             this.model.ensure_node(path.clone());
                         }
-                        this.hidden_subtrees = hidden;
-                        this.rebuild_visible();
+                        if this.hidden_subtrees != hidden {
+                            let preserve_fit = this.map_pending_fit == Some(this.selected)
+                                || this.map_fit_node == Some(this.selected);
+                            let restart_recursive = this.recursive_grid.is_some();
+                            if let Some(recursive) = this.recursive_grid.take() {
+                                recursive.cancelled.store(true, Ordering::Release);
+                            }
+                            this.hidden_subtrees = hidden;
+                            this.rebuild_visible();
+                            if restart_recursive {
+                                this.start_recursive_grid(cx);
+                                if !preserve_fit {
+                                    this.map_pending_fit = None;
+                                }
+                            }
+                        }
+                        this.hidden_subtrees_loaded = true;
                     }
                     Err(error) => {
-                        eprintln!("cannot load Rekesz catalog: {error:#}");
-                        this.recipes = Some(Arc::new(HashMap::new()));
+                        eprintln!("cannot load hidden folders: {error:#}");
+                        this.settings_status =
+                            Some(format!("Could not load hidden folders: {error:#}"));
                     }
+                }
+                if this.map_card.is_some() {
+                    this.request_map_card_thumbnail(cx);
                 }
                 cx.notify();
             })
@@ -792,6 +1087,17 @@ impl PictureBrowser {
                                 cached_metadata,
                                 missing_metadata,
                             );
+                            if node == this.selected
+                                && this.directory_view_mode == DirectoryViewMode::Map
+                                && this.map_pending_fit == Some(node)
+                                && this.model.loaded(node).is_some_and(|contents| {
+                                    contents.metadata_status == DirectoryMetadataStatus::Complete
+                                })
+                            {
+                                this.fit_map_to_selected_images();
+                                this.map_pending_fit = None;
+                                this.request_map_render(cx);
+                            }
                         }
                         loaded
                     }
@@ -864,6 +1170,14 @@ impl PictureBrowser {
                     this.model.cancel_metadata_load(node, request);
                 } else {
                     this.model.finish_metadata_load(node, request, metadata);
+                    if node == this.selected
+                        && this.directory_view_mode == DirectoryViewMode::Map
+                        && this.map_pending_fit == Some(node)
+                    {
+                        this.fit_map_to_selected_images();
+                        this.map_pending_fit = None;
+                        this.request_map_render(cx);
+                    }
                 }
                 cx.notify();
             })
@@ -1059,9 +1373,7 @@ impl PictureBrowser {
     ) {
         let mut requests = HashMap::new();
         let mut demands = Vec::new();
-        let Some(recipes) = self.recipes.clone() else {
-            return;
-        };
+        let recipes = self.recipes.clone().unwrap_or_default();
         for (path, variant, priority) in requested {
             let render_identity = self.render_identity_for(&path);
             if !self
@@ -1490,7 +1802,12 @@ impl PictureBrowser {
     }
 
     fn select(&mut self, node: NodeId, cx: &mut Context<Self>) {
+        self.dismiss_map_card();
         let directory_changed = self.selected != node;
+        if !directory_changed {
+            cx.notify();
+            return;
+        }
         if directory_changed && let Some(recursive) = self.recursive_grid.take() {
             recursive.cancelled.store(true, Ordering::Release);
         }
@@ -1499,6 +1816,9 @@ impl PictureBrowser {
         self.reset_grid_prediction();
         self.cancel_metadata_enrichment();
         self.selected = node;
+        if directory_changed {
+            self.map_pending_fit = Some(node);
+        }
         self.main_view = MainView::Dir(
             self.model.node(node).path.to_path_buf(),
             ImageSelection::default(),
@@ -1510,6 +1830,17 @@ impl PictureBrowser {
         self.saved_selection = ImageSelection::default();
         self.ensure_directory_loaded(node, DirectoryScanPriority::Interactive, cx);
         self.start_metadata_enrichment(node, cx);
+        if directory_changed && self.directory_view_mode == DirectoryViewMode::Map {
+            if self.model.loaded(node).is_some_and(|contents| {
+                contents.metadata_status == DirectoryMetadataStatus::Complete
+            }) {
+                self.fit_map_to_selected_images();
+                self.map_pending_fit = None;
+            } else {
+                self.map_camera = map::Camera::default();
+            }
+            self.request_map_render(cx);
+        }
         cx.notify();
     }
 
@@ -1650,6 +1981,7 @@ impl PictureBrowser {
         self.scheduler.clear_scope(NEAR_GRID_SCOPE);
         self.scheduler.clear_scope(IDLE_PREFETCH_SCOPE);
         self.scheduler.clear_scope(FOCUSED_PREFETCH_SCOPE);
+        self.scheduler.clear_scope(MAP_CARD_SCOPE);
         self.main_view = MainView::Image(ImageViewState::new(path.clone()));
         // Keep visible thumbnail demand alive. Returning to the grid can then
         // resume without rebuilding its visible cache entries.
@@ -1727,6 +2059,9 @@ impl PictureBrowser {
                 self.model.node(self.selected).path.to_path_buf(),
                 self.saved_selection.clone(),
             );
+            if self.directory_view_mode == DirectoryViewMode::Map && self.map_card.is_some() {
+                self.request_map_card_thumbnail(cx);
+            }
             cx.notify();
         }
     }
@@ -1859,11 +2194,986 @@ impl PictureBrowser {
         }) = &self.recursive_grid
             && *root == self.selected
         {
-            return images;
+            return &images.paths;
         }
         self.model
             .loaded(self.selected)
             .map_or(&[], |contents| contents.images.as_slice())
+    }
+
+    fn selected_coordinates(&self) -> Vec<metadata::GeoCoordinate> {
+        if let Some(RecursiveGridState {
+            root,
+            status: RecursiveGridStatus::Loaded(images),
+            ..
+        }) = &self.recursive_grid
+            && *root == self.selected
+        {
+            return images
+                .paths
+                .iter()
+                .filter_map(|path| images.coordinates.get(path).copied())
+                .collect();
+        }
+        self.selected_images()
+            .iter()
+            .filter_map(|path| self.model.coordinate(self.selected, path))
+            .collect()
+    }
+
+    fn selected_located_images(&self) -> Vec<(usize, metadata::GeoCoordinate)> {
+        if let Some(RecursiveGridState {
+            root,
+            status: RecursiveGridStatus::Loaded(images),
+            ..
+        }) = &self.recursive_grid
+            && *root == self.selected
+        {
+            return images
+                .paths
+                .iter()
+                .enumerate()
+                .filter_map(|(index, path)| {
+                    images
+                        .coordinates
+                        .get(path)
+                        .copied()
+                        .map(|value| (index, value))
+                })
+                .collect();
+        }
+        self.selected_images()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, path)| {
+                self.model
+                    .coordinate(self.selected, path)
+                    .map(|value| (index, value))
+            })
+            .collect()
+    }
+
+    fn fit_map_to_selected_images(&mut self) {
+        if let Some(camera) =
+            map::Camera::fit_viewport(&self.selected_coordinates(), self.map_render_size, 48.0)
+        {
+            self.map_camera = camera;
+        } else {
+            self.map_camera = map::Camera::default();
+        }
+        self.map_fit_node = Some(self.selected);
+    }
+
+    fn request_map_render(&mut self, cx: &mut Context<Self>) {
+        if self.map_cache_clearing {
+            return;
+        }
+        self.map_render_epoch = self.map_render_epoch.wrapping_add(1);
+        let epoch = self.map_render_epoch;
+        self.map_render_generation.store(epoch, Ordering::Release);
+        if !matches!(self.map_render, MapRenderState::Loaded { .. }) {
+            self.map_render = MapRenderState::Loading;
+        }
+        let camera = self.map_camera;
+        let cache_path = self.settings.cache_root.join("map/ambient.sqlite3");
+        let cache_capacity = self.settings.map_cache_bytes;
+        let online_access =
+            map::OnlineMapAccess::from_permission(self.settings.online_map_permission);
+        self.map_job = Some(MapJob {
+            epoch,
+            label: if online_access.is_some() && camera.zoom > map::BUNDLED_DETAIL_MAX_ZOOM {
+                "Rendering map and downloading visible tiles…".to_owned()
+            } else {
+                "Rendering map…".to_owned()
+            },
+            status: MapJobStatus::Queued,
+        });
+        cx.notify();
+        let render_width = self
+            .map_render_size
+            .0
+            .saturating_add(MAP_RENDER_OVERSCAN.saturating_mul(2));
+        let render_height = self
+            .map_render_size
+            .1
+            .saturating_add(MAP_RENDER_OVERSCAN.saturating_mul(2));
+        let generation = self.map_render_generation.clone();
+        let debounce = cx.background_executor().timer(Duration::from_millis(90));
+        let retry_executor = cx.background_executor().clone();
+        let (running_sender, running_receiver) = futures::channel::oneshot::channel();
+        let rendering = cx.background_executor().spawn(async move {
+            debounce.await;
+            if generation.load(Ordering::Acquire) != epoch {
+                return Ok::<_, String>(None);
+            }
+            let _render_guard = loop {
+                if generation.load(Ordering::Acquire) != epoch {
+                    return Ok(None);
+                }
+                if MAP_RENDER_BUSY
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    break MapRenderGuard;
+                }
+                retry_executor.timer(Duration::from_millis(16)).await;
+            };
+            if generation.load(Ordering::Acquire) != epoch {
+                return Ok(None);
+            }
+            let _ = running_sender.send(());
+            let rendered = map::renderer::render_map(
+                render_width,
+                render_height,
+                camera,
+                cache_path,
+                cache_capacity,
+                online_access,
+                || generation.load(Ordering::Acquire) != epoch,
+            )?;
+            if generation.load(Ordering::Acquire) != epoch {
+                return Ok(None);
+            }
+            Ok(Some((
+                Arc::new(gpui::RenderImage::new(smallvec::smallvec![
+                    image::Frame::new(rendered.image)
+                ])),
+                rendered.network,
+                rendered.detail_tiles,
+                rendered.detail_error.map(Arc::from),
+            )))
+        });
+        cx.spawn(async move |this, cx| {
+            if running_receiver.await.is_ok() {
+                this.update(cx, |this, cx| {
+                    if let Some(job) = &mut this.map_job
+                        && job.epoch == epoch
+                    {
+                        job.status = MapJobStatus::Running;
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
+        cx.spawn(async move |this, cx| {
+            let result = rendering.await;
+            this.update(cx, |this, cx| {
+                if this.map_render_epoch != epoch || matches!(result, Ok(None)) {
+                    return;
+                }
+                if this.map_job.as_ref().is_some_and(|job| job.epoch == epoch) {
+                    this.map_job = None;
+                }
+                this.map_render = match result {
+                    Ok(Some((image, stats, detail_tiles, detail_error))) => {
+                        this.map_network_stats.hits =
+                            this.map_network_stats.hits.saturating_add(stats.hits);
+                        this.map_network_stats.misses =
+                            this.map_network_stats.misses.saturating_add(stats.misses);
+                        this.map_network_stats.downloads = this
+                            .map_network_stats
+                            .downloads
+                            .saturating_add(stats.downloads);
+                        this.map_network_stats.errors =
+                            this.map_network_stats.errors.saturating_add(stats.errors);
+                        this.map_network_stats.not_modified = this
+                            .map_network_stats
+                            .not_modified
+                            .saturating_add(stats.not_modified);
+                        MapRenderState::Loaded {
+                            image,
+                            camera,
+                            size: (render_width, render_height),
+                            detail_tiles,
+                            detail_error,
+                        }
+                    }
+                    Ok(None) => return,
+                    Err(error) => MapRenderState::Error(error.into()),
+                };
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn set_directory_view_mode(&mut self, mode: DirectoryViewMode, cx: &mut Context<Self>) {
+        self.dismiss_map_card();
+        self.directory_view_mode = mode;
+        if mode != DirectoryViewMode::Map {
+            self.map_render_epoch = self.map_render_epoch.wrapping_add(1);
+            self.map_render_generation
+                .store(self.map_render_epoch, Ordering::Release);
+            self.map_job = None;
+        }
+        let metadata_complete = self.recursive_grid.as_ref().is_some_and(|recursive| {
+            recursive.root == self.selected
+                && matches!(recursive.status, RecursiveGridStatus::Loaded(_))
+        }) || self
+            .model
+            .loaded(self.selected)
+            .is_some_and(|contents| contents.metadata_status == DirectoryMetadataStatus::Complete);
+        if mode == DirectoryViewMode::Map
+            && metadata_complete
+            && self.map_pending_fit == Some(self.selected)
+        {
+            self.fit_map_to_selected_images();
+            self.map_pending_fit = None;
+        }
+        if mode == DirectoryViewMode::Map {
+            self.request_map_render(cx);
+        }
+        cx.notify();
+    }
+
+    fn set_online_map_permission(
+        &mut self,
+        permission: config::OnlineMapPermission,
+        cx: &mut Context<Self>,
+    ) {
+        let mut settings = self.settings.clone();
+        settings.online_map_permission = permission;
+        match config::save(&self.settings_path, &settings) {
+            Ok(()) => {
+                self.settings = settings;
+                if let Some(draft) = &mut self.settings_draft {
+                    draft.online_map_permission = permission;
+                }
+                self.settings_status = None;
+                if self.directory_view_mode == DirectoryViewMode::Map {
+                    self.request_map_render(cx);
+                }
+            }
+            Err(error) => {
+                self.settings_status =
+                    Some(format!("Could not save online map setting: {error:#}"));
+            }
+        }
+        cx.notify();
+    }
+
+    fn render_map_view(&self, cx: &mut Context<Self>) -> AnyElement {
+        let selected_images = self.selected_images();
+        let total = selected_images.len();
+        let can_show_recursively = self.recursive_grid.is_none()
+            && self
+                .model
+                .loaded(self.selected)
+                .is_some_and(|contents| !contents.children.is_empty());
+        let located_images = self.selected_located_images();
+        let coordinates = located_images
+            .iter()
+            .map(|(_, coordinate)| *coordinate)
+            .collect::<Vec<_>>();
+        let located = coordinates.len();
+        let mut cluster_hasher = std::collections::hash_map::DefaultHasher::new();
+        self.selected.hash(&mut cluster_hasher);
+        for (index, coordinate) in &located_images {
+            index.hash(&mut cluster_hasher);
+            coordinate.latitude().to_bits().hash(&mut cluster_hasher);
+            coordinate.longitude().to_bits().hash(&mut cluster_hasher);
+        }
+        let cluster_key = cluster_hasher.finish();
+        let rebuild_clusters = self
+            .map_clusters
+            .borrow()
+            .as_ref()
+            .is_none_or(|(cached_key, _)| *cached_key != cluster_key);
+        if rebuild_clusters && self.map_cluster_pending_key.get() != Some(cluster_key) {
+            self.map_cluster_pending_key.set(Some(cluster_key));
+            self.map_cluster_generation
+                .store(cluster_key, Ordering::Release);
+            let generation = Arc::clone(&self.map_cluster_generation);
+            let retry_executor = cx.background_executor().clone();
+            let clustering = cx.background_executor().spawn(async move {
+                loop {
+                    if generation.load(Ordering::Acquire) != cluster_key {
+                        return None;
+                    }
+                    if MAP_CLUSTER_BUSY
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        break;
+                    }
+                    retry_executor.timer(Duration::from_millis(16)).await;
+                }
+                let _guard = MapClusterGuard;
+                if generation.load(Ordering::Acquire) != cluster_key {
+                    return None;
+                }
+                Some(map::PhotoClusters::new(&coordinates))
+            });
+            cx.spawn(async move |this, cx| {
+                let result = clustering.await;
+                this.update(cx, |this, cx| {
+                    if this.map_cluster_pending_key.get() != Some(cluster_key)
+                        || this.map_cluster_generation.load(Ordering::Acquire) != cluster_key
+                    {
+                        return;
+                    }
+                    let Some(result) = result else {
+                        return;
+                    };
+                    this.map_cluster_pending_key.set(None);
+                    *this.map_clusters.borrow_mut() = Some((cluster_key, Some(result)));
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
+        let markers = self
+            .map_clusters
+            .borrow()
+            .as_ref()
+            .filter(|(cached_key, _)| *cached_key == cluster_key)
+            .and_then(|(_, clusters)| {
+                let clusters = clusters.as_ref()?;
+                let zoom = self.map_camera.zoom.floor().clamp(0.0, 20.0) as u8;
+                Some(
+                    self.map_camera
+                        .visible_bounds(self.map_render_size)
+                        .into_iter()
+                        .flat_map(|bounds| clusters.markers(bounds, zoom))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .unwrap_or_default();
+        let camera = self.map_camera;
+        let completed_detail = match &self.map_render {
+            MapRenderState::Loaded {
+                detail_tiles,
+                detail_error,
+                ..
+            } => Some((*detail_tiles, detail_error.as_deref())),
+            _ => None,
+        };
+        let status = map_detail_status(
+            camera.zoom,
+            self.settings.online_map_permission,
+            matches!(self.map_render, MapRenderState::Loading),
+            completed_detail,
+        );
+        div()
+            .id("map-view")
+            .debug_selector(|| "#map-view".to_owned())
+            .size_full()
+            .relative()
+            .overflow_hidden()
+            .bg(rgb(0x17242b))
+            .cursor(if self.map_drag_last.is_some() {
+                CursorStyle::ClosedHand
+            } else {
+                CursorStyle::OpenHand
+            })
+            .on_mouse_move(cx.listener(Self::map_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::map_mouse_up))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::map_mouse_down))
+            .on_scroll_wheel(cx.listener(Self::map_scroll_wheel))
+            .child(match &self.map_render {
+                MapRenderState::Loaded {
+                    image,
+                    camera: rendered_camera,
+                    size: rendered_size,
+                    ..
+                } => {
+                    let geometry = map_surface_geometry(
+                        *rendered_camera,
+                        camera,
+                        self.map_render_size,
+                        *rendered_size,
+                    );
+                    img(image.clone())
+                        .absolute()
+                        .left(px(geometry.left))
+                        .top(px(geometry.top))
+                        .w(px(geometry.width))
+                        .h(px(geometry.height))
+                        .into_any_element()
+                }
+                MapRenderState::Loading => div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child("Rendering bundled map…")
+                    .into_any_element(),
+                MapRenderState::Error(error) => div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(format!("Basic map renderer unavailable: {error}"))
+                    .into_any_element(),
+                MapRenderState::Empty => div().into_any_element(),
+            })
+            .children(markers.into_iter().enumerate().filter_map(|(marker_position, marker)| {
+                let (x, y) =
+                    map_screen_position(marker.coordinate, camera, self.map_render_size)?;
+                if !(-0.05..=1.05).contains(&x) || !(-0.05..=1.05).contains(&y) {
+                    return None;
+                }
+                let photo_indices = marker.photo_indices.clone();
+                let cluster_id = marker.cluster_id;
+                let expansion_zoom = marker.expansion_zoom;
+                let count = marker.count;
+                let coordinate = marker.coordinate;
+                let marker_id = cluster_id.map_or_else(
+                    || {
+                        photo_indices
+                            .iter()
+                            .map(usize::to_string)
+                            .collect::<Vec<_>>()
+                            .join("-")
+                    },
+                    |id| format!("cluster-{id}"),
+                );
+                Some(
+                    div()
+                        .id(SharedString::from(format!("map-marker-{marker_id}")))
+                        .debug_selector(move || format!("#map-marker-{marker_position}"))
+                        .absolute()
+                        .left(relative(x))
+                        .top(relative(y))
+                        .min_w(px(28.0))
+                        .h(px(28.0))
+                        .px_2()
+                        .rounded_full()
+                        .bg(rgb(0xd46a4c))
+                        .border_2()
+                        .border_color(rgb(0xffded4))
+                        .text_color(rgb(0xffffff))
+                        .text_sm()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .block_mouse_except_scroll()
+                        .hover(|this| this.bg(rgb(0xf07b58)))
+                        .child(if count > 1 {
+                            count.to_string()
+                        } else {
+                            String::new()
+                        })
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.activate_map_marker(
+                                    coordinate,
+                                    photo_indices.clone(),
+                                    cluster_id,
+                                    count,
+                                    expansion_zoom,
+                                    cx,
+                                );
+                                cx.stop_propagation();
+                            }),
+                        ),
+                )
+            }))
+            .when(located == 0 && !can_show_recursively, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_color(rgb(0x7897a3))
+                        .child("No location data for this selection"),
+                )
+            })
+            .when(total == 0 && can_show_recursively, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap_3()
+                        .text_color(rgb(0x9fb0b8))
+                        .child("No images directly in this directory")
+                        .child(
+                            div()
+                                .id("map-show-images-recursively")
+                                .debug_selector(|| "#map-show-images-recursively".to_owned())
+                                .px_4()
+                                .py_2()
+                                .rounded_sm()
+                                .bg(rgb(0x315b8f))
+                                .text_color(rgb(0xffffff))
+                                .hover(|this| this.bg(rgb(0x3d6fa9)))
+                                .cursor_pointer()
+                                .child("Show images from all subdirectories")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.start_recursive_grid(cx);
+                                })),
+                        ),
+                )
+            })
+            .when(
+                self.settings.online_map_permission == config::OnlineMapPermission::Unknown,
+                |this| {
+                    this.child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .occlude()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(gpui::rgba(0x081015aa))
+                            .child(
+                                div()
+                                    .w(px(520.0))
+                                    .p_5()
+                                    .rounded_md()
+                                    .bg(rgb(0x1b252d))
+                                    .text_color(rgb(0xe3e8ec))
+                                    .child("Enable online map detail?")
+                                    .child(
+                                        div()
+                                            .mt_2()
+                                            .text_sm()
+                                            .text_color(rgb(0xaebbc3))
+                                            .child("OpenFreeMap receives tile coordinates for the area you view. Rekesz sends no photos, filenames, or photo metadata."),
+                                    )
+                                    .child(
+                                        div()
+                                            .mt_4()
+                                            .flex()
+                                            .gap_2()
+                                            .child(map_control("enable-online-map", "Enable Online Detail").on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.set_online_map_permission(config::OnlineMapPermission::Enabled, cx);
+                                                    cx.stop_propagation();
+                                                }),
+                                            ))
+                                            .child(map_control("keep-map-offline", "Keep Offline").on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.set_online_map_permission(config::OnlineMapPermission::Disabled, cx);
+                                                    cx.stop_propagation();
+                                                }),
+                                            )),
+                                    ),
+                            ),
+                    )
+                },
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(12.0))
+                    .top(px(12.0))
+                    .px_3()
+                    .py_2()
+                    .rounded_sm()
+                    .bg(gpui::rgba(0x101820dd))
+                    .text_sm()
+                    .text_color(rgb(0xc8d4db))
+                    .child(format!("Located {located} of {total} images"))
+                    .child(div().text_color(rgb(0x8fa3ad)).child(status)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .right(px(12.0))
+                    .top(px(12.0))
+                    .flex()
+                    .gap_1()
+                    .child(map_control("map-zoom-out", "−").on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.dismiss_map_card();
+                            this.map_camera.zoom_by(-1.0);
+                            this.map_fit_node = None;
+                            this.map_pending_fit = None;
+                            this.request_map_render(cx);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    ))
+                    .child(map_control("map-zoom-in", "+").on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.dismiss_map_card();
+                            this.map_camera.zoom_by(1.0);
+                            this.map_fit_node = None;
+                            this.map_pending_fit = None;
+                            this.request_map_render(cx);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    ))
+                    .child(map_control("map-fit", "Fit").on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.dismiss_map_card();
+                            this.fit_map_to_selected_images();
+                            this.map_pending_fit = None;
+                            this.request_map_render(cx);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(12.0))
+                    .bottom(px(10.0))
+                    .text_xs()
+                    .text_color(rgb(0x9fb0b8))
+                    .child(map::ATTRIBUTION),
+            )
+            .when_some(self.map_card.clone(), |this, card| {
+                let (anchor_x, anchor_y) =
+                    map_screen_position(card.coordinate, camera, self.map_render_size)
+                        .unwrap_or((0.5, 0.5));
+                let popup_left = (anchor_x * self.map_render_size.0 as f32 + 18.0)
+                    .clamp(8.0, (self.map_render_size.0 as f32 - 368.0).max(8.0));
+                let popup_top = (anchor_y * self.map_render_size.1 as f32 - 24.0)
+                    .clamp(8.0, (self.map_render_size.1 as f32 - 310.0).max(8.0));
+                let tiles = card.page_items().iter().enumerate().map(|(position, item)| {
+                    let path = item.path.clone();
+                    let identity = self.render_identity_for(&path);
+                    let thumbnail = match self.thumbnails.state_for(&path, identity) {
+                        PreviewState::Loaded(preview) => img(preview.image.clone())
+                            .size_full()
+                            .object_fit(gpui::ObjectFit::Cover)
+                            .into_any_element(),
+                        PreviewState::Error(_) => div()
+                            .size_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_xs()
+                            .child("Unavailable")
+                            .into_any_element(),
+                        _ => div()
+                            .size_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_xs()
+                            .child("Loading…")
+                            .into_any_element(),
+                    };
+                    div()
+                        .id(SharedString::from(format!(
+                            "map-gallery-{}",
+                            item.path.display()
+                        )))
+                        .debug_selector(move || format!("#map-gallery-item-{position}"))
+                        .w(px(104.0))
+                        .h(px(104.0))
+                        .flex_none()
+                        .overflow_hidden()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(rgb(0x495463))
+                        .hover(|this| this.border_color(rgb(0xffded4)))
+                        .cursor_pointer()
+                        .child(thumbnail)
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.show_image(path.clone(), cx);
+                                cx.stop_propagation();
+                            }),
+                        )
+                });
+                this.child(
+                    div()
+                        .absolute()
+                        .left(px(popup_left))
+                        .top(px(popup_top))
+                        .w(px(360.0))
+                        .p_3()
+                        .rounded_md()
+                        .bg(gpui::rgba(0x151b22f4))
+                        .text_color(rgb(0xe3e8ec))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(format!("{} photos here", card.total))
+                                .child(map_control("map-card-close", "×").on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.dismiss_map_card();
+                                        cx.stop_propagation();
+                                        cx.notify();
+                                    }),
+                                )),
+                        )
+                        .child(div().mt_2().flex().flex_wrap().gap_2().children(tiles))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap_2()
+                                .mt_2()
+                                .when(
+                                    card.expansion_zoom
+                                        .is_some_and(|zoom| f64::from(zoom) > camera.zoom),
+                                    |this| {
+                                        this.child(
+                                            map_control("map-card-zoom", "Zoom to cluster")
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(|this, _, _, cx| {
+                                                        this.zoom_to_map_card(cx);
+                                                        cx.stop_propagation();
+                                                    }),
+                                                ),
+                                        )
+                                    },
+                                )
+                                .when(card.page_count() > 1, |this| {
+                                    this.child(format!(
+                                        "Page {} of {}",
+                                        card.page + 1,
+                                        card.page_count()
+                                    ))
+                                    .child(map_control("map-card-previous", "←").on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.navigate_map_card(-1, cx);
+                                            cx.stop_propagation();
+                                        }),
+                                    ))
+                                    .child(map_control("map-card-next", "→").on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.navigate_map_card(1, cx);
+                                            cx.stop_propagation();
+                                        }),
+                                    ))
+                                }),
+                        ),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn activate_map_marker(
+        &mut self,
+        coordinate: metadata::GeoCoordinate,
+        photo_indices: Vec<usize>,
+        cluster_id: Option<usize>,
+        count: usize,
+        expansion_zoom: Option<u8>,
+        cx: &mut Context<Self>,
+    ) {
+        let direct_indices = cluster_id.is_none().then_some(photo_indices.clone());
+        let dense_indices = cluster_id
+            .and_then(|cluster_id| {
+                self.map_clusters
+                    .borrow()
+                    .as_ref()
+                    .and_then(|(_, clusters)| clusters.as_ref())
+                    .map(|clusters| {
+                        clusters.cluster_leaves_page(cluster_id, MAP_GALLERY_PAGE_SIZE, 0)
+                    })
+            })
+            .unwrap_or_else(|| {
+                photo_indices
+                    .into_iter()
+                    .take(MAP_GALLERY_PAGE_SIZE)
+                    .collect()
+            });
+        let items = self.map_card_items(dense_indices);
+        self.map_card = MapCard::new(coordinate, items, count, cluster_id, expansion_zoom);
+        if let Some(card) = &mut self.map_card {
+            card.direct_indices = direct_indices;
+        }
+        if self.map_card.is_some() {
+            self.request_map_card_thumbnail(cx);
+        }
+        cx.notify();
+    }
+
+    fn request_map_card_thumbnail(&mut self, cx: &mut Context<Self>) {
+        let Some(card) = self.map_card.as_ref() else {
+            self.scheduler.clear_scope(MAP_CARD_SCOPE);
+            return;
+        };
+        let requested = card
+            .page_items()
+            .iter()
+            .map(|item| {
+                (
+                    item.path.clone(),
+                    RenderVariant::Thumbnail { width: 120 },
+                    JobPriority::INTERACTIVE,
+                )
+            })
+            .collect();
+        self.replace_render_scope(MAP_CARD_SCOPE, requested, cx);
+    }
+
+    fn navigate_map_card(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if let Some(card) = &mut self.map_card {
+            card.navigate(delta);
+        }
+        let page_request = self.map_card.as_ref().map(|card| {
+            (
+                card.cluster_id,
+                card.direct_indices.clone(),
+                card.page.saturating_mul(MAP_GALLERY_PAGE_SIZE),
+            )
+        });
+        if let Some((cluster_id, direct_indices, offset)) = page_request {
+            let dense_indices = if let Some(cluster_id) = cluster_id {
+                self.map_clusters
+                    .borrow()
+                    .as_ref()
+                    .and_then(|(_, clusters)| clusters.as_ref())
+                    .map(|clusters| {
+                        clusters.cluster_leaves_page(cluster_id, MAP_GALLERY_PAGE_SIZE, offset)
+                    })
+                    .unwrap_or_default()
+            } else {
+                direct_indices
+                    .unwrap_or_default()
+                    .into_iter()
+                    .skip(offset)
+                    .take(MAP_GALLERY_PAGE_SIZE)
+                    .collect()
+            };
+            let items = self.map_card_items(dense_indices);
+            if let Some(card) = &mut self.map_card {
+                card.items = items;
+            }
+        }
+        self.request_map_card_thumbnail(cx);
+        cx.notify();
+    }
+
+    fn map_card_items(&self, dense_indices: Vec<usize>) -> Vec<MapCardItem> {
+        let selected_images = self.selected_images();
+        let located_images = self.selected_located_images();
+        dense_indices
+            .into_iter()
+            .filter_map(|dense| located_images.get(dense))
+            .filter_map(|(index, _)| {
+                selected_images
+                    .get(*index)
+                    .cloned()
+                    .map(|path| MapCardItem { path })
+            })
+            .collect()
+    }
+
+    fn zoom_to_map_card(&mut self, cx: &mut Context<Self>) {
+        let Some(card) = &self.map_card else {
+            return;
+        };
+        let Some(expansion_zoom) = card.expansion_zoom else {
+            return;
+        };
+        self.map_camera.center = card.coordinate;
+        self.map_camera.zoom = f64::from(expansion_zoom)
+            .max(self.map_camera.zoom + 1.0)
+            .min(20.0);
+        self.map_fit_node = None;
+        self.map_pending_fit = None;
+        self.dismiss_map_card();
+        self.request_map_render(cx);
+        cx.notify();
+    }
+
+    fn dismiss_map_card(&mut self) {
+        self.map_card = None;
+        self.scheduler.clear_scope(MAP_CARD_SCOPE);
+    }
+
+    fn map_mouse_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.dismiss_map_card();
+        self.map_drag_last = Some((f32::from(event.position.x), f32::from(event.position.y)));
+        self.map_drag_moved = false;
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn map_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if !event.dragging() {
+            return;
+        }
+        let position = (f32::from(event.position.x), f32::from(event.position.y));
+        let Some(previous) = self.map_drag_last.replace(position) else {
+            return;
+        };
+        let delta_x = position.0 - previous.0;
+        let delta_y = position.1 - previous.1;
+        if delta_x == 0.0 && delta_y == 0.0 {
+            return;
+        }
+        self.map_drag_moved = true;
+        let world_pixels = 256.0 * 2_f64.powf(self.map_camera.zoom);
+        let (center_x, center_y) = map::mercator_project(self.map_camera.center);
+        if let Some(center) = map::mercator_unproject(
+            center_x - f64::from(delta_x) / world_pixels,
+            center_y - f64::from(delta_y) / world_pixels,
+        ) {
+            self.map_camera.center = center;
+        }
+        self.map_fit_node = None;
+        self.map_pending_fit = None;
+        cx.notify();
+    }
+
+    fn map_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.finish_map_drag(cx);
+    }
+
+    fn finish_map_drag(&mut self, cx: &mut Context<Self>) {
+        if self.map_drag_last.take().is_some() {
+            if self.map_drag_moved {
+                self.request_map_render(cx);
+            }
+            self.map_drag_moved = false;
+            cx.notify();
+        }
+    }
+
+    fn map_scroll_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let delta = f32::from(event.delta.pixel_delta(px(20.0)).y);
+        if delta.abs() < 1.0 {
+            return;
+        }
+        cx.stop_propagation();
+        let zoom_delta = (-f64::from(delta) / 120.0).clamp(-1.0, 1.0);
+        let anchor = (
+            f64::from(event.position.x) - f64::from(self.map_view_origin.0),
+            f64::from(event.position.y) - f64::from(self.map_view_origin.1),
+        );
+        self.map_camera =
+            zoom_map_camera(self.map_camera, zoom_delta, anchor, self.map_render_size);
+        self.map_fit_node = None;
+        self.map_pending_fit = None;
+        self.request_map_render(cx);
+        cx.notify();
     }
 
     fn start_recursive_grid(&mut self, cx: &mut Context<Self>) {
@@ -1881,6 +3191,9 @@ impl PictureBrowser {
             status: RecursiveGridStatus::Loading,
             cancelled: cancelled.clone(),
         });
+        self.map_pending_fit = Some(node);
+        self.map_card = None;
+        self.scheduler.clear_scope(MAP_CARD_SCOPE);
         self.reset_grid_prediction();
         if let MainView::Dir(_, selection) = &mut self.main_view {
             *selection = ImageSelection::default();
@@ -1921,6 +3234,13 @@ impl PictureBrowser {
                         Err(error) => RecursiveGridStatus::Error(error.to_string().into()),
                     };
                 }
+                if this.directory_view_mode == DirectoryViewMode::Map
+                    && this.map_pending_fit == Some(node)
+                {
+                    this.fit_map_to_selected_images();
+                    this.map_pending_fit = None;
+                    this.request_map_render(cx);
+                }
                 this.reset_grid_prediction();
                 cx.notify();
             })
@@ -1933,6 +3253,14 @@ impl PictureBrowser {
     fn stop_recursive_grid(&mut self, cx: &mut Context<Self>) {
         if let Some(recursive) = self.recursive_grid.take() {
             recursive.cancelled.store(true, Ordering::Release);
+            self.map_fit_node = None;
+            self.map_pending_fit = None;
+            self.map_card = None;
+            self.scheduler.clear_scope(MAP_CARD_SCOPE);
+            if self.directory_view_mode == DirectoryViewMode::Map {
+                self.fit_map_to_selected_images();
+                self.request_map_render(cx);
+            }
             self.reset_grid_prediction();
             if let MainView::Dir(_, selection) = &mut self.main_view {
                 *selection = ImageSelection::default();
@@ -2008,6 +3336,7 @@ impl PictureBrowser {
                     row_element = row_element.child(
                         div()
                             .id(("thumbnail", index))
+                            .debug_selector(move || format!("#thumbnail-{index}"))
                             .w(px(self.thumbnail_width as f32))
                             .h(px(tile_height))
                             .flex_none()
@@ -2152,6 +3481,7 @@ impl PictureBrowser {
                 let toggle_node = row.node;
                 div()
                     .id(("directory", row_ix))
+                    .debug_selector(move || format!("#directory-{row_ix}"))
                     .flex()
                     .items_center()
                     .h(px(30.0))
@@ -2245,6 +3575,71 @@ impl PictureBrowser {
         .detach();
     }
 
+    fn map_cache_usage(&self) -> u64 {
+        let path = self.settings.cache_root.join("map/ambient.sqlite3");
+        [
+            path.clone(),
+            path.with_extension("sqlite3-wal"),
+            path.with_extension("sqlite3-shm"),
+        ]
+        .iter()
+        .filter_map(|path| std::fs::metadata(path).ok())
+        .map(|metadata| metadata.len())
+        .sum()
+    }
+
+    fn clear_map_cache(&mut self, cx: &mut Context<Self>) {
+        let path = self.settings.cache_root.join("map/ambient.sqlite3");
+        let epoch = self.map_render_epoch.wrapping_add(1);
+        self.map_render_epoch = epoch;
+        self.map_render_generation.store(epoch, Ordering::Release);
+        self.map_network_stats = Default::default();
+        self.map_render = MapRenderState::Empty;
+        self.map_job = None;
+        self.map_cache_clearing = true;
+        self.settings_status = Some("Clearing downloaded map tiles…".to_owned());
+        let retry_executor = cx.background_executor().clone();
+        let clearing = cx.background_executor().spawn(async move {
+            let _render_guard = loop {
+                if MAP_RENDER_BUSY
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    break MapRenderGuard;
+                }
+                retry_executor.timer(Duration::from_millis(16)).await;
+            };
+            for candidate in [
+                path.clone(),
+                path.with_extension("sqlite3-wal"),
+                path.with_extension("sqlite3-shm"),
+            ] {
+                match std::fs::remove_file(candidate) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(format!("Could not clear map cache: {error}")),
+                }
+            }
+            Ok::<_, String>(())
+        });
+        cx.spawn(async move |this, cx| {
+            let result = clearing.await;
+            this.update(cx, |this, cx| {
+                this.map_cache_clearing = false;
+                this.settings_status = Some(match result {
+                    Ok(()) => "Downloaded map tiles cleared.".to_owned(),
+                    Err(error) => error,
+                });
+                if this.directory_view_mode == DirectoryViewMode::Map {
+                    this.request_map_render(cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn save_settings(&mut self, cx: &mut Context<Self>) {
         let Some(draft) = self.settings_draft.clone() else {
             return;
@@ -2266,6 +3661,9 @@ impl PictureBrowser {
                 } else {
                     "Settings saved. Restart Rekesz to apply service and library changes."
                 }.into());
+                if self.directory_view_mode == DirectoryViewMode::Map {
+                    self.request_map_render(cx);
+                }
             }
             Err(error) => {
                 self.settings_status = Some(format!("Could not save settings: {error:#}"))
@@ -2282,6 +3680,13 @@ impl PictureBrowser {
             SettingsNumber::ImageCacheSize => &mut draft.image_cache_size,
             SettingsNumber::JobParallelism => &mut draft.job_parallelism,
             SettingsNumber::RawParallelism => &mut draft.raw_parallelism,
+            SettingsNumber::MapCacheGiB => {
+                let gib = 1024_u64.pow(3);
+                let current = draft.map_cache_bytes.div_ceil(gib).max(1);
+                draft.map_cache_bytes = current.saturating_add_signed(delta as i64).max(1) * gib;
+                cx.notify();
+                return;
+            }
         };
         *value = value.saturating_add_signed(delta).max(1);
         if draft.raw_parallelism > draft.job_parallelism {
@@ -2370,6 +3775,9 @@ impl PictureBrowser {
                         this.previews.clear();
                         this.raw_previews.clear();
                         this.thumbnails.clear();
+                        if this.map_card.is_some() {
+                            this.request_map_card_thumbnail(cx);
+                        }
                     }
                     Err(error) => eprintln!("cannot import Lightroom catalog: {error:#}"),
                 }
@@ -2402,6 +3810,46 @@ impl PictureBrowser {
 
     fn set_subtree_hidden(&mut self, path: PathBuf, hidden: bool, cx: &mut Context<Self>) {
         self.path_context_menu = None;
+        if !self.hidden_subtrees_loaded {
+            if !self.hidden_save_in_flight {
+                self.hidden_save_in_flight = true;
+                let root = self.model.node(self.model.root()).path.to_path_buf();
+                let loading = cx
+                    .background_executor()
+                    .spawn(async move { catalog::load_hidden_subtrees(&root) });
+                cx.spawn(async move |this, cx| {
+                    let result = loading.await;
+                    this.update(cx, |this, cx| {
+                        this.hidden_save_in_flight = false;
+                        match result {
+                            Ok(hidden) => {
+                                this.hidden_subtrees = hidden;
+                                this.hidden_subtrees_loaded = true;
+                                this.rebuild_visible();
+                                this.settings_status =
+                                    Some("Hidden folders loaded; repeat your change.".to_owned());
+                            }
+                            Err(error) => {
+                                this.settings_status =
+                                    Some(format!("Could not load hidden folders: {error:#}"));
+                            }
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+            self.settings_status = Some("Loading hidden folders; try again shortly.".to_owned());
+            cx.notify();
+            return;
+        }
+        if self.hidden_save_in_flight {
+            self.settings_status =
+                Some("A hidden-folder change is already being saved.".to_owned());
+            cx.notify();
+            return;
+        }
         let mut desired = self.hidden_subtrees.clone();
         if hidden {
             if desired.iter().any(|ancestor| path.starts_with(ancestor)) {
@@ -2414,29 +3862,45 @@ impl PictureBrowser {
             desired.remove(&path);
         }
         let root = self.model.node(self.model.root()).path.to_path_buf();
-        let persisted = desired.clone();
+        self.hidden_save_in_flight = true;
         let saving = cx
             .background_executor()
-            .spawn(async move { catalog::save_hidden_subtrees(&root, &persisted) });
+            .spawn(async move { catalog::save_hidden_subtrees(&root, &desired).map(|()| desired) });
         cx.spawn(async move |this, cx| {
             let result = saving.await;
             this.update(cx, |this, cx| {
+                this.hidden_save_in_flight = false;
                 match result {
-                    Ok(()) => {
+                    Ok(desired) => {
+                        let preserve_fit = this.map_pending_fit == Some(this.selected)
+                            || this.map_fit_node == Some(this.selected);
+                        let restart_recursive = this.recursive_grid.is_some();
                         if let Some(recursive) = this.recursive_grid.take() {
                             recursive.cancelled.store(true, Ordering::Release);
                             this.reset_grid_prediction();
                         }
+                        this.map_card = None;
+                        this.scheduler.clear_scope(MAP_CARD_SCOPE);
                         this.hidden_subtrees = desired;
                         this.rebuild_visible();
+                        if restart_recursive {
+                            this.start_recursive_grid(cx);
+                            if !preserve_fit {
+                                this.map_pending_fit = None;
+                            }
+                        }
                     }
-                    Err(error) => eprintln!("cannot save hidden subtrees: {error:#}"),
+                    Err(error) => {
+                        this.settings_status =
+                            Some(format!("Could not save hidden folders: {error:#}"));
+                    }
                 }
                 cx.notify();
             })
             .ok();
         })
         .detach();
+        cx.notify();
     }
 
     fn export_image(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -2521,6 +3985,12 @@ impl PictureBrowser {
 
     fn toggle_developed(&mut self, _: &ToggleDeveloped, _: &mut Window, cx: &mut Context<Self>) {
         self.developed = !self.developed;
+        if self.map_card.is_some()
+            && self.directory_view_mode == DirectoryViewMode::Map
+            && matches!(self.main_view, MainView::Dir(_, _))
+        {
+            self.request_map_card_thumbnail(cx);
+        }
         cx.notify();
     }
 
@@ -2639,7 +4109,41 @@ impl PictureBrowser {
     ) -> Vec<gpui::AnyElement> {
         range
             .filter_map(|index| {
-                let job = self.job_queue_snapshot.jobs.get(index)?;
+                if let Some(map_job) = &self.map_job
+                    && index == 0
+                {
+                    let status = match map_job.status {
+                        MapJobStatus::Queued => "QUEUE",
+                        MapJobStatus::Running => "RUN",
+                    };
+                    return Some(
+                        div()
+                            .id("map-job-queue-row")
+                            .debug_selector(|| "#map-job-queue-row".to_owned())
+                            .h(px(58.0))
+                            .px_3()
+                            .py_2()
+                            .border_b_1()
+                            .border_color(rgb(0x30343d))
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(0xe1e5ec))
+                                    .child("Visible map tiles"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .truncate()
+                                    .text_color(rgb(0x9da7b6))
+                                    .child(format!("{status} · {}", map_job.label)),
+                            )
+                            .into_any_element(),
+                    );
+                }
+                let scheduler_index = index.saturating_sub(usize::from(self.map_job.is_some()));
+                let job = self.job_queue_snapshot.jobs.get(scheduler_index)?;
                 let status = match job.status {
                     JobSnapshotStatus::Running => "RUN",
                     JobSnapshotStatus::Queued => "QUEUE",
@@ -2797,7 +4301,7 @@ fn collect_recursive_images(
     pair_preference: RawJpegPreference,
     hidden_subtrees: &HashSet<PathBuf>,
     cancelled: Arc<AtomicBool>,
-) -> Result<Vec<PathBuf>, std::io::Error> {
+) -> Result<RecursiveImages, std::io::Error> {
     let mut pending = vec![root];
     let mut visited = HashSet::new();
     let mut images = Vec::new();
@@ -2825,7 +4329,18 @@ fn collect_recursive_images(
     }
     let mut metadata = metadata_loader.load_directory(images, cancelled);
     discovery::sort_metadata(&mut metadata);
-    Ok(metadata.into_iter().map(|entry| entry.path).collect())
+    let coordinates = metadata
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .coordinate
+                .map(|coordinate| (entry.path.clone(), coordinate))
+        })
+        .collect();
+    Ok(RecursiveImages {
+        paths: metadata.into_iter().map(|entry| entry.path).collect(),
+        coordinates,
+    })
 }
 
 fn speculative_indices(
@@ -2866,7 +4381,8 @@ impl Render for PictureBrowser {
             .jobs
             .iter()
             .filter(|job| !job.cancelled)
-            .count();
+            .count()
+            + usize::from(self.map_job.is_some());
         if self.show_job_queue || scheduler_jobs > 0 || self.work.active > 0 {
             self.schedule_scheduler_refresh(cx);
         }
@@ -2882,6 +4398,21 @@ impl Render for PictureBrowser {
         let main_width =
             (f32::from(window.viewport_size().width) - self.sidebar_width - inspector_width - 29.0)
                 .max(self.thumbnail_width as f32);
+        let menu_height = if USE_IN_WINDOW_MENU { 29.0 } else { 0.0 };
+        let map_width = main_width.round().max(1.0) as u32;
+        let map_height = (f32::from(window.viewport_size().height) - menu_height - 44.0)
+            .round()
+            .max(1.0) as u32;
+        self.map_view_origin = (self.sidebar_width + 5.0, menu_height + 44.0);
+        if self.directory_view_mode == DirectoryViewMode::Map
+            && self.map_render_size != (map_width, map_height)
+        {
+            self.map_render_size = (map_width, map_height);
+            if self.map_fit_node == Some(self.selected) {
+                self.fit_map_to_selected_images();
+            }
+            cx.defer_in(window, |this, _, cx| this.request_map_render(cx));
+        }
         self.grid_columns = ((main_width + THUMBNAIL_GAP)
             / (self.thumbnail_width as f32 + THUMBNAIL_GAP))
             .floor()
@@ -2992,6 +4523,7 @@ impl Render for PictureBrowser {
                     true,
                     div()
                         .id("image-viewport")
+                        .debug_selector(|| "#image-viewport".to_owned())
                         .size_full()
                         .relative()
                         .overflow_hidden()
@@ -3104,6 +4636,7 @@ impl Render for PictureBrowser {
                                 .child(
                                     div()
                                         .id("show-images-recursively")
+                                        .debug_selector(|| "#show-images-recursively".to_owned())
                                         .px_4()
                                         .py_2()
                                         .rounded_sm()
@@ -3124,6 +4657,11 @@ impl Render for PictureBrowser {
                             .into_any_element(),
                         DirectoryContents::Loaded(_) => thumbnail_grid(),
                     }
+                };
+                let directory_content = if self.directory_view_mode == DirectoryViewMode::Map {
+                    self.render_map_view(cx)
+                } else {
+                    grid_content
                 };
                 let content = div()
                     .size_full()
@@ -3146,6 +4684,7 @@ impl Render for PictureBrowser {
                                 .child(
                                     div()
                                         .id("exit-recursive-grid")
+                                        .debug_selector(|| "#exit-recursive-grid".to_owned())
                                         .px_3()
                                         .py_1()
                                         .rounded_sm()
@@ -3177,6 +4716,7 @@ impl Render for PictureBrowser {
                                 .child(
                                     div()
                                         .id("apply-capture-time-order")
+                                        .debug_selector(|| "#apply-capture-time-order".to_owned())
                                         .ml_4()
                                         .px_3()
                                         .py_1()
@@ -3196,8 +4736,11 @@ impl Render for PictureBrowser {
                             .flex_1()
                             .min_h_0()
                             .relative()
-                            .child(grid_content)
-                            .child(grid_scrollbar),
+                            .child(directory_content)
+                            .when(
+                                self.directory_view_mode == DirectoryViewMode::Grid,
+                                |this| this.child(grid_scrollbar),
+                            ),
                     )
                     .into_any_element();
                 (
@@ -3212,87 +4755,180 @@ impl Render for PictureBrowser {
                 )
             }
         };
-        let main_view = div()
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .flex()
-            .flex_col()
-            .track_focus(&self.main_focus)
-            .key_context("MainView")
-            .on_action(cx.listener(Self::open_selected_image))
-            .on_action(cx.listener(Self::close_image))
-            .on_action(cx.listener(Self::grid_left))
-            .on_action(cx.listener(Self::grid_right))
-            .on_action(cx.listener(Self::grid_up))
-            .on_action(cx.listener(Self::grid_down))
-            .on_action(cx.listener(Self::grid_extend_left))
-            .on_action(cx.listener(Self::grid_extend_right))
-            .on_action(cx.listener(Self::grid_extend_up))
-            .on_action(cx.listener(Self::grid_extend_down))
-            .bg(rgb(0x101217))
-            .child(
-                div()
-                    .h(px(44.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .px_4()
-                    .border_b_1()
-                    .border_color(rgb(0x30343d))
-                    .text_sm()
-                    .text_color(rgb(0xaeb4bf))
-                    .when(show_back, |this| {
-                        this.child(
+        let main_view =
+            div()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .flex()
+                .flex_col()
+                .relative()
+                .track_focus(&self.main_focus)
+                .key_context("MainView")
+                .on_action(cx.listener(Self::open_selected_image))
+                .on_action(cx.listener(Self::close_image))
+                .on_action(cx.listener(Self::grid_left))
+                .on_action(cx.listener(Self::grid_right))
+                .on_action(cx.listener(Self::grid_up))
+                .on_action(cx.listener(Self::grid_down))
+                .on_action(cx.listener(Self::grid_extend_left))
+                .on_action(cx.listener(Self::grid_extend_right))
+                .on_action(cx.listener(Self::grid_extend_up))
+                .on_action(cx.listener(Self::grid_extend_down))
+                .bg(rgb(0x101217))
+                .child(
+                    div()
+                        .h(px(44.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .px_4()
+                        .border_b_1()
+                        .border_color(rgb(0x30343d))
+                        .text_sm()
+                        .text_color(rgb(0xaeb4bf))
+                        .when(show_back, |this| {
+                            this.child(
+                                div()
+                                    .id("back-to-directory")
+                                    .mr_3()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .bg(rgb(0x30343d))
+                                    .hover(|this| this.bg(rgb(0x445066)))
+                                    .child("← Back")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.close_image(&CloseImage, window, cx);
+                                    })),
+                            )
+                        })
+                        .child(title)
+                        .child(div().flex_1())
+                        .when(
+                            !show_back
+                                && self.settings.map_switcher_placement
+                                    == config::MapSwitcherPlacement::Header,
+                            |this| {
+                                this.child(
+                                    div()
+                                        .flex()
+                                        .mr_3()
+                                        .rounded_sm()
+                                        .bg(rgb(0x252932))
+                                        .child(
+                                            div()
+                                                .id("show-grid-view")
+                                                .debug_selector(|| "#show-grid-view".to_owned())
+                                                .px_3()
+                                                .py_1()
+                                                .rounded_sm()
+                                                .bg(rgb(
+                                                    if self.directory_view_mode
+                                                        == DirectoryViewMode::Grid
+                                                    {
+                                                        0x46658c
+                                                    } else {
+                                                        0x30343d
+                                                    },
+                                                ))
+                                                .child("Grid")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.set_directory_view_mode(
+                                                        DirectoryViewMode::Grid,
+                                                        cx,
+                                                    );
+                                                })),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("show-map-view")
+                                                .debug_selector(|| "#show-map-view".to_owned())
+                                                .px_3()
+                                                .py_1()
+                                                .rounded_sm()
+                                                .bg(rgb(
+                                                    if self.directory_view_mode
+                                                        == DirectoryViewMode::Map
+                                                    {
+                                                        0x46658c
+                                                    } else {
+                                                        0x30343d
+                                                    },
+                                                ))
+                                                .child("Map")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.set_directory_view_mode(
+                                                        DirectoryViewMode::Map,
+                                                        cx,
+                                                    );
+                                                })),
+                                        ),
+                                )
+                            },
+                        )
+                        .child(
                             div()
-                                .id("back-to-directory")
-                                .mr_3()
+                                .id("toggle-developed")
+                                .debug_selector(|| "#toggle-developed".to_owned())
                                 .px_2()
                                 .py_1()
                                 .rounded_sm()
-                                .bg(rgb(0x30343d))
+                                .bg(rgb(if has_active_recipe {
+                                    0x36547a
+                                } else {
+                                    0x30343d
+                                }))
                                 .hover(|this| this.bg(rgb(0x445066)))
-                                .child("← Back")
+                                .child(if has_active_recipe {
+                                    "Developed"
+                                } else if self.developed {
+                                    "Baseline (no adjustments)"
+                                } else {
+                                    "Baseline"
+                                })
                                 .on_click(cx.listener(|this, _, window, cx| {
-                                    this.close_image(&CloseImage, window, cx);
+                                    this.toggle_developed(&ToggleDeveloped, window, cx);
                                 })),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .text_color(rgb(0x8d96a5))
+                        .child(main_content),
+                )
+                .when(
+                    !show_back
+                        && self.settings.map_switcher_placement
+                            == config::MapSwitcherPlacement::Floating,
+                    |this| {
+                        this.child(
+                            div()
+                                .absolute()
+                                .bottom(px(18.0))
+                                .left_1_2()
+                                .flex()
+                                .p_1()
+                                .rounded_md()
+                                .bg(gpui::rgba(0x202630ee))
+                                .child(map_control("floating-grid-view", "Grid").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.set_directory_view_mode(DirectoryViewMode::Grid, cx);
+                                    }),
+                                ))
+                                .child(map_control("floating-map-view", "Map").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.set_directory_view_mode(DirectoryViewMode::Map, cx);
+                                    }),
+                                )),
                         )
-                    })
-                    .child(title)
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .id("toggle-developed")
-                            .px_2()
-                            .py_1()
-                            .rounded_sm()
-                            .bg(rgb(if has_active_recipe {
-                                0x36547a
-                            } else {
-                                0x30343d
-                            }))
-                            .hover(|this| this.bg(rgb(0x445066)))
-                            .child(if has_active_recipe {
-                                "Developed"
-                            } else if self.developed {
-                                "Baseline (no adjustments)"
-                            } else {
-                                "Baseline"
-                            })
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.toggle_developed(&ToggleDeveloped, window, cx);
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .text_color(rgb(0x8d96a5))
-                    .child(main_content),
-            );
+                    },
+                );
         let splitter = div()
             .id("sidebar-splitter")
+            .debug_selector(|| "#sidebar-splitter".to_owned())
             .w(px(5.0))
             .h_full()
             .flex_none()
@@ -3322,6 +4958,7 @@ impl Render for PictureBrowser {
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     this.resizing_sidebar = false;
+                    this.finish_map_drag(cx);
                     cx.notify();
                 }),
             )
@@ -3353,13 +4990,21 @@ impl Render for PictureBrowser {
                                 .child("Job queue")
                                 .child(div().text_xs().text_color(rgb(0x9da7b6)).child(format!(
                                     "{} running · {} queued",
-                                    self.job_queue_snapshot.running, self.job_queue_snapshot.queued
+                                    self.job_queue_snapshot.running
+                                        + usize::from(self.map_job.as_ref().is_some_and(|job| {
+                                            job.status == MapJobStatus::Running
+                                        })),
+                                    self.job_queue_snapshot.queued
+                                        + usize::from(self.map_job.as_ref().is_some_and(|job| {
+                                            job.status == MapJobStatus::Queued
+                                        }))
                                 ))),
                         )
                         .child(
                             uniform_list(
                                 "job-queue-rows",
-                                self.job_queue_snapshot.jobs.len(),
+                                self.job_queue_snapshot.jobs.len()
+                                    + usize::from(self.map_job.is_some()),
                                 cx.processor(Self::render_job_queue_rows),
                             )
                             .flex_1()
@@ -3369,13 +5014,17 @@ impl Render for PictureBrowser {
                         ),
                 )
             });
-        let progress_active = self.work.active > 0 || scheduler_jobs > 0;
+        let progress_active = self.work.active > 0 || scheduler_jobs > 0 || self.map_job.is_some();
         let progress = if self.work.active > 0 {
             self.work.fraction().clamp(0.08, 1.0)
         } else {
             0.35
         };
-        let progress_label = scheduler_progress_label(&self.job_queue_snapshot)
+        let progress_label = self
+            .map_job
+            .as_ref()
+            .map(map_job_progress_label)
+            .or_else(|| scheduler_progress_label(&self.job_queue_snapshot))
             .or_else(|| self.work.current_activity().map(str::to_owned))
             .unwrap_or_else(|| "Finishing background work…".to_owned());
         let menu_bar = div()
@@ -3392,6 +5041,7 @@ impl Render for PictureBrowser {
             .child(
                 div()
                     .id("file-menu-button")
+                    .debug_selector(|| "#file-menu-button".to_owned())
                     .h(px(24.0))
                     .px_2()
                     .flex()
@@ -3410,6 +5060,7 @@ impl Render for PictureBrowser {
             .child(
                 div()
                     .id("view-menu-button")
+                    .debug_selector(|| "#view-menu-button".to_owned())
                     .h(px(24.0))
                     .px_2()
                     .flex()
@@ -3434,6 +5085,7 @@ impl Render for PictureBrowser {
             .when(progress_active, |this| {
                 this.child(
                     div()
+                        .debug_selector(|| "#background-progress".to_owned())
                         .absolute()
                         .left_0()
                         .right_0()
@@ -3500,6 +5152,11 @@ impl Render for PictureBrowser {
                 self.raw_previews.stats(),
                 self.thumbnails.stats(),
                 self.disk_cache_usage.clone(),
+                MapCacheStatistics {
+                    usage: self.map_cache_usage(),
+                    capacity: self.settings.map_cache_bytes,
+                    network: self.map_network_stats,
+                },
                 cx,
             )
         });
@@ -3549,6 +5206,7 @@ impl Render for PictureBrowser {
                         .child(
                             div()
                                 .id("import-lightroom-menu-item")
+                                .debug_selector(|| "#import-lightroom-menu-item".to_owned())
                                 .h(px(28.0))
                                 .px_2()
                                 .flex()
@@ -3564,6 +5222,7 @@ impl Render for PictureBrowser {
                         .child(
                             div()
                                 .id("cache-statistics-menu-item")
+                                .debug_selector(|| "#cache-statistics-menu-item".to_owned())
                                 .h(px(28.0))
                                 .px_2()
                                 .flex()
@@ -3579,6 +5238,7 @@ impl Render for PictureBrowser {
                         .child(
                             div()
                                 .id("settings-menu-item")
+                                .debug_selector(|| "#settings-menu-item".to_owned())
                                 .h(px(28.0))
                                 .px_2()
                                 .flex()
@@ -3678,6 +5338,7 @@ impl Render for PictureBrowser {
                             .child(
                                 div()
                                     .id("copy-absolute-path-menu-item")
+                                    .debug_selector(|| "#copy-absolute-path-menu-item".to_owned())
                                     .h(px(28.0))
                                     .px_2()
                                     .flex()
@@ -3698,6 +5359,9 @@ impl Render for PictureBrowser {
                                 this.child(
                                     div()
                                         .id("toggle-hidden-subtree-menu-item")
+                                        .debug_selector(|| {
+                                            "#toggle-hidden-subtree-menu-item".to_owned()
+                                        })
                                         .h(px(28.0))
                                         .px_2()
                                         .flex()
@@ -3727,6 +5391,7 @@ impl Render for PictureBrowser {
                                 this.child(
                                     div()
                                         .id("export-png-menu-item")
+                                        .debug_selector(|| "#export-png-menu-item".to_owned())
                                         .h(px(28.0))
                                         .px_2()
                                         .flex()
@@ -3774,6 +5439,7 @@ fn settings_number_row(
                 .child(
                     div()
                         .id(SharedString::from(format!("settings-minus-{label}")))
+                        .debug_selector(move || format!("#settings-minus-{label}"))
                         .px_3()
                         .py_1()
                         .rounded_sm()
@@ -3788,6 +5454,7 @@ fn settings_number_row(
                 .child(
                     div()
                         .id(SharedString::from(format!("settings-plus-{label}")))
+                        .debug_selector(move || format!("#settings-plus-{label}"))
                         .px_3()
                         .py_1()
                         .rounded_sm()
@@ -3799,6 +5466,22 @@ fn settings_number_row(
                         })),
                 ),
         )
+}
+
+fn map_control(id: &'static str, label: &'static str) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .debug_selector(|| format!("#{id}"))
+        .min_w(px(34.0))
+        .px_2()
+        .py_1()
+        .rounded_sm()
+        .bg(rgb(0x303b43))
+        .text_color(rgb(0xe0e7ea))
+        .text_center()
+        .cursor_pointer()
+        .hover(|this| this.bg(rgb(0x465761)))
+        .child(label)
 }
 
 fn render_settings_dialog(
@@ -3858,6 +5541,7 @@ fn render_settings_dialog(
                                 .child(
                                     div()
                                         .id("settings-browse-root")
+                                        .debug_selector(|| "#settings-browse-root".to_owned())
                                         .px_3()
                                         .py_1()
                                         .rounded_sm()
@@ -3888,6 +5572,101 @@ fn render_settings_dialog(
                     SettingsNumber::RawParallelism,
                     cx,
                 ))
+                .child(settings_number_row(
+                    "Downloaded map cache (GiB)",
+                    draft.map_cache_bytes.div_ceil(1024_u64.pow(3)) as usize,
+                    SettingsNumber::MapCacheGiB,
+                    cx,
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .py_2()
+                        .border_b_1()
+                        .border_color(rgb(0x30343d))
+                        .child(
+                            div()
+                                .max_w(px(430.0))
+                                .child("Online map detail")
+                                .child(
+                                    div()
+                                        .mt_1()
+                                        .text_xs()
+                                        .text_color(rgb(0x9da7b6))
+                                        .child("When enabled, only visible tile coordinates are sent to OpenFreeMap. Photos and metadata never leave Rekesz."),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("settings-online-map")
+                                .debug_selector(|| "#settings-online-map".to_owned())
+                                .px_3()
+                                .py_1()
+                                .rounded_sm()
+                                .bg(rgb(0x343943))
+                                .hover(|this| this.bg(rgb(0x465064)))
+                                .child(match draft.online_map_permission {
+                                    config::OnlineMapPermission::Enabled => "Enabled",
+                                    config::OnlineMapPermission::Unknown
+                                    | config::OnlineMapPermission::Disabled => "Keep offline",
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let permission = if this.settings.online_map_permission
+                                        == config::OnlineMapPermission::Enabled
+                                    {
+                                        config::OnlineMapPermission::Disabled
+                                    } else {
+                                        config::OnlineMapPermission::Enabled
+                                    };
+                                    this.set_online_map_permission(permission, cx);
+                                })),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .py_2()
+                        .border_b_1()
+                        .border_color(rgb(0x30343d))
+                        .child("Grid/Map switcher")
+                        .child(
+                            div()
+                                .id("settings-map-switcher-placement")
+                                .debug_selector(|| {
+                                    "#settings-map-switcher-placement".to_owned()
+                                })
+                                .px_3()
+                                .py_1()
+                                .rounded_sm()
+                                .bg(rgb(0x343943))
+                                .hover(|this| this.bg(rgb(0x465064)))
+                                .child(match draft.map_switcher_placement {
+                                    config::MapSwitcherPlacement::Header => "Top header",
+                                    config::MapSwitcherPlacement::Floating => "Bottom floating",
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let placement = match this.settings.map_switcher_placement {
+                                        config::MapSwitcherPlacement::Header => config::MapSwitcherPlacement::Floating,
+                                        config::MapSwitcherPlacement::Floating => config::MapSwitcherPlacement::Header,
+                                    };
+                                    let mut settings = this.settings.clone();
+                                    settings.map_switcher_placement = placement;
+                                    if let Err(error) = config::save(&this.settings_path, &settings) {
+                                        this.settings_status = Some(format!("Could not save switcher placement: {error:#}"));
+                                    } else {
+                                        this.settings = settings;
+                                        if let Some(draft) = &mut this.settings_draft {
+                                            draft.map_switcher_placement = placement;
+                                        }
+                                    }
+                                    cx.notify();
+                                })),
+                        ),
+                )
                 .child(
                     div()
                         .flex()
@@ -3900,6 +5679,7 @@ fn render_settings_dialog(
                         .child(
                             div()
                                 .id("settings-pair-preference")
+                                .debug_selector(|| "#settings-pair-preference".to_owned())
                                 .px_3()
                                 .py_1()
                                 .rounded_sm()
@@ -3942,6 +5722,7 @@ fn render_settings_dialog(
                             .child(
                                 div()
                                     .id("settings-browse-cache")
+                                    .debug_selector(|| "#settings-browse-cache".to_owned())
                                     .px_3()
                                     .py_1()
                                     .rounded_sm()
@@ -3972,6 +5753,7 @@ fn render_settings_dialog(
                         .child(
                             div()
                                 .id("settings-cancel")
+                                .debug_selector(|| "#settings-cancel".to_owned())
                                 .px_4()
                                 .py_2()
                                 .rounded_sm()
@@ -3987,6 +5769,7 @@ fn render_settings_dialog(
                         .child(
                             div()
                                 .id("settings-save")
+                                .debug_selector(|| "#settings-save".to_owned())
                                 .px_4()
                                 .py_2()
                                 .rounded_sm()
@@ -4005,6 +5788,7 @@ fn render_cache_statistics_dialog(
     raw_previews: preview::PreviewCacheStats,
     thumbnails: preview::PreviewCacheStats,
     disk_usage: Option<Result<rendering::pipeline::DiskCacheUsage, Arc<str>>>,
+    map_cache: MapCacheStatistics,
     cx: &mut Context<PictureBrowser>,
 ) -> gpui::Div {
     let requests = pipeline.cache_hits + pipeline.cache_misses;
@@ -4041,6 +5825,7 @@ fn render_cache_statistics_dialog(
         .estimated_memory_bytes
         .saturating_add(raw_previews.estimated_memory_bytes)
         .saturating_add(thumbnails.estimated_memory_bytes);
+    let map_cache_fraction = cache_capacity_fraction(map_cache.usage, map_cache.capacity);
     div()
         .absolute()
         .inset_0()
@@ -4070,6 +5855,68 @@ fn render_cache_statistics_dialog(
                 .child(render_disk_cache_usage(disk_usage))
                 .child(div().my_2().border_t_1().border_color(rgb(0x30343d)))
                 .child(row(
+                    "Downloaded map tiles",
+                    format!(
+                        "{} / {}",
+                        format_byte_size(map_cache.usage),
+                        format_byte_size(map_cache.capacity)
+                    ),
+                ))
+                .child(
+                    div()
+                        .id("map-cache-capacity-bar")
+                        .debug_selector(|| "#map-cache-capacity-bar".to_owned())
+                        .h(px(12.0))
+                        .w_full()
+                        .my_1()
+                        .relative()
+                        .overflow_hidden()
+                        .rounded_sm()
+                        .bg(rgb(0x15171c))
+                        .child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .bottom_0()
+                                .left_0()
+                                .w(relative(map_cache_fraction))
+                                .debug_selector(|| "#map-cache-capacity-fill".to_owned())
+                                .bg(if map_cache_fraction >= 0.9 {
+                                    rgb(0xc06052)
+                                } else {
+                                    rgb(0x315b8f)
+                                }),
+                        ),
+                )
+                .child(row("Map cache hits", map_cache.network.hits.to_string()))
+                .child(row(
+                    "Map cache misses",
+                    map_cache.network.misses.to_string(),
+                ))
+                .child(row(
+                    "Map downloads",
+                    map_cache.network.downloads.to_string(),
+                ))
+                .child(row(
+                    "Map revalidations",
+                    map_cache.network.not_modified.to_string(),
+                ))
+                .child(row("Map errors", map_cache.network.errors.to_string()))
+                .child(
+                    div()
+                        .id("clear-downloaded-map-tiles")
+                        .debug_selector(|| "#clear-downloaded-map-tiles".to_owned())
+                        .mt_2()
+                        .px_3()
+                        .py_2()
+                        .rounded_sm()
+                        .bg(rgb(0x593b3b))
+                        .hover(|this| this.bg(rgb(0x754949)))
+                        .child("Clear Downloaded Map Tiles")
+                        .on_click(cx.listener(|this, _, _, cx| this.clear_map_cache(cx))),
+                )
+                .child(div().my_2().border_t_1().border_color(rgb(0x30343d)))
+                .child(row(
                     "Persistent cache hits",
                     pipeline.cache_hits.to_string(),
                 ))
@@ -4096,6 +5943,7 @@ fn render_cache_statistics_dialog(
                     div().mt_4().flex().justify_end().child(
                         div()
                             .id("cache-statistics-close")
+                            .debug_selector(|| "#cache-statistics-close".to_owned())
                             .px_4()
                             .py_2()
                             .rounded_sm()
@@ -4109,6 +5957,13 @@ fn render_cache_statistics_dialog(
                     ),
                 ),
         )
+}
+
+fn cache_capacity_fraction(usage: u64, capacity: u64) -> f32 {
+    if capacity == 0 {
+        return 0.0;
+    }
+    (usage as f64 / capacity as f64).clamp(0.0, 1.0) as f32
 }
 
 fn render_disk_cache_usage(
@@ -4222,25 +6077,7 @@ fn main() -> Result<()> {
     let config = config::from_env()?;
     rendering::assert_hevc_decoder_available()?;
     Application::new().run(move |cx: &mut App| {
-        cx.bind_keys([
-            KeyBinding::new("up", TreeUp, Some("DirectoryTree")),
-            KeyBinding::new("down", TreeDown, Some("DirectoryTree")),
-            KeyBinding::new("left", TreeLeft, Some("DirectoryTree")),
-            KeyBinding::new("right", TreeRight, Some("DirectoryTree")),
-            KeyBinding::new("enter", TreeConfirm, Some("DirectoryTree")),
-            KeyBinding::new("enter", OpenImage, Some("MainView")),
-            KeyBinding::new("escape", CloseImage, Some("MainView")),
-            KeyBinding::new("left", GridLeft, Some("MainView")),
-            KeyBinding::new("right", GridRight, Some("MainView")),
-            KeyBinding::new("up", GridUp, Some("MainView")),
-            KeyBinding::new("down", GridDown, Some("MainView")),
-            KeyBinding::new("shift-left", GridExtendLeft, Some("MainView")),
-            KeyBinding::new("shift-right", GridExtendRight, Some("MainView")),
-            KeyBinding::new("shift-up", GridExtendUp, Some("MainView")),
-            KeyBinding::new("shift-down", GridExtendDown, Some("MainView")),
-            KeyBinding::new("ctrl-shift-j", ToggleJobQueue, None),
-            KeyBinding::new("d", ToggleDeveloped, Some("MainView")),
-        ]);
+        bind_picture_browser_keys(cx);
         cx.set_menus(vec![
             Menu {
                 name: "File".into(),
@@ -4271,6 +6108,28 @@ fn main() -> Result<()> {
         cx.activate(true);
     });
     Ok(())
+}
+
+fn bind_picture_browser_keys(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("up", TreeUp, Some("DirectoryTree")),
+        KeyBinding::new("down", TreeDown, Some("DirectoryTree")),
+        KeyBinding::new("left", TreeLeft, Some("DirectoryTree")),
+        KeyBinding::new("right", TreeRight, Some("DirectoryTree")),
+        KeyBinding::new("enter", TreeConfirm, Some("DirectoryTree")),
+        KeyBinding::new("enter", OpenImage, Some("MainView")),
+        KeyBinding::new("escape", CloseImage, Some("MainView")),
+        KeyBinding::new("left", GridLeft, Some("MainView")),
+        KeyBinding::new("right", GridRight, Some("MainView")),
+        KeyBinding::new("up", GridUp, Some("MainView")),
+        KeyBinding::new("down", GridDown, Some("MainView")),
+        KeyBinding::new("shift-left", GridExtendLeft, Some("MainView")),
+        KeyBinding::new("shift-right", GridExtendRight, Some("MainView")),
+        KeyBinding::new("shift-up", GridExtendUp, Some("MainView")),
+        KeyBinding::new("shift-down", GridExtendDown, Some("MainView")),
+        KeyBinding::new("ctrl-shift-j", ToggleJobQueue, None),
+        KeyBinding::new("d", ToggleDeveloped, Some("MainView")),
+    ]);
 }
 
 #[cfg(test)]
