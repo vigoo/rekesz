@@ -12,8 +12,16 @@ pub(super) fn decode(
 ) -> image::ImageResult<DecodedSource> {
     check_cancelled(cancelled)?;
     match plan.decode() {
-        super::plan::DecodePlan::Heif => heif::decode(plan.request().path.as_path(), cancelled),
-        super::plan::DecodePlan::Raw => raw::decode(plan.request().path.as_path(), cancelled),
+        super::plan::DecodePlan::Heif => heif::decode(
+            plan.request().path.as_path(),
+            cancelled,
+            plan.analysis_memory_budget(),
+        ),
+        super::plan::DecodePlan::Raw => raw::decode(
+            plan.request().path.as_path(),
+            cancelled,
+            plan.analysis_memory_budget(),
+        ),
         super::plan::DecodePlan::Standard { scaled_jpeg } => standard::decode(
             plan.request().path.as_path(),
             plan.request().variant,

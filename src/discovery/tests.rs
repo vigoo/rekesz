@@ -1,5 +1,6 @@
 use super::*;
 use std::{
+    collections::HashSet,
     sync::mpsc,
     thread,
     time::{Duration, Instant, SystemTime},
@@ -317,4 +318,61 @@ fn stale_results_are_ignored() {
         model.node(root).contents,
         DirectoryContents::Loading(active) if active == request
     ));
+}
+
+#[test]
+fn library_inventory_applies_hidden_supported_and_pair_rules() {
+    let root = tempfile::tempdir().unwrap();
+    let visible = root.path().join("visible");
+    let hidden = root.path().join("hidden");
+    fs::create_dir_all(&visible).unwrap();
+    fs::create_dir_all(&hidden).unwrap();
+    fs::write(visible.join("pair.cr3"), b"raw").unwrap();
+    fs::write(visible.join("pair.jpg"), b"jpeg").unwrap();
+    fs::write(visible.join("notes.txt"), b"no").unwrap();
+    fs::write(hidden.join("secret.jpg"), b"hidden").unwrap();
+
+    let inventory = scan_library_inventory(
+        root.path(),
+        &HashSet::from([hidden]),
+        RawJpegPreference::Jpeg,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(inventory, vec![visible.join("pair.jpg")]);
+}
+
+#[test]
+fn library_inventory_progress_reports_traversal_frontier_and_current_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let nested = root.path().join("nested");
+    fs::create_dir(&nested).unwrap();
+    fs::write(nested.join("portrait.jpg"), b"image").unwrap();
+    let mut updates = Vec::new();
+    let images = scan_library_inventory_with_progress(
+        root.path(),
+        &HashSet::new(),
+        RawJpegPreference::Raw,
+        &AtomicBool::new(false),
+        |scanned, pending, images, current| {
+            updates.push((scanned, pending, images, current.to_path_buf()));
+        },
+    )
+    .unwrap();
+    assert_eq!(images, vec![nested.clone().join("portrait.jpg")]);
+    assert_eq!(updates.last(), Some(&(2, 0, 1, nested)));
+}
+
+#[test]
+fn cancelled_library_inventory_is_an_error_not_a_destructive_partial_snapshot() {
+    let root = tempfile::tempdir().unwrap();
+    let cancelled = AtomicBool::new(true);
+    let error = scan_library_inventory(
+        root.path(),
+        &HashSet::new(),
+        RawJpegPreference::Raw,
+        &cancelled,
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
 }

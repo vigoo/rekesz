@@ -32,6 +32,7 @@ pub(super) fn decode(
         source_pipeline: SourcePipeline::Standard,
         photographic: None,
         orientation_applied: Some(orientation.to_exif()),
+        face_transform: crate::rendering::FaceTransform::orientation(orientation.to_exif()),
     })
 }
 
@@ -54,7 +55,11 @@ fn decode_scaled_jpeg(
             max_width,
             max_height,
         } => (max_width, max_height),
-        RenderVariant::Full => unreachable!("full JPEGs use the standard decoder"),
+        RenderVariant::Full
+        | RenderVariant::FaceCrop { .. }
+        | RenderVariant::FaceContext { .. } => {
+            unreachable!("full-resolution JPEGs use the standard decoder")
+        }
     };
     decoder
         .scale(
@@ -103,6 +108,9 @@ fn decode_scaled_jpeg(
         source_pipeline: SourcePipeline::Standard,
         photographic: None,
         orientation_applied: orientation.map(image::metadata::Orientation::to_exif),
+        face_transform: orientation.map_or(crate::rendering::FaceTransform::IDENTITY, |value| {
+            crate::rendering::FaceTransform::orientation(value.to_exif())
+        }),
     })
 }
 

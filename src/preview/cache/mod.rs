@@ -22,8 +22,8 @@ pub struct DecodedPreview {
 
 /// UI-owned cache of GPUI images and in-flight request state.
 pub struct PreviewCache {
-    entries: HashMap<(PathBuf, RenderIdentity), PreviewState>,
-    last_used: HashMap<(PathBuf, RenderIdentity), u64>,
+    entries: HashMap<(PathBuf, RenderIdentity, RenderVariant), PreviewState>,
+    last_used: HashMap<(PathBuf, RenderIdentity, RenderVariant), u64>,
     capacity: usize,
     next_request: RequestId,
     access_clock: u64,
@@ -57,8 +57,38 @@ impl PreviewCache {
 
     pub fn state_for(&self, path: &std::path::Path, identity: RenderIdentity) -> PreviewState {
         self.entries
-            .get(&(path.to_path_buf(), identity))
+            .iter()
+            .find(|((candidate, candidate_identity, _), _)| {
+                candidate == path && *candidate_identity == identity
+            })
+            .map(|(_, state)| state)
             .cloned()
+            .unwrap_or(PreviewState::Unloaded)
+    }
+
+    pub fn state_for_variant(
+        &self,
+        path: &std::path::Path,
+        identity: RenderIdentity,
+        variant: RenderVariant,
+    ) -> PreviewState {
+        self.entries
+            .get(&(path.to_path_buf(), identity, variant))
+            .cloned()
+            .or_else(|| {
+                self.entries
+                    .iter()
+                    .find_map(|((candidate, candidate_identity, _), state)| match state {
+                        PreviewState::Loaded(preview)
+                            if candidate == path
+                                && *candidate_identity == identity
+                                && variant_satisfies(preview.metadata.variant, variant) =>
+                        {
+                            Some(state.clone())
+                        }
+                        _ => None,
+                    })
+            })
             .unwrap_or(PreviewState::Unloaded)
     }
 
@@ -108,22 +138,39 @@ impl PreviewCache {
         variant: RenderVariant,
         identity: RenderIdentity,
     ) -> Option<RequestId> {
-        if matches!(self.state_for(path, identity), PreviewState::Loaded(ref preview) if variant_satisfies(preview.metadata.variant, variant))
-        {
-            self.touch(path, identity);
+        let satisfying = self.entries.iter().find_map(
+            |((candidate, candidate_identity, cached_variant), state)| match state {
+                PreviewState::Loaded(preview)
+                    if candidate == path
+                        && *candidate_identity == identity
+                        && variant_satisfies(preview.metadata.variant, variant) =>
+                {
+                    Some(*cached_variant)
+                }
+                _ => None,
+            },
+        );
+        if let Some(cached_variant) = satisfying {
+            self.touch(path, identity, cached_variant);
             return None;
         }
-        let key = (path.to_path_buf(), identity);
-        if matches!(self.state_for(path, identity), PreviewState::Loaded(_)) {
+        let key = (path.to_path_buf(), identity, variant);
+        if matches!(
+            self.state_for_variant(path, identity, variant),
+            PreviewState::Loaded(_)
+        ) {
             self.entries.remove(&key);
             self.last_used.remove(&key);
         }
-        if !matches!(self.state_for(path, identity), PreviewState::Unloaded) {
+        if !matches!(
+            self.state_for_variant(path, identity, variant),
+            PreviewState::Unloaded
+        ) {
             return None;
         }
         self.next_request += 1;
         let request = self.next_request;
-        self.touch(path, identity);
+        self.touch(path, identity, variant);
         self.entries.insert(key, PreviewState::Loading(request));
         Some(request)
     }
@@ -134,7 +181,16 @@ impl PreviewCache {
         variant: RenderVariant,
         identity: RenderIdentity,
     ) -> bool {
-        match self.state_for(path, identity) {
+        if self.entries.iter().any(
+            |((candidate, candidate_identity, _), state)| {
+                candidate == path
+                    && *candidate_identity == identity
+                    && matches!(state, PreviewState::Loaded(preview) if variant_satisfies(preview.metadata.variant, variant))
+            },
+        ) {
+            return false;
+        }
+        match self.state_for_variant(path, identity, variant) {
             PreviewState::Loaded(preview) => !variant_satisfies(preview.metadata.variant, variant),
             PreviewState::Unloaded | PreviewState::Loading(_) => true,
             PreviewState::Error(_) => false,
@@ -143,20 +199,25 @@ impl PreviewCache {
 
     #[cfg(test)]
     pub fn cancel(&mut self, path: &std::path::Path, request: RequestId) -> bool {
-        self.cancel_for(path, RenderIdentity::default(), request)
+        let identity = RenderIdentity::default();
+        let Some(variant) = self.variant_for_request(path, identity, request) else {
+            return false;
+        };
+        self.cancel_for(path, identity, variant, request)
     }
 
     pub fn cancel_for(
         &mut self,
         path: &std::path::Path,
         identity: RenderIdentity,
+        variant: RenderVariant,
         request: RequestId,
     ) -> bool {
-        if !matches!(self.state_for(path, identity), PreviewState::Loading(active) if active == request)
+        if !matches!(self.state_for_variant(path, identity, variant), PreviewState::Loading(active) if active == request)
         {
             return false;
         }
-        let key = (path.to_path_buf(), identity);
+        let key = (path.to_path_buf(), identity, variant);
         self.entries.remove(&key);
         self.last_used.remove(&key);
         true
@@ -169,24 +230,29 @@ impl PreviewCache {
         request: RequestId,
         result: PreviewState,
     ) -> bool {
-        self.finish_for(path, RenderIdentity::default(), request, result)
+        let identity = RenderIdentity::default();
+        let Some(variant) = self.variant_for_request(path, identity, request) else {
+            return false;
+        };
+        self.finish_for(path, identity, variant, request, result)
     }
 
     pub fn finish_for(
         &mut self,
         path: &std::path::Path,
         identity: RenderIdentity,
+        variant: RenderVariant,
         request: RequestId,
         result: PreviewState,
     ) -> bool {
-        if !matches!(self.state_for(path, identity), PreviewState::Loading(active) if active == request)
+        if !matches!(self.state_for_variant(path, identity, variant), PreviewState::Loading(active) if active == request)
         {
             return false;
         }
-        let key = (path.to_path_buf(), identity);
-        let is_loaded = matches!(result, PreviewState::Loaded(_));
+        let key = (path.to_path_buf(), identity, variant);
+        let is_terminal = matches!(result, PreviewState::Loaded(_) | PreviewState::Error(_));
         self.entries.insert(key.clone(), result);
-        if is_loaded {
+        if is_terminal {
             self.evict_over_capacity();
         } else {
             self.last_used.remove(&key);
@@ -200,29 +266,61 @@ impl PreviewCache {
     }
 
     pub fn mark_used_for(&mut self, path: &std::path::Path, identity: RenderIdentity) {
-        if matches!(self.state_for(path, identity), PreviewState::Loaded(_)) {
-            self.touch(path, identity);
+        let variants = self
+            .entries
+            .iter()
+            .filter_map(|((candidate, candidate_identity, variant), state)| {
+                (candidate == path
+                    && *candidate_identity == identity
+                    && matches!(state, PreviewState::Loaded(_)))
+                .then_some(*variant)
+            })
+            .collect::<Vec<_>>();
+        for variant in variants {
+            self.touch(path, identity, variant);
         }
     }
 
-    fn touch(&mut self, path: &std::path::Path, identity: RenderIdentity) {
+    #[cfg(test)]
+    fn variant_for_request(
+        &self,
+        path: &std::path::Path,
+        identity: RenderIdentity,
+        request: RequestId,
+    ) -> Option<RenderVariant> {
+        self.entries
+            .iter()
+            .find_map(|((candidate, candidate_identity, variant), state)| {
+                (candidate == path
+                    && *candidate_identity == identity
+                    && matches!(state, PreviewState::Loading(active) if *active == request))
+                .then_some(*variant)
+            })
+    }
+
+    fn touch(&mut self, path: &std::path::Path, identity: RenderIdentity, variant: RenderVariant) {
         self.access_clock += 1;
         self.last_used
-            .insert((path.to_path_buf(), identity), self.access_clock);
+            .insert((path.to_path_buf(), identity, variant), self.access_clock);
     }
 
     fn evict_over_capacity(&mut self) {
+        self.evict_state_over_capacity(|state| matches!(state, PreviewState::Loaded(_)));
+        self.evict_state_over_capacity(|state| matches!(state, PreviewState::Error(_)));
+    }
+
+    fn evict_state_over_capacity(&mut self, matches_state: impl Fn(&PreviewState) -> bool) {
         while self
             .entries
             .values()
-            .filter(|state| matches!(state, PreviewState::Loaded(_)))
+            .filter(|state| matches_state(state))
             .count()
             > self.capacity
         {
             let evicted = self
                 .entries
                 .iter()
-                .filter(|(_, state)| matches!(state, PreviewState::Loaded(_)))
+                .filter(|(_, state)| matches_state(state))
                 .min_by_key(|(id, _)| self.last_used.get(*id).copied().unwrap_or(0))
                 .map(|(id, _)| id.clone());
             if let Some(evicted) = evicted {

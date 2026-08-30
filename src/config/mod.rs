@@ -11,6 +11,7 @@ use crate::discovery::RawJpegPreference;
 
 pub(crate) const DEFAULT_IMAGE_CACHE_SIZE: usize = 8;
 pub(crate) const DEFAULT_MAP_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
+pub(crate) const DEFAULT_FACE_WORKER_MEMORY_BYTES: u64 = 768 * 1024 * 1024;
 const RAW_MEMORY_RESERVE_BYTES: u64 = 1024 * 1024 * 1024;
 const ESTIMATED_RAW_WORKING_SET_BYTES: u64 = 768 * 1024 * 1024;
 
@@ -36,6 +37,14 @@ pub(crate) enum MapSwitcherPlacement {
     #[default]
     Header,
     Floating,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum FaceCropDiskCachePolicy {
+    #[default]
+    MemoryOnly,
+    Disk,
 }
 
 impl From<PairPreference> for RawJpegPreference {
@@ -70,6 +79,14 @@ pub(crate) struct AppSettings {
     pub map_cache_bytes: u64,
     #[serde(default)]
     pub map_switcher_placement: MapSwitcherPlacement,
+    #[serde(default = "default_true")]
+    pub automatic_face_analysis: bool,
+    #[serde(default = "default_face_workers")]
+    pub face_workers: usize,
+    #[serde(default = "default_face_worker_memory_bytes")]
+    pub face_worker_memory_bytes: u64,
+    #[serde(default)]
+    pub face_crop_disk_cache: FaceCropDiskCachePolicy,
 }
 
 #[derive(Clone, Debug)]
@@ -187,6 +204,10 @@ fn defaults(dirs: &directories::ProjectDirs) -> Result<AppSettings> {
         online_map_permission: OnlineMapPermission::Unknown,
         map_cache_bytes: DEFAULT_MAP_CACHE_BYTES,
         map_switcher_placement: MapSwitcherPlacement::Header,
+        automatic_face_analysis: true,
+        face_workers: default_face_workers(),
+        face_worker_memory_bytes: DEFAULT_FACE_WORKER_MEMORY_BYTES,
+        face_crop_disk_cache: FaceCropDiskCachePolicy::MemoryOnly,
     })
 }
 
@@ -203,6 +224,13 @@ fn validate(settings: &mut AppSettings) -> Result<()> {
     if settings.map_cache_bytes == 0 {
         bail!("map cache size must be at least 1 byte");
     }
+    if settings.face_workers == 0 {
+        bail!("face workers must be at least 1");
+    }
+    if settings.face_worker_memory_bytes < 64 * 1024 * 1024 {
+        bail!("face worker memory limit must be at least 64 MiB");
+    }
+    settings.face_workers = settings.face_workers.min(settings.job_parallelism);
     settings.raw_parallelism = settings.raw_parallelism.min(settings.job_parallelism);
     settings.root = absolute(settings.root.clone())?;
     settings.cache_root = absolute(settings.cache_root.clone())?;
@@ -211,6 +239,18 @@ fn validate(settings: &mut AppSettings) -> Result<()> {
 
 const fn default_map_cache_bytes() -> u64 {
     DEFAULT_MAP_CACHE_BYTES
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+const fn default_face_workers() -> usize {
+    1
+}
+
+const fn default_face_worker_memory_bytes() -> u64 {
+    DEFAULT_FACE_WORKER_MEMORY_BYTES
 }
 
 fn absolute(path: PathBuf) -> Result<PathBuf> {

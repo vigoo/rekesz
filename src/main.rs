@@ -4,13 +4,13 @@
 
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     hash::{Hash, Hasher},
     ops::Range,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -20,13 +20,16 @@ use gpui::{
     AnyElement, App, AppContext as _, Application, Bounds, ClickEvent, ClipboardItem, Context,
     CursorStyle, FocusHandle, KeyBinding, ListSizingBehavior, Menu, MenuItem, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Render, ScrollStrategy,
-    ScrollWheelEvent, SharedString, UniformListScrollHandle, Window, WindowBounds, WindowOptions,
-    actions, canvas, div, img, point, prelude::*, px, relative, rgb, size, uniform_list,
+    ScrollWheelEvent, SharedString, StatefulInteractiveElement, UniformListScrollHandle, Window,
+    WindowBounds, WindowOptions, actions, canvas, div, img, point, prelude::*, px, relative, rgb,
+    size, uniform_list,
 };
 
+mod accessibility;
 mod catalog;
 mod config;
 mod discovery;
+mod face_engine;
 mod formats;
 mod jobs;
 mod map;
@@ -38,6 +41,15 @@ mod scheduler;
 static MAP_RENDER_BUSY: AtomicBool = AtomicBool::new(false);
 static MAP_CLUSTER_BUSY: AtomicBool = AtomicBool::new(false);
 const MAP_RENDER_OVERSCAN: u32 = 128;
+const FACE_OS_MEMORY_RESERVE: u64 = 512 * 1024 * 1024;
+
+fn admitted_face_workers(available: u64, per_worker: u64, requested: usize) -> usize {
+    let reserve = FACE_OS_MEMORY_RESERVE.saturating_add(available / 5);
+    let usable = available.saturating_sub(reserve);
+    usize::try_from(usable / per_worker.max(1))
+        .unwrap_or(usize::MAX)
+        .min(requested)
+}
 
 struct MapRenderGuard;
 
@@ -111,6 +123,10 @@ const IDLE_PREFETCH_SCOPE: DemandScopeId = DemandScopeId(4);
 const FOCUSED_PREFETCH_SCOPE: DemandScopeId = DemandScopeId(5);
 const IMAGE_PREFETCH_SCOPE: DemandScopeId = DemandScopeId(6);
 const MAP_CARD_SCOPE: DemandScopeId = DemandScopeId(7);
+const PEOPLE_SCOPE: DemandScopeId = DemandScopeId(8);
+#[cfg(test)]
+static PEOPLE_QUERY_TEST_DELAY: std::sync::Mutex<Option<(PathBuf, Duration)>> =
+    std::sync::Mutex::new(None);
 const MAP_GALLERY_PAGE_SIZE: usize = 6;
 const IDLE_PREFETCH_DELAY: Duration = Duration::from_millis(400);
 const IDLE_PREFETCH_BATCH: usize = 64;
@@ -118,9 +134,271 @@ const IMAGE_PREFETCH_COUNT: usize = 4;
 const JOB_QUEUE_PANEL_WIDTH: f32 = 430.0;
 const DEVELOP_PANEL_WIDTH: f32 = 320.0;
 const SCHEDULER_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
+const FULL_IDENTITY_VERIFICATION_INTERVAL: u64 = 1_440;
 const USE_IN_WINDOW_MENU: bool = cfg!(target_os = "linux");
 const IMAGE_WHEEL_THRESHOLD_PX: f32 = 30.0;
 const HIDDEN_NODE: NodeId = NodeId(usize::MAX);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RefreshThrottle {
+    in_flight: bool,
+    dirty: bool,
+}
+
+impl RefreshThrottle {
+    fn request(&mut self) -> bool {
+        if self.in_flight {
+            self.dirty = true;
+            false
+        } else {
+            self.in_flight = true;
+            true
+        }
+    }
+
+    fn complete(&mut self) -> bool {
+        self.in_flight = false;
+        if self.dirty {
+            self.dirty = false;
+            self.in_flight = true;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MaintenanceCoordinator {
+    refill_active: Duration,
+    refill_error: Duration,
+    inventory_watch: Duration,
+    inventory_error: Duration,
+    throughput_window: Duration,
+}
+
+type MaintenanceBatch = Vec<(face_engine::FaceAnalyzeJob, i32)>;
+type MaintenanceRefill = (MaintenanceBatch, Option<Duration>);
+
+#[derive(Default)]
+struct FaceInventoryProgress {
+    stage: AtomicUsize,
+    discovered: AtomicUsize,
+    processed: AtomicUsize,
+    scan_directories: AtomicUsize,
+    scan_pending: AtomicUsize,
+    scan_images: AtomicUsize,
+    current_file: Mutex<Option<PathBuf>>,
+}
+
+impl FaceInventoryProgress {
+    fn label(&self) -> Option<String> {
+        let total = self.discovered.load(Ordering::Acquire);
+        let processed = self.processed.load(Ordering::Acquire).min(total);
+        let file = self
+            .current_file
+            .lock()
+            .ok()
+            .and_then(|path| path.clone())
+            .and_then(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| "preparing…".to_owned());
+        match self.stage.load(Ordering::Acquire) {
+            1 => {
+                let directories = self.scan_directories.load(Ordering::Acquire);
+                let pending = self.scan_pending.load(Ordering::Acquire);
+                let images = self.scan_images.load(Ordering::Acquire);
+                Some(format!(
+                    "Scanning library · {directories} folders scanned · {pending} queued · {images} images found · {file}"
+                ))
+            }
+            2 => Some(format!(
+                "Checking image identity {processed}/{total} · {file}"
+            )),
+            3 => Some(format!(
+                "Updating face-analysis inventory {processed}/{total} · {file}"
+            )),
+            4 => Some(format!(
+                "Prioritizing pending face analysis across {total} images…"
+            )),
+            _ => None,
+        }
+    }
+
+    fn fraction(&self) -> Option<f32> {
+        if self.stage.load(Ordering::Acquire) == 1 {
+            let scanned = self.scan_directories.load(Ordering::Acquire);
+            let pending = self.scan_pending.load(Ordering::Acquire);
+            return (scanned + pending > 0).then_some(scanned as f32 / (scanned + pending) as f32);
+        }
+        let total = self.discovered.load(Ordering::Acquire);
+        let processed = self.processed.load(Ordering::Acquire).min(total);
+        (total > 0 && matches!(self.stage.load(Ordering::Acquire), 2 | 3))
+            .then_some(processed as f32 / total as f32)
+    }
+}
+
+trait MaintenanceDriver: Send + Sync {
+    fn inventory(
+        &self,
+        root: &Path,
+        hidden: &HashSet<PathBuf>,
+        pair_preference: discovery::RawJpegPreference,
+        preferred_subtree: &Path,
+        recent_assets: &[PathBuf],
+        coordination: InventoryCoordination<'_>,
+    ) -> Result<MaintenanceBatch>;
+
+    fn refill(
+        &self,
+        root: &Path,
+        preferred_subtree: &Path,
+        recent_assets: &[PathBuf],
+    ) -> Result<MaintenanceRefill>;
+}
+
+#[derive(Clone, Copy)]
+struct InventoryCoordination<'a> {
+    progress: &'a FaceInventoryProgress,
+    admission: &'a scheduler::MaintenanceAdmission,
+    cancelled: &'a AtomicBool,
+    identity_mode: catalog::InventoryIdentityMode,
+}
+
+fn owns_inventory_progress(current_generation: u64, completed_generation: u64) -> bool {
+    current_generation == completed_generation
+}
+
+struct ProductionMaintenanceDriver;
+
+impl MaintenanceDriver for ProductionMaintenanceDriver {
+    fn inventory(
+        &self,
+        root: &Path,
+        hidden: &HashSet<PathBuf>,
+        pair_preference: discovery::RawJpegPreference,
+        preferred_subtree: &Path,
+        recent_assets: &[PathBuf],
+        coordination: InventoryCoordination<'_>,
+    ) -> Result<MaintenanceBatch> {
+        let InventoryCoordination {
+            progress,
+            admission,
+            cancelled,
+            identity_mode,
+        } = coordination;
+        // Keep the calibrated inference module's legacy inventory entry point
+        // linked without changing that source file's release-bound digest.
+        let _calibrated_inventory_entry_point = face_engine::sync_analysis_inventory;
+        progress.stage.store(1, Ordering::Release);
+        let paths = discovery::scan_library_inventory_with_progress(
+            root,
+            hidden,
+            pair_preference,
+            cancelled,
+            |directories, pending, images, path| {
+                progress
+                    .scan_directories
+                    .store(directories, Ordering::Release);
+                progress.scan_pending.store(pending, Ordering::Release);
+                progress.scan_images.store(images, Ordering::Release);
+                if let Ok(mut current) = progress.current_file.lock() {
+                    *current = Some(path.to_path_buf());
+                }
+                admission.checkpoint(cancelled);
+            },
+        )?;
+        progress.discovered.store(paths.len(), Ordering::Release);
+        progress.processed.store(0, Ordering::Release);
+        progress.stage.store(2, Ordering::Release);
+        catalog::sync_asset_inventory_with_progress(
+            root,
+            &paths,
+            "yunet-2023mar+sface-2021dec",
+            "sface-2021dec",
+            identity_mode,
+            |processed, total, path| {
+                let previous = progress.processed.swap(processed, Ordering::AcqRel);
+                if processed < previous {
+                    progress.stage.store(3, Ordering::Release);
+                }
+                progress.discovered.store(total, Ordering::Release);
+                if let Ok(mut current) = progress.current_file.lock() {
+                    *current = Some(path.to_path_buf());
+                }
+            },
+            || admission.checkpoint(cancelled),
+        )?;
+        progress.stage.store(4, Ordering::Release);
+        face_engine::pending_analysis_jobs_prioritized(
+            root,
+            10_000,
+            Some(preferred_subtree),
+            recent_assets,
+        )
+    }
+
+    fn refill(
+        &self,
+        root: &Path,
+        preferred_subtree: &Path,
+        recent_assets: &[PathBuf],
+    ) -> Result<MaintenanceRefill> {
+        Ok((
+            face_engine::pending_analysis_jobs_prioritized(
+                root,
+                10_000,
+                Some(preferred_subtree),
+                recent_assets,
+            )?,
+            face_engine::next_analysis_wake(root)?,
+        ))
+    }
+}
+
+impl MaintenanceCoordinator {
+    const PRODUCTION: Self = Self {
+        refill_active: Duration::from_secs(2),
+        refill_error: Duration::from_secs(30),
+        inventory_watch: Duration::from_secs(60),
+        inventory_error: Duration::from_secs(120),
+        // The scheduler uses a sixty-second rolling window. The extra second
+        // avoids waking on its inclusive boundary.
+        throughput_window: Duration::from_secs(61),
+    };
+
+    fn refill_after(
+        self,
+        paused: bool,
+        had_jobs: bool,
+        retry_deadline: Option<Duration>,
+        failed: bool,
+    ) -> Option<Duration> {
+        if paused {
+            None
+        } else if failed {
+            Some(self.refill_error)
+        } else if had_jobs {
+            Some(self.refill_active)
+        } else {
+            retry_deadline
+        }
+    }
+
+    fn inventory_after(self, paused: bool, failed: bool) -> Option<Duration> {
+        (!paused).then_some(if failed {
+            self.inventory_error
+        } else {
+            self.inventory_watch
+        })
+    }
+
+    fn throughput_after(self, completed_last_minute: usize) -> Option<Duration> {
+        (completed_last_minute > 0).then_some(self.throughput_window)
+    }
+}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct ImageSelection {
@@ -193,6 +471,329 @@ enum DirectoryViewMode {
     #[default]
     Grid,
     Map,
+    People,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum PeopleDecision {
+    Confirm,
+    Reject,
+    NotFace,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PeopleNameOperation {
+    Rename { person_id: i64 },
+    Create { face_ids: Vec<i64> },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PeopleTargetOperation {
+    Merge {
+        source_person_id: i64,
+    },
+    Move {
+        source_person_id: i64,
+        face_ids: Vec<i64>,
+    },
+    Assign {
+        face_ids: Vec<i64>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PeopleOperationDialog {
+    Name {
+        operation: PeopleNameOperation,
+        input: String,
+        cursor: usize,
+        selection_anchor: Option<usize>,
+    },
+    Target {
+        operation: PeopleTargetOperation,
+        target_person_id: Option<i64>,
+    },
+}
+
+#[derive(Clone, Debug)]
+enum PeopleMergePreviewLoad {
+    Loading(i64),
+    Loaded(Arc<catalog::people::MergePeoplePreview>),
+    Error(i64, Arc<str>),
+}
+
+fn prepare_selected_face_ids(selection: &PeopleFaceSelection) -> Result<Vec<i64>, String> {
+    let face_ids = selection
+        .selected
+        .iter()
+        .map(|key| key.face_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if face_ids.is_empty() {
+        Err("Select at least one face first".to_owned())
+    } else {
+        Ok(face_ids)
+    }
+}
+
+fn validate_people_operation_dialog(dialog: &PeopleOperationDialog) -> Result<(), String> {
+    match dialog {
+        PeopleOperationDialog::Name { input, .. } => {
+            let count = input.trim().chars().count();
+            if (1..=200).contains(&count) {
+                Ok(())
+            } else {
+                Err("A person name must contain 1 to 200 characters".to_owned())
+            }
+        }
+        PeopleOperationDialog::Target {
+            operation,
+            target_person_id,
+        } => {
+            let target = target_person_id.ok_or_else(|| "Choose a target person".to_owned())?;
+            let source = match operation {
+                PeopleTargetOperation::Merge { source_person_id }
+                | PeopleTargetOperation::Move {
+                    source_person_id, ..
+                } => Some(*source_person_id),
+                PeopleTargetOperation::Assign { .. } => None,
+            };
+            if source == Some(target) {
+                Err("Source and target people must differ".to_owned())
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+fn people_editor_range(cursor: usize, anchor: Option<usize>) -> Range<usize> {
+    let anchor = anchor.unwrap_or(cursor);
+    anchor.min(cursor)..anchor.max(cursor)
+}
+
+fn people_editor_replace(
+    input: &mut String,
+    cursor: &mut usize,
+    anchor: &mut Option<usize>,
+    replacement: &str,
+) {
+    let mut chars = input.chars().collect::<Vec<_>>();
+    let range = people_editor_range(*cursor, *anchor);
+    let available = 200usize.saturating_sub(chars.len().saturating_sub(range.len()));
+    let replacement = replacement.chars().take(available).collect::<Vec<_>>();
+    chars.splice(range.clone(), replacement.iter().copied());
+    *cursor = range.start + replacement.len();
+    *anchor = None;
+    *input = chars.into_iter().collect();
+}
+
+fn people_editor_selected_text(input: &str, cursor: usize, anchor: Option<usize>) -> String {
+    let range = people_editor_range(cursor, anchor);
+    input.chars().skip(range.start).take(range.len()).collect()
+}
+
+fn people_editor_display(input: &str, cursor: usize, anchor: Option<usize>) -> String {
+    let chars = input.chars().collect::<Vec<_>>();
+    let range = people_editor_range(cursor, anchor);
+    let mut output = String::new();
+    for (index, character) in chars.iter().enumerate() {
+        if index == cursor {
+            output.push('▏');
+        }
+        if range.contains(&index) {
+            output.push('‹');
+            output.push(*character);
+            output.push('›');
+        } else {
+            output.push(*character);
+        }
+    }
+    if cursor == chars.len() {
+        output.push('▏');
+    }
+    output
+}
+
+fn people_merge_preview_text(preview: &catalog::people::MergePeoplePreview) -> String {
+    let resulting_confirmed = preview
+        .source_confirmed_faces
+        .saturating_add(preview.target_confirmed_faces)
+        .saturating_sub(preview.confirmation_deduplications);
+    format!(
+        "Result: {resulting_confirmed} confirmed faces. {} duplicate confirmations and {} duplicate assignments collapse; {} external catalog link(s) move. {}",
+        preview.confirmation_deduplications,
+        preview.assignment_deduplications,
+        preview.external_links_moved,
+        if preview.source_representative_will_be_discarded {
+            "The target example face is kept and the source example is discarded."
+        } else if preview.resulting_representative_face_id.is_some() {
+            "The available example face is kept."
+        } else {
+            "No example face will be set."
+        }
+    )
+}
+
+fn should_start_automatic_face_inventory(settings: &AppSettings) -> bool {
+    settings.automatic_face_analysis && settings.face_workers > 0
+}
+
+fn validate_people_decision_batch(decisions: &[(i64, i64, PeopleDecision)]) -> Result<(), String> {
+    let mut confirmations = HashMap::new();
+    for (face_id, person_id, decision) in decisions {
+        if *decision != PeopleDecision::Confirm {
+            continue;
+        }
+        if let Some(previous) = confirmations.insert(*face_id, *person_id)
+            && previous != *person_id
+        {
+            return Err(format!(
+                "Face {face_id} has multiple selected identities. Select only one person to accept."
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn can_start_people_review_save(undo_pending: bool) -> bool {
+    !undo_pending
+}
+
+fn can_start_people_undo(undo_pending: bool, pending_saves: usize) -> bool {
+    !undo_pending && pending_saves == 0
+}
+
+const PEOPLE_DECISION_CHUNK_SIZE: usize = 500;
+
+fn coordinate_people_decision_chunks<T: Clone>(items: &[T]) -> Vec<Vec<T>> {
+    items
+        .chunks(PEOPLE_DECISION_CHUNK_SIZE)
+        .map(<[T]>::to_vec)
+        .collect()
+}
+
+fn people_decision_affects_row(
+    decision: &(i64, i64, PeopleDecision),
+    row_face_id: i64,
+    row_person_id: i64,
+) -> bool {
+    decision.0 == row_face_id
+        && (decision.2 == PeopleDecision::NotFace || decision.1 == row_person_id)
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct PeopleFaceKey {
+    face_id: i64,
+    person_id: i64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct PeopleFaceSelection {
+    selected: HashSet<PeopleFaceKey>,
+    anchor: Option<PeopleFaceKey>,
+    focus: Option<PeopleFaceKey>,
+}
+
+impl PeopleFaceSelection {
+    fn click(&mut self, key: PeopleFaceKey, order: &[PeopleFaceKey], shift: bool, toggle: bool) {
+        if shift {
+            let anchor = self.anchor.unwrap_or(key);
+            self.select_range(anchor, key, order, toggle);
+        } else if toggle {
+            if !self.selected.insert(key) {
+                self.selected.remove(&key);
+            }
+            self.anchor = Some(key);
+        } else {
+            self.selected.clear();
+            self.selected.insert(key);
+            self.anchor = Some(key);
+        }
+        self.focus = Some(key);
+    }
+
+    fn move_focus(&mut self, order: &[PeopleFaceKey], delta: isize, extend: bool) {
+        if order.is_empty() {
+            return;
+        }
+        let current = self
+            .focus
+            .and_then(|key| order.iter().position(|candidate| *candidate == key))
+            .unwrap_or(0);
+        let next = current
+            .saturating_add_signed(delta)
+            .min(order.len().saturating_sub(1));
+        let key = order[next];
+        if extend {
+            let anchor = self.anchor.unwrap_or(order[current]);
+            self.select_range(anchor, key, order, false);
+        } else {
+            self.selected.clear();
+            self.selected.insert(key);
+            self.anchor = Some(key);
+        }
+        self.focus = Some(key);
+    }
+
+    fn select_all(&mut self, order: &[PeopleFaceKey]) {
+        self.selected.extend(order.iter().copied());
+        self.anchor = order.first().copied();
+        self.focus = order.last().copied();
+    }
+
+    fn clear(&mut self) {
+        self.selected.clear();
+        self.anchor = None;
+        self.focus = None;
+    }
+
+    fn select_range(
+        &mut self,
+        anchor: PeopleFaceKey,
+        key: PeopleFaceKey,
+        order: &[PeopleFaceKey],
+        preserve: bool,
+    ) {
+        let Some(anchor_index) = order.iter().position(|candidate| *candidate == anchor) else {
+            self.clear();
+            self.selected.insert(key);
+            self.anchor = Some(key);
+            return;
+        };
+        let Some(key_index) = order.iter().position(|candidate| *candidate == key) else {
+            return;
+        };
+        if !preserve {
+            self.selected.clear();
+        }
+        let (start, end) = if anchor_index <= key_index {
+            (anchor_index, key_index)
+        } else {
+            (key_index, anchor_index)
+        };
+        self.selected.extend(order[start..=end].iter().copied());
+        self.anchor = Some(anchor);
+    }
+}
+
+#[derive(Clone)]
+enum PeoplePageLoad<T> {
+    Loading,
+    Loaded(T),
+    Error(Arc<str>),
+}
+
+enum EitherPeoplePage {
+    Overview(catalog::people::PersonPage),
+    Faces(catalog::people::FaceReviewPage),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PeopleSpecialPage {
+    Unnamed,
+    Review,
 }
 
 #[derive(Clone, Copy)]
@@ -208,6 +809,23 @@ struct WorkProgress {
     total: usize,
     next_id: u64,
     activities: BTreeMap<u64, String>,
+}
+
+#[derive(Clone)]
+enum LightroomImportState {
+    Running,
+    Succeeded {
+        images: u64,
+        recipes: u64,
+        faces: u64,
+    },
+    Failed(Arc<str>),
+}
+
+#[derive(Clone)]
+struct LightroomImportDialog {
+    path: PathBuf,
+    state: LightroomImportState,
 }
 
 impl WorkProgress {
@@ -272,6 +890,23 @@ struct PictureBrowser {
     work: WorkProgress,
     render_pipeline: PreviewRenderer,
     scheduler: RenderScheduler,
+    face_analysis: face_engine::FaceAnalysisService,
+    recognition_refresh: face_engine::RecognitionRefreshService,
+    people_summary_rebuild: face_engine::PeopleSummaryRebuildService,
+    maintenance_admission: scheduler::MaintenanceAdmission,
+    maintenance_driver: Arc<dyn MaintenanceDriver>,
+    face_inventory_progress: Arc<FaceInventoryProgress>,
+    face_inventory_cancelled: Arc<AtomicBool>,
+    face_inventory_generation: u64,
+    face_analysis_paused: bool,
+    face_crop_disk_cache_enabled: Arc<AtomicBool>,
+    face_analysis_refill_scheduled: bool,
+    face_inventory_refresh_scheduled: bool,
+    face_inventory_watch_scheduled: bool,
+    maintenance_diagnostics_observed: (u64, u64, u64),
+    maintenance_throughput_expiry_scheduled: bool,
+    maintenance_diagnostics_throttle: RefreshThrottle,
+    recent_face_assets: VecDeque<PathBuf>,
     directory_scanner: DirectoryScanner,
     grid_demand_epoch: u64,
     grid_prediction: Option<GridPredictionState>,
@@ -291,8 +926,12 @@ struct PictureBrowser {
     settings: AppSettings,
     settings_path: PathBuf,
     settings_draft: Option<AppSettings>,
+    lightroom_import_dialog: Option<LightroomImportDialog>,
     settings_status: Option<String>,
     job_queue_snapshot: SchedulerSnapshot,
+    face_job_queue_snapshot: Vec<face_engine::FaceAnalysisJobSnapshot>,
+    recognition_job_queue_snapshot: Vec<face_engine::RecognitionRefreshJobSnapshot>,
+    summary_job_queue_snapshot: Vec<face_engine::PeopleSummaryRebuildJobSnapshot>,
     job_queue_scroll: UniformListScrollHandle,
     scheduler_refresh_scheduled: bool,
     path_context_menu: Option<PathContextMenu>,
@@ -302,6 +941,49 @@ struct PictureBrowser {
     metadata_load: Option<(NodeId, discovery::RequestId, Arc<AtomicBool>)>,
     scrollbar_drag: Option<ScrollbarDrag>,
     recipes: Option<Arc<HashMap<PathBuf, catalog::RecipeEntry>>>,
+    people_overview: PeoplePageLoad<catalog::people::PersonPage>,
+    people_diagnostics: Option<Result<Arc<catalog::people::PeopleDiagnostics>, Arc<str>>>,
+    people_faces: PeoplePageLoad<catalog::people::FaceReviewPage>,
+    people_rendered_face_indices: BTreeSet<usize>,
+    people_rendered_overview_indices: BTreeSet<usize>,
+    people_overview_scroll: UniformListScrollHandle,
+    people_query_generation: u64,
+    people_query_cancelled: Arc<AtomicBool>,
+    people_sort: catalog::people::PeopleSort,
+    people_representative_offsets: HashMap<i64, u64>,
+    people_whole_library: bool,
+    selected_person: Option<i64>,
+    selected_person_name: Option<String>,
+    people_special_page: Option<PeopleSpecialPage>,
+    pending_people_decisions: HashSet<(i64, i64)>,
+    people_undo_pending: bool,
+    people_face_selection: PeopleFaceSelection,
+    people_grid_focus: FocusHandle,
+    people_view_switch_focus: FocusHandle,
+    people_primary_card_focus: FocusHandle,
+    people_back_focus: FocusHandle,
+    people_restore_grid_focus: bool,
+    people_decision_error: Option<Arc<str>>,
+    people_operation_dialog: Option<PeopleOperationDialog>,
+    people_operation_focus: FocusHandle,
+    people_operation_pending: bool,
+    people_operation_status: Option<Arc<str>>,
+    people_operation_targets: Vec<(i64, String)>,
+    people_operation_target_scroll: UniformListScrollHandle,
+    people_operation_target_cancelled: Arc<AtomicBool>,
+    people_operation_target_page: usize,
+    people_operation_target_total: u64,
+    people_operation_target_loading: bool,
+    people_operation_target_generation: u64,
+    people_merge_preview: Option<PeopleMergePreviewLoad>,
+    people_context_mode: bool,
+    /// Explicit crop/context choices for faces on the current detail page.
+    /// Entries equal to the grid default are removed, keeping this bounded by
+    /// the loaded page rather than catalog size.
+    people_face_context_overrides: HashMap<PeopleFaceKey, bool>,
+    people_accessibility: accessibility::PeopleAccessibilityBridge,
+    people_page: usize,
+    people_face_scroll: UniformListScrollHandle,
     developed: bool,
     directory_view_mode: DirectoryViewMode,
     map_camera: map::Camera,
@@ -323,6 +1005,17 @@ struct PictureBrowser {
     map_cache_clearing: bool,
     hidden_subtrees_loaded: bool,
     hidden_save_in_flight: bool,
+}
+
+fn durable_render_cache_write(
+    face_crop_policy: &AtomicBool,
+    variant: RenderVariant,
+    normal_background_durability: bool,
+) -> bool {
+    match variant {
+        RenderVariant::FaceCrop { .. } => face_crop_policy.load(Ordering::Acquire),
+        _ => normal_background_durability,
+    }
 }
 
 enum MapRenderState {
@@ -398,6 +1091,8 @@ enum SettingsNumber {
     JobParallelism,
     RawParallelism,
     MapCacheGiB,
+    FaceWorkers,
+    FaceMemoryMiB,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -586,6 +1281,8 @@ fn render_activity_label(
         (RenderVariant::Preview { .. }, RenderMode::Baseline) => "preview",
         (RenderVariant::Thumbnail { .. }, RenderMode::Developed) => "developed thumbnail",
         (RenderVariant::Thumbnail { .. }, RenderMode::Baseline) => "thumbnail",
+        (RenderVariant::FaceCrop { .. }, _) => "face crop",
+        (RenderVariant::FaceContext { .. }, _) => "face context",
     };
     format!("{action} {stage}: {}…", path_display_name(path))
 }
@@ -866,6 +1563,7 @@ impl PictureBrowser {
 
     fn new(config: &Config, cx: &mut Context<Self>) -> Self {
         let settings = &config.settings;
+        rendering::configure_analysis_memory_budget(settings.face_worker_memory_bytes);
         let model = DirectoryModel::new(settings.root.clone());
         let root = model.root();
         let root_path = model.node(root).path.to_path_buf();
@@ -883,6 +1581,10 @@ impl PictureBrowser {
         );
         let render_job_limiter = job_limiter.clone();
         let scheduler_pipeline = render_pipeline.clone();
+        let face_crop_disk_cache_enabled = Arc::new(AtomicBool::new(
+            settings.face_crop_disk_cache == config::FaceCropDiskCachePolicy::Disk,
+        ));
+        let scheduler_face_crop_disk_cache = face_crop_disk_cache_enabled.clone();
         let scheduler = RenderScheduler::new(
             settings.job_parallelism,
             Arc::new(move |key, priority, cancelled| {
@@ -899,12 +1601,33 @@ impl PictureBrowser {
                         render_identity: key.render_identity,
                         recipe: key.recipe.as_deref(),
                         interactive: priority.class == scheduler::PriorityClass::Interactive,
-                        durable_cache_write: priority.class < scheduler::PriorityClass::Visible,
+                        durable_cache_write: durable_render_cache_write(
+                            scheduler_face_crop_disk_cache.as_ref(),
+                            key.variant,
+                            priority.class < scheduler::PriorityClass::Visible,
+                        ),
                     },
                     cancelled,
                 )
             }),
         );
+        let maintenance_admission = scheduler.maintenance_admission();
+        let face_workers = admitted_face_workers(
+            sysinfo::System::new_all().available_memory(),
+            settings.face_worker_memory_bytes,
+            settings.face_workers,
+        );
+        let recognition_refresh =
+            face_engine::RecognitionRefreshService::new(1, maintenance_admission.clone());
+        let face_analysis = face_engine::FaceAnalysisService::new_with_pipeline_and_recognition(
+            face_workers,
+            job_limiter.clone(),
+            maintenance_admission.clone(),
+            render_pipeline.pipeline.clone(),
+            recognition_refresh.clone(),
+        );
+        let people_summary_rebuild =
+            face_engine::PeopleSummaryRebuildService::new(maintenance_admission.clone());
         let mut this = Self {
             model,
             visible: vec![VisibleRow {
@@ -933,6 +1656,23 @@ impl PictureBrowser {
             work: WorkProgress::default(),
             render_pipeline,
             scheduler,
+            face_analysis,
+            recognition_refresh,
+            people_summary_rebuild,
+            maintenance_admission,
+            maintenance_driver: Arc::new(ProductionMaintenanceDriver),
+            face_inventory_progress: Arc::new(FaceInventoryProgress::default()),
+            face_inventory_cancelled: Arc::new(AtomicBool::new(false)),
+            face_inventory_generation: 0,
+            face_analysis_paused: !settings.automatic_face_analysis || face_workers == 0,
+            face_crop_disk_cache_enabled,
+            face_analysis_refill_scheduled: false,
+            face_inventory_refresh_scheduled: false,
+            face_inventory_watch_scheduled: false,
+            maintenance_diagnostics_observed: (0, 0, 0),
+            maintenance_throughput_expiry_scheduled: false,
+            maintenance_diagnostics_throttle: RefreshThrottle::default(),
+            recent_face_assets: VecDeque::new(),
             directory_scanner: DirectoryScanner::new(settings.job_parallelism, job_limiter.clone()),
             grid_demand_epoch: 0,
             grid_prediction: None,
@@ -955,8 +1695,14 @@ impl PictureBrowser {
             settings: settings.clone(),
             settings_path: config.settings_path.clone(),
             settings_draft: None,
-            settings_status: None,
+            lightroom_import_dialog: None,
+            settings_status: (face_workers == 0).then(||
+                "Automatic face analysis is paused: insufficient memory after OS and foreground reserves."
+                    .to_owned()),
             job_queue_snapshot: SchedulerSnapshot::default(),
+            face_job_queue_snapshot: Vec::new(),
+            recognition_job_queue_snapshot: Vec::new(),
+            summary_job_queue_snapshot: Vec::new(),
             job_queue_scroll: UniformListScrollHandle::new(),
             scheduler_refresh_scheduled: false,
             path_context_menu: None,
@@ -966,6 +1712,46 @@ impl PictureBrowser {
             metadata_load: None,
             scrollbar_drag: None,
             recipes: None,
+            people_overview: PeoplePageLoad::Loading,
+            people_diagnostics: None,
+            people_faces: PeoplePageLoad::Loading,
+            people_rendered_face_indices: BTreeSet::new(),
+            people_rendered_overview_indices: BTreeSet::new(),
+            people_overview_scroll: UniformListScrollHandle::new(),
+            people_query_generation: 0,
+            people_query_cancelled: Arc::new(AtomicBool::new(false)),
+            people_sort: catalog::people::PeopleSort::Name,
+            people_representative_offsets: HashMap::new(),
+            people_whole_library: true,
+            selected_person: None,
+            selected_person_name: None,
+            people_special_page: None,
+            pending_people_decisions: HashSet::new(),
+            people_undo_pending: false,
+            people_face_selection: PeopleFaceSelection::default(),
+            people_grid_focus: cx.focus_handle(),
+            people_view_switch_focus: cx.focus_handle(),
+            people_primary_card_focus: cx.focus_handle(),
+            people_back_focus: cx.focus_handle(),
+            people_restore_grid_focus: false,
+            people_decision_error: None,
+            people_operation_dialog: None,
+            people_operation_focus: cx.focus_handle(),
+            people_operation_pending: false,
+            people_operation_status: None,
+            people_operation_targets: Vec::new(),
+            people_operation_target_scroll: UniformListScrollHandle::new(),
+            people_operation_target_cancelled: Arc::new(AtomicBool::new(false)),
+            people_operation_target_page: 0,
+            people_operation_target_total: 0,
+            people_operation_target_loading: false,
+            people_operation_target_generation: 0,
+            people_merge_preview: None,
+            people_context_mode: false,
+            people_face_context_overrides: HashMap::new(),
+            people_accessibility: accessibility::PeopleAccessibilityBridge::new(),
+            people_page: 0,
+            people_face_scroll: UniformListScrollHandle::new(),
             developed: true,
             directory_view_mode: DirectoryViewMode::Grid,
             map_camera: map::Camera::default(),
@@ -990,27 +1776,19 @@ impl PictureBrowser {
         };
         let catalog_work = this.work.start("Loading develop catalog…");
         let catalog_root = settings.root.clone();
-        let recipe_root = catalog_root.clone();
-        let recipe_loading = cx
-            .background_executor()
-            .spawn(async move { catalog::load_recipes(&recipe_root) });
-        let hidden_loading = cx
-            .background_executor()
-            .spawn(async move { catalog::load_hidden_subtrees(&catalog_root) });
+        let catalog_loading = cx.background_executor().spawn(async move {
+            catalog::prepare_existing_catalog(&catalog_root)?;
+            let recipes = catalog::load_recipes(&catalog_root)?;
+            let hidden = catalog::load_hidden_subtrees(&catalog_root)?;
+            Ok::<_, anyhow::Error>((recipes, hidden))
+        });
         cx.spawn(async move |this, cx| {
-            let recipes = recipe_loading.await;
-            let hidden = hidden_loading.await;
+            let catalog = catalog_loading.await;
             this.update(cx, |this, cx| {
                 this.work.finish(catalog_work);
-                match recipes {
-                    Ok(recipes) => this.recipes = Some(Arc::new(recipes)),
-                    Err(error) => {
-                        eprintln!("cannot load Rekesz recipes: {error:#}");
-                        this.recipes = Some(Arc::new(HashMap::new()));
-                    }
-                }
-                match hidden {
-                    Ok(hidden) => {
+                match catalog {
+                    Ok((recipes, hidden)) => {
+                        this.recipes = Some(Arc::new(recipes));
                         for path in &hidden {
                             this.model.ensure_node(path.clone());
                         }
@@ -1031,11 +1809,28 @@ impl PictureBrowser {
                             }
                         }
                         this.hidden_subtrees_loaded = true;
+                        if this.directory_view_mode == DirectoryViewMode::People {
+                            this.refresh_people_page(cx);
+                        }
+                        #[cfg(not(test))]
+                        this.start_people_summary_maintenance(cx);
+                        // Recover durable recognition work immediately on every start,
+                        // including catalogs whose automatic face analysis is disabled.
+                        #[cfg(not(test))]
+                        this.recognition_refresh
+                            .enqueue(this.settings.root.clone(), 0);
+                        #[cfg(not(test))]
+                        if should_start_automatic_face_inventory(&this.settings)
+                            && !this.face_analysis_paused
+                        {
+                            this.refresh_face_inventory(cx);
+                        }
                     }
                     Err(error) => {
-                        eprintln!("cannot load hidden folders: {error:#}");
+                        eprintln!("cannot prepare Rekesz catalog: {error:#}");
+                        this.recipes = Some(Arc::new(HashMap::new()));
                         this.settings_status =
-                            Some(format!("Could not load hidden folders: {error:#}"));
+                            Some(format!("Could not prepare Rekesz catalog: {error:#}"));
                     }
                 }
                 if this.map_card.is_some() {
@@ -1114,6 +1909,11 @@ impl PictureBrowser {
                     this.rebuild_visible();
                     if node == this.selected {
                         this.start_metadata_enrichment(node, cx);
+                    }
+                    if should_start_automatic_face_inventory(&this.settings)
+                        && !this.face_analysis_paused
+                    {
+                        this.schedule_live_face_inventory_refresh(cx);
                     }
                     cx.notify();
                 }
@@ -1331,6 +2131,7 @@ impl PictureBrowser {
         match variant {
             RenderVariant::Full => &self.previews,
             RenderVariant::Thumbnail { .. } => &self.thumbnails,
+            RenderVariant::FaceCrop { .. } | RenderVariant::FaceContext { .. } => &self.thumbnails,
             RenderVariant::Preview { .. } => &self.raw_previews,
         }
     }
@@ -1339,6 +2140,9 @@ impl PictureBrowser {
         match variant {
             RenderVariant::Full => &mut self.previews,
             RenderVariant::Thumbnail { .. } => &mut self.thumbnails,
+            RenderVariant::FaceCrop { .. } | RenderVariant::FaceContext { .. } => {
+                &mut self.thumbnails
+            }
             RenderVariant::Preview { .. } => &mut self.raw_previews,
         }
     }
@@ -1437,6 +2241,7 @@ impl PictureBrowser {
                     }
                     match completion {
                         Ok(JobCompletion::Finished(result)) => {
+                            let failed = matches!(result, PreviewState::Error(_));
                             if let PreviewState::Loaded(preview) = &result {
                                 this.model
                                     .record_render_metadata(path.clone(), preview.metadata.clone());
@@ -1444,14 +2249,22 @@ impl PictureBrowser {
                             this.cache_for_variant_mut(variant).finish_for(
                                 &path,
                                 render_identity,
+                                variant,
                                 request,
                                 result,
                             );
+                            if failed
+                                && scope == PEOPLE_SCOPE
+                                && !this.advance_failed_people_representative(&path, variant, cx)
+                            {
+                                this.refresh_people_render_demand(cx);
+                            }
                         }
                         Ok(JobCompletion::Cancelled) | Err(_) => {
                             this.cache_for_variant_mut(variant).cancel_for(
                                 &path,
                                 render_identity,
+                                variant,
                                 request,
                             );
                         }
@@ -1841,6 +2654,14 @@ impl PictureBrowser {
             }
             self.request_map_render(cx);
         }
+        if directory_changed
+            && self.directory_view_mode == DirectoryViewMode::People
+            && !self.people_whole_library
+        {
+            self.people_page = 0;
+            self.people_representative_offsets.clear();
+            self.refresh_people_page(cx);
+        }
         cx.notify();
     }
 
@@ -1982,6 +2803,9 @@ impl PictureBrowser {
         self.scheduler.clear_scope(IDLE_PREFETCH_SCOPE);
         self.scheduler.clear_scope(FOCUSED_PREFETCH_SCOPE);
         self.scheduler.clear_scope(MAP_CARD_SCOPE);
+        self.recent_face_assets.retain(|recent| recent != &path);
+        self.recent_face_assets.push_front(path.clone());
+        self.recent_face_assets.truncate(32);
         self.main_view = MainView::Image(ImageViewState::new(path.clone()));
         // Keep visible thumbnail demand alive. Returning to the grid can then
         // resume without rebuilding its visible cache entries.
@@ -2426,7 +3250,2789 @@ impl PictureBrowser {
         if mode == DirectoryViewMode::Map {
             self.request_map_render(cx);
         }
+        if mode == DirectoryViewMode::People {
+            self.refresh_people_page(cx);
+        } else {
+            self.people_query_generation = self.people_query_generation.wrapping_add(1);
+            self.people_query_cancelled.store(true, Ordering::Release);
+            self.scheduler.clear_scope(PEOPLE_SCOPE);
+        }
         cx.notify();
+    }
+
+    fn refresh_face_inventory(&mut self, cx: &mut Context<Self>) {
+        let root = self.settings.root.clone();
+        let hidden = self.hidden_subtrees.clone();
+        let pair_preference = self.pair_preference;
+        let preferred_subtree = self.model.node(self.selected).path.clone();
+        let recent_assets = self.recent_face_assets.iter().cloned().collect::<Vec<_>>();
+        let maintenance_driver = self.maintenance_driver.clone();
+        let admission = self.maintenance_admission.clone();
+        self.face_inventory_cancelled.store(true, Ordering::Release);
+        self.face_inventory_cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled = self.face_inventory_cancelled.clone();
+        self.face_inventory_generation = self.face_inventory_generation.wrapping_add(1);
+        let generation = self.face_inventory_generation;
+        let identity_mode = if generation.is_multiple_of(FULL_IDENTITY_VERIFICATION_INTERVAL) {
+            catalog::InventoryIdentityMode::VerifyContents
+        } else {
+            catalog::InventoryIdentityMode::MetadataFirst
+        };
+        let work_id = self.work.start("Updating face-analysis inventory…");
+        let progress = Arc::new(FaceInventoryProgress::default());
+        progress.scan_pending.store(1, Ordering::Release);
+        progress.stage.store(1, Ordering::Release);
+        self.face_inventory_progress = progress.clone();
+        let worker_progress = progress.clone();
+        let work = cx.background_executor().spawn(async move {
+            let result = admission.run_maintenance(-100, &cancelled, || {
+                maintenance_driver.inventory(
+                    &root,
+                    &hidden,
+                    pair_preference,
+                    &preferred_subtree,
+                    &recent_assets,
+                    InventoryCoordination {
+                        progress: &worker_progress,
+                        admission: &admission,
+                        cancelled: &cancelled,
+                        identity_mode,
+                    },
+                )
+            });
+            result.unwrap_or_else(|| Err(anyhow::anyhow!("face inventory cancelled")))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            this.update(cx, |this, cx| {
+                this.work.finish(work_id);
+                if !owns_inventory_progress(this.face_inventory_generation, generation) {
+                    cx.notify();
+                    return;
+                }
+                progress.stage.store(0, Ordering::Release);
+                match result {
+                    Ok(jobs) if !this.face_analysis_paused => {
+                        for (job, rank) in jobs {
+                            this.face_analysis.enqueue(job, rank);
+                        }
+                        this.recognition_refresh
+                            .enqueue(this.settings.root.clone(), 0);
+                        if let Some(delay) = MaintenanceCoordinator::PRODUCTION.refill_after(
+                            this.face_analysis_paused,
+                            true,
+                            None,
+                            false,
+                        ) {
+                            this.schedule_face_analysis_refill(delay, cx);
+                        }
+                        this.schedule_face_inventory_watch(cx);
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        this.settings_status =
+                            Some(format!("Could not update face inventory: {error:#}"));
+                        if let Some(delay) = MaintenanceCoordinator::PRODUCTION
+                            .inventory_after(this.face_analysis_paused, true)
+                        {
+                            this.schedule_face_inventory_watch_after(delay, cx);
+                        }
+                    }
+                }
+                cx.notify();
+            })?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .detach();
+    }
+
+    #[cfg(not(test))]
+    fn start_people_summary_maintenance(&mut self, cx: &mut Context<Self>) {
+        let root = self.settings.root.clone();
+        let status = cx
+            .background_executor()
+            .spawn(async move { catalog::people::people_summary_rebuild_status(&root) });
+        cx.spawn(async move |this, cx| {
+            let result = status.await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(status) if status.ready_to_enqueue() => {
+                        this.people_summary_rebuild
+                            .enqueue(this.settings.root.clone(), 0);
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        eprintln!("Could not refill People summary maintenance: {error:#}");
+                    }
+                }
+                let timer = cx.background_executor().timer(Duration::from_secs(2));
+                cx.spawn(async move |this, cx| {
+                    timer.await;
+                    this.update(cx, |this, cx| {
+                        this.start_people_summary_maintenance(cx);
+                    })
+                    .ok();
+                })
+                .detach();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn schedule_live_face_inventory_refresh(&mut self, cx: &mut Context<Self>) {
+        if self.face_inventory_refresh_scheduled {
+            return;
+        }
+        self.face_inventory_refresh_scheduled = true;
+        let timer = cx.background_executor().timer(Duration::from_secs(1));
+        cx.spawn(async move |this, cx| {
+            timer.await;
+            this.update(cx, |this, cx| {
+                this.face_inventory_refresh_scheduled = false;
+                if should_start_automatic_face_inventory(&this.settings)
+                    && !this.face_analysis_paused
+                {
+                    this.refresh_face_inventory(cx);
+                }
+            })?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .detach();
+    }
+
+    fn schedule_face_inventory_watch(&mut self, cx: &mut Context<Self>) {
+        if let Some(delay) =
+            MaintenanceCoordinator::PRODUCTION.inventory_after(self.face_analysis_paused, false)
+        {
+            self.schedule_face_inventory_watch_after(delay, cx);
+        }
+    }
+
+    fn schedule_face_inventory_watch_after(&mut self, delay: Duration, cx: &mut Context<Self>) {
+        if self.face_inventory_watch_scheduled || self.face_analysis_paused {
+            return;
+        }
+        self.face_inventory_watch_scheduled = true;
+        let timer = cx.background_executor().timer(delay);
+        cx.spawn(async move |this, cx| {
+            timer.await;
+            this.update(cx, |this, cx| {
+                this.face_inventory_watch_scheduled = false;
+                if should_start_automatic_face_inventory(&this.settings)
+                    && !this.face_analysis_paused
+                {
+                    this.refresh_face_inventory(cx);
+                }
+            })?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .detach();
+    }
+
+    #[cfg(test)]
+    fn schedule_face_analysis_refill(&mut self, _: Duration, _: &mut Context<Self>) {}
+
+    #[cfg(not(test))]
+    fn schedule_face_analysis_refill(&mut self, delay: Duration, cx: &mut Context<Self>) {
+        if self.face_analysis_paused || self.face_analysis_refill_scheduled {
+            return;
+        }
+        self.face_analysis_refill_scheduled = true;
+        let root = self.settings.root.clone();
+        let preferred_subtree = self.model.node(self.selected).path.clone();
+        let recent_assets = self.recent_face_assets.iter().cloned().collect::<Vec<_>>();
+        let maintenance_driver = self.maintenance_driver.clone();
+        let executor = cx.background_executor().clone();
+        let timer_executor = executor.clone();
+        let refill = executor.spawn(async move {
+            timer_executor.timer(delay).await;
+            maintenance_driver.refill(&root, &preferred_subtree, &recent_assets)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = refill.await;
+            this.update(cx, |this, cx| {
+                this.face_analysis_refill_scheduled = false;
+                match result {
+                    Ok((jobs, next_wake)) if !this.face_analysis_paused => {
+                        let had_jobs = !jobs.is_empty();
+                        for (job, rank) in jobs {
+                            this.face_analysis.enqueue(job, rank);
+                        }
+                        this.recognition_refresh
+                            .enqueue(this.settings.root.clone(), 0);
+                        if let Some(delay) = MaintenanceCoordinator::PRODUCTION.refill_after(
+                            this.face_analysis_paused,
+                            had_jobs,
+                            next_wake,
+                            false,
+                        ) {
+                            this.schedule_face_analysis_refill(delay, cx);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        this.settings_status =
+                            Some(format!("Could not refill face analysis: {error:#}"));
+                        if let Some(delay) = MaintenanceCoordinator::PRODUCTION.refill_after(
+                            this.face_analysis_paused,
+                            false,
+                            None,
+                            true,
+                        ) {
+                            this.schedule_face_analysis_refill(delay, cx);
+                        }
+                    }
+                }
+                cx.notify();
+            })?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .detach();
+    }
+
+    fn refresh_people_page(&mut self, cx: &mut Context<Self>) {
+        self.people_query_generation = self.people_query_generation.wrapping_add(1);
+        self.people_query_cancelled.store(true, Ordering::Release);
+        self.people_query_cancelled = Arc::new(AtomicBool::new(false));
+        self.people_rendered_face_indices.clear();
+        self.people_rendered_overview_indices.clear();
+        self.scheduler.clear_scope(PEOPLE_SCOPE);
+        let generation = self.people_query_generation;
+        let cancelled = self.people_query_cancelled.clone();
+        let root = self.settings.root.clone();
+        let subtree =
+            (!self.people_whole_library).then(|| self.model.node(self.selected).path.to_path_buf());
+        let offset = self.people_page.saturating_mul(30) as u64;
+        let selected_person = self.selected_person;
+        let special_page = self.people_special_page;
+        let sort = self.people_sort;
+        let representative_offsets = self.people_representative_offsets.clone();
+        if selected_person.is_some() || special_page.is_some() {
+            self.people_face_selection.clear();
+            self.people_faces = PeoplePageLoad::Loading;
+        } else {
+            self.people_overview = PeoplePageLoad::Loading;
+            self.people_diagnostics = None;
+            let diagnostics_root = root.clone();
+            let diagnostics = cx
+                .background_executor()
+                .spawn(async move { catalog::people::diagnostics(&diagnostics_root) });
+            cx.spawn(async move |this, cx| {
+                let result = diagnostics.await;
+                this.update(cx, |this, cx| {
+                    if generation == this.people_query_generation
+                        && this.directory_view_mode == DirectoryViewMode::People
+                    {
+                        this.people_diagnostics = Some(result.map(Arc::new).map_err(|error| {
+                            Arc::from(format!("Could not load People diagnostics: {error:#}"))
+                        }));
+                        cx.notify();
+                    }
+                })?;
+                Ok::<_, anyhow::Error>(())
+            })
+            .detach();
+        }
+        self.scheduler.clear_scope(PEOPLE_SCOPE);
+        let foreground = self.maintenance_admission.begin_foreground_activity();
+        let query = cx.background_executor().spawn(async move {
+            let _foreground = foreground;
+            #[cfg(test)]
+            if let Some(delay) = PEOPLE_QUERY_TEST_DELAY
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take_if(|(delayed_root, _)| delayed_root == &root)
+                .map(|(_, delay)| delay)
+            {
+                std::thread::sleep(delay);
+            }
+            if let Some(special_page) = special_page {
+                match special_page {
+                    PeopleSpecialPage::Unnamed => {
+                        catalog::people::list_unnamed_faces_page_cancellable(
+                            &root,
+                            subtree.as_deref(),
+                            offset,
+                            30,
+                            cancelled.clone(),
+                        )
+                    }
+                    PeopleSpecialPage::Review => {
+                        catalog::people::list_review_queue_page_cancellable(
+                            &root,
+                            subtree.as_deref(),
+                            offset,
+                            30,
+                            cancelled.clone(),
+                        )
+                    }
+                }
+                .map(EitherPeoplePage::Faces)
+            } else {
+                selected_person.map_or_else(
+                    || {
+                        catalog::people::list_people_page_sorted_cancellable(
+                            &root,
+                            subtree.as_deref(),
+                            sort,
+                            offset,
+                            30,
+                            representative_offsets.clone(),
+                            cancelled.clone(),
+                        )
+                        .map(EitherPeoplePage::Overview)
+                    },
+                    |person_id| {
+                        catalog::people::list_person_faces_page_cancellable(
+                            &root,
+                            person_id,
+                            subtree.as_deref(),
+                            offset,
+                            30,
+                            cancelled.clone(),
+                        )
+                        .map(EitherPeoplePage::Faces)
+                    },
+                )
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = query.await;
+            this.update(cx, |this, cx| {
+                if generation != this.people_query_generation {
+                    return;
+                }
+                if this.directory_view_mode != DirectoryViewMode::People {
+                    return;
+                }
+                match result {
+                    Ok(EitherPeoplePage::Overview(page)) => {
+                        this.people_overview = PeoplePageLoad::Loaded(page);
+                    }
+                    Ok(EitherPeoplePage::Faces(page)) => {
+                        let loaded = page
+                            .items
+                            .iter()
+                            .map(|face| PeopleFaceKey {
+                                face_id: face.face_id,
+                                person_id: face.person_id,
+                            })
+                            .collect::<HashSet<_>>();
+                        this.people_face_context_overrides
+                            .retain(|key, _| loaded.contains(key));
+                        this.people_faces = PeoplePageLoad::Loaded(page);
+                    }
+                    Err(error) => {
+                        let error: Arc<str> = format!("{error:#}").into();
+                        if selected_person.is_some() || special_page.is_some() {
+                            this.people_faces = PeoplePageLoad::Error(error);
+                        } else {
+                            this.people_overview = PeoplePageLoad::Error(error);
+                        }
+                    }
+                }
+                this.refresh_people_render_demand(cx);
+                this.people_restore_grid_focus = true;
+                cx.notify();
+            })?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn retry_failed_people_analysis(&mut self, cx: &mut Context<Self>) {
+        let root = self.settings.root.clone();
+        let work = cx
+            .background_executor()
+            .spawn(async move { catalog::people::retry_failed_analysis(&root) });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(retried) => {
+                        this.people_operation_status = Some(Arc::from(format!(
+                            "Retrying {} analysis and {} recognition job(s)",
+                            retried.analysis_jobs, retried.recognition_jobs
+                        )));
+                        if retried.recognition_jobs > 0 {
+                            this.recognition_refresh
+                                .enqueue(this.settings.root.clone(), 100);
+                        }
+                        this.refresh_face_inventory(cx);
+                        this.refresh_people_page(cx);
+                    }
+                    Err(error) => {
+                        this.people_operation_status = Some(Arc::from(format!(
+                            "Could not retry failed People analysis: {error:#}"
+                        )));
+                    }
+                }
+                cx.notify();
+            })?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .detach();
+    }
+
+    fn refresh_people_render_demand(&mut self, cx: &mut Context<Self>) {
+        if self.directory_view_mode != DirectoryViewMode::People {
+            self.scheduler.clear_scope(PEOPLE_SCOPE);
+            return;
+        }
+        let requests = if self.selected_person.is_some() || self.people_special_page.is_some() {
+            let PeoplePageLoad::Loaded(page) = &self.people_faces else {
+                self.scheduler.clear_scope(PEOPLE_SCOPE);
+                return;
+            };
+            page.items
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| self.people_rendered_face_indices.contains(index))
+                .map(|(_, face)| {
+                    let key = PeopleFaceKey {
+                        face_id: face.face_id,
+                        person_id: face.person_id,
+                    };
+                    let variant = if self.people_face_uses_context(key) {
+                        RenderVariant::face_context(320)
+                    } else {
+                        RenderVariant::face_crop(face.face_id, face.bounds, 320)
+                    };
+                    (face.path.clone(), variant, JobPriority::visible(0))
+                })
+                .collect()
+        } else {
+            let PeoplePageLoad::Loaded(page) = &self.people_overview else {
+                self.scheduler.clear_scope(PEOPLE_SCOPE);
+                return;
+            };
+            let visible = page
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| self.people_rendered_overview_indices.contains(index))
+                .filter_map(|(_, person)| {
+                    person
+                        .representative
+                        .as_ref()
+                        .map(|face| (person.id, face.clone()))
+                })
+                .collect::<Vec<_>>();
+            // A failed preview can outlive the subscription that observed its
+            // completion when another card refreshes the shared People scope.
+            // Advance cached terminal errors here as well, otherwise that card
+            // would remain permanently stuck on an unavailable candidate.
+            let failed_people = visible
+                .iter()
+                .filter_map(|(person_id, face)| {
+                    matches!(
+                        self.thumbnails.state_for_variant(
+                            &face.path,
+                            self.render_identity_for(&face.path),
+                            RenderVariant::face_crop(face.face_id, face.bounds, 320),
+                        ),
+                        PreviewState::Error(_)
+                    )
+                    .then_some(*person_id)
+                })
+                .collect::<Vec<_>>();
+            if !failed_people.is_empty() {
+                for person_id in failed_people {
+                    *self
+                        .people_representative_offsets
+                        .entry(person_id)
+                        .or_default() += 1;
+                }
+                self.refresh_people_page(cx);
+                return;
+            }
+            visible
+                .into_iter()
+                .map(|(_, face)| {
+                    let variant = RenderVariant::face_crop(face.face_id, face.bounds, 320);
+                    (face.path, variant, JobPriority::visible(0))
+                })
+                .collect()
+        };
+        self.replace_render_scope(PEOPLE_SCOPE, requests, cx);
+    }
+
+    fn advance_failed_people_representative(
+        &mut self,
+        path: &std::path::Path,
+        variant: RenderVariant,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let RenderVariant::FaceCrop { face_id, .. } = variant else {
+            return false;
+        };
+        let PeoplePageLoad::Loaded(page) = &self.people_overview else {
+            return false;
+        };
+        let Some(person_id) = page.items.iter().find_map(|person| {
+            person
+                .representative
+                .as_ref()
+                .filter(|face| face.face_id == face_id && face.path == path)
+                .map(|_| person.id)
+        }) else {
+            return false;
+        };
+        *self
+            .people_representative_offsets
+            .entry(person_id)
+            .or_default() += 1;
+        self.refresh_people_page(cx);
+        true
+    }
+
+    fn change_people_page(&mut self, delta: isize, cx: &mut Context<Self>) {
+        self.people_page = self.people_page.saturating_add_signed(delta);
+        self.people_face_selection.clear();
+        self.people_representative_offsets.clear();
+        self.refresh_people_page(cx);
+        cx.notify();
+    }
+
+    fn visible_people_face_keys(&self) -> Vec<PeopleFaceKey> {
+        match &self.people_faces {
+            PeoplePageLoad::Loaded(page) => page
+                .items
+                .iter()
+                .map(|face| PeopleFaceKey {
+                    face_id: face.face_id,
+                    person_id: face.person_id,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn people_face_uses_context(&self, key: PeopleFaceKey) -> bool {
+        self.people_face_context_overrides
+            .get(&key)
+            .copied()
+            .unwrap_or(self.people_context_mode)
+    }
+
+    fn toggle_people_face_context(&mut self, key: PeopleFaceKey, cx: &mut Context<Self>) {
+        let next = !self.people_face_uses_context(key);
+        if next == self.people_context_mode {
+            self.people_face_context_overrides.remove(&key);
+        } else {
+            self.people_face_context_overrides.insert(key, next);
+        }
+        self.refresh_people_render_demand(cx);
+        cx.notify();
+    }
+
+    fn set_people_context_default(&mut self, context: bool, cx: &mut Context<Self>) {
+        self.people_context_mode = context;
+        self.people_face_context_overrides.clear();
+        self.refresh_people_render_demand(cx);
+        cx.notify();
+    }
+
+    fn people_has_next_page(&self) -> bool {
+        let total = if self.selected_person.is_some() || self.people_special_page.is_some() {
+            match &self.people_faces {
+                PeoplePageLoad::Loaded(page) => page.total,
+                _ => 0,
+            }
+        } else {
+            match &self.people_overview {
+                PeoplePageLoad::Loaded(page) => page.total,
+                _ => 0,
+            }
+        };
+        ((self.people_page as u64) + 1).saturating_mul(30) < total
+    }
+
+    fn current_people_face_path(&self, path: &Path) -> bool {
+        matches!(&self.people_faces, PeoplePageLoad::Loaded(page) if page.items.iter().any(|face| face.path == path))
+    }
+
+    fn people_face_action_enabled(
+        &self,
+        face_id: i64,
+        person_id: i64,
+        decision: PeopleDecision,
+    ) -> bool {
+        if self
+            .pending_people_decisions
+            .iter()
+            .any(|(pending, _)| *pending == face_id)
+        {
+            return false;
+        }
+        matches!(&self.people_faces, PeoplePageLoad::Loaded(page) if page.items.iter().any(|face| {
+            face.face_id == face_id && face.person_id == person_id && match decision {
+                PeopleDecision::Confirm => face.kind == catalog::people::FaceAssignmentKind::Suggested && person_id != 0,
+                PeopleDecision::Reject => matches!(face.kind, catalog::people::FaceAssignmentKind::Suggested | catalog::people::FaceAssignmentKind::Confirmed) && person_id != 0,
+                PeopleDecision::NotFace => face.kind != catalog::people::FaceAssignmentKind::Ignored,
+            }
+        }))
+    }
+
+    fn people_accessibility_controls(&self) -> Vec<accessibility::ControlAccessibilityItem> {
+        use accessibility::{ControlAccessibilityItem as Item, PeopleAccessibilityAction as A};
+        let button = |action, label: &str, disabled, busy| Item {
+            action,
+            label: label.to_owned(),
+            role: accesskit::Role::Button,
+            disabled,
+            busy,
+            toggled: None,
+        };
+        let switch = |action, label: &str, toggled| Item {
+            action,
+            label: label.to_owned(),
+            role: accesskit::Role::Switch,
+            disabled: false,
+            busy: false,
+            toggled: Some(toggled),
+        };
+        let mut controls = Vec::new();
+        if self.people_operation_dialog.is_some() {
+            controls.push(button(
+                A::CancelDialog,
+                "Cancel People operation",
+                self.people_operation_pending,
+                self.people_operation_pending,
+            ));
+            controls.push(button(
+                A::ConfirmDialog,
+                "Confirm People operation",
+                self.people_operation_pending,
+                self.people_operation_pending,
+            ));
+            if matches!(
+                self.people_operation_dialog,
+                Some(PeopleOperationDialog::Target { .. })
+            ) {
+                let (source, selected) = match &self.people_operation_dialog {
+                    Some(PeopleOperationDialog::Target {
+                        operation,
+                        target_person_id,
+                    }) => {
+                        let source = match operation {
+                            PeopleTargetOperation::Merge { source_person_id }
+                            | PeopleTargetOperation::Move {
+                                source_person_id, ..
+                            } => Some(*source_person_id),
+                            PeopleTargetOperation::Assign { .. } => None,
+                        };
+                        (source, *target_person_id)
+                    }
+                    _ => unreachable!(),
+                };
+                controls.extend(
+                    self.people_operation_targets
+                        .iter()
+                        .filter(|(id, _)| Some(*id) != source)
+                        .map(|(id, name)| Item {
+                            action: A::SelectTarget(*id),
+                            label: format!("Select {name} as target"),
+                            role: accesskit::Role::RadioButton,
+                            disabled: self.people_operation_target_loading,
+                            busy: false,
+                            toggled: Some(selected == Some(*id)),
+                        }),
+                );
+                controls.push(button(
+                    A::PreviousTargetPage,
+                    "Previous target page",
+                    self.people_operation_target_page == 0,
+                    self.people_operation_target_loading,
+                ));
+                controls.push(button(
+                    A::NextTargetPage,
+                    "Next target page",
+                    ((self.people_operation_target_page + 1) as u64 * 100)
+                        >= self.people_operation_target_total,
+                    self.people_operation_target_loading,
+                ));
+            }
+            return controls;
+        }
+        let detail = self.selected_person.is_some() || self.people_special_page.is_some();
+        let page_error = if detail {
+            matches!(self.people_faces, PeoplePageLoad::Error(_))
+        } else {
+            matches!(self.people_overview, PeoplePageLoad::Error(_))
+        };
+        if page_error {
+            controls.push(button(A::RetryPage, "Retry loading People", false, false));
+        }
+        controls.push(button(
+            A::PreviousPage,
+            "Previous People page",
+            self.people_page == 0,
+            false,
+        ));
+        controls.push(button(
+            A::NextPage,
+            "Next People page",
+            !self.people_has_next_page(),
+            false,
+        ));
+        if detail {
+            controls.push(button(A::Back, "Back to People", false, false));
+            let blocked = self.people_undo_pending || !self.pending_people_decisions.is_empty();
+            controls.push(button(A::UndoReview, "Undo last review", blocked, blocked));
+            if let Some(person_id) = self.selected_person {
+                controls.push(button(
+                    A::RenamePerson(person_id),
+                    "Rename person",
+                    self.people_operation_pending,
+                    self.people_operation_pending,
+                ));
+                controls.push(button(
+                    A::MergePerson(person_id),
+                    "Merge person",
+                    self.people_operation_pending,
+                    self.people_operation_pending,
+                ));
+            }
+            if let PeoplePageLoad::Loaded(page) = &self.people_faces {
+                for face in &page.items {
+                    let pending = self
+                        .pending_people_decisions
+                        .iter()
+                        .any(|(id, _)| *id == face.face_id);
+                    let name = face.path.file_name().map_or_else(
+                        || face.path.display().to_string(),
+                        |v| v.to_string_lossy().into_owned(),
+                    );
+                    controls.push(button(
+                        A::OpenPhoto(face.path.clone()),
+                        &format!("Open {name}"),
+                        false,
+                        false,
+                    ));
+                    if face.kind != catalog::people::FaceAssignmentKind::Ignored {
+                        controls.push(button(
+                            A::MarkNotFace {
+                                face_id: face.face_id,
+                                person_id: face.person_id,
+                            },
+                            &format!("Mark {name} as not a face"),
+                            pending,
+                            pending,
+                        ));
+                    }
+                }
+            }
+            if !self.people_face_selection.selected.is_empty() {
+                let selected_busy = self.people_undo_pending
+                    || self.people_face_selection.selected.iter().any(|key| {
+                        self.pending_people_decisions
+                            .iter()
+                            .any(|(pending_id, _)| *pending_id == key.face_id)
+                    });
+                let eligible = |decision| {
+                    let mut faces = self
+                        .people_face_selection
+                        .selected
+                        .iter()
+                        .filter(|key| {
+                            self.people_face_action_enabled(key.face_id, key.person_id, decision)
+                        })
+                        .map(|key| (key.face_id, key.person_id))
+                        .collect::<Vec<_>>();
+                    faces.sort_unstable();
+                    faces
+                };
+                let confirm = eligible(PeopleDecision::Confirm);
+                let reject = eligible(PeopleDecision::Reject);
+                let not_face = eligible(PeopleDecision::NotFace);
+                controls.push(button(
+                    A::BulkDecision {
+                        decision: PeopleDecision::Confirm,
+                        faces: confirm.clone(),
+                    },
+                    "Accept selected faces",
+                    self.people_undo_pending || confirm.is_empty(),
+                    selected_busy,
+                ));
+                controls.push(button(
+                    A::BulkDecision {
+                        decision: PeopleDecision::Reject,
+                        faces: reject.clone(),
+                    },
+                    "Reject selected faces",
+                    self.people_undo_pending || reject.is_empty(),
+                    selected_busy,
+                ));
+                controls.push(button(
+                    A::BulkDecision {
+                        decision: PeopleDecision::NotFace,
+                        faces: not_face.clone(),
+                    },
+                    "Mark selected items as not faces",
+                    self.people_undo_pending || not_face.is_empty(),
+                    selected_busy,
+                ));
+                controls.push(button(
+                    A::CreatePerson,
+                    "Create person from selected faces",
+                    false,
+                    false,
+                ));
+                if let Some(person_id) = self.selected_person {
+                    controls.push(button(
+                        A::MoveSelected(person_id),
+                        "Move selected faces",
+                        false,
+                        false,
+                    ));
+                    controls.push(button(
+                        A::UseAsRepresentative,
+                        "Use selected face as example",
+                        self.people_face_selection.selected.len() != 1,
+                        false,
+                    ));
+                }
+                controls.push(button(
+                    A::ClearSelection,
+                    "Clear face selection",
+                    false,
+                    false,
+                ));
+            }
+        } else {
+            controls.push(button(
+                A::OpenReviewQueue,
+                "Open review queue",
+                false,
+                false,
+            ));
+            controls.push(button(
+                A::OpenUnnamedFaces,
+                "Open unnamed faces",
+                false,
+                false,
+            ));
+            controls.push(switch(
+                A::UseWholeLibrary(true),
+                "Use whole library scope",
+                self.people_whole_library,
+            ));
+            controls.push(switch(
+                A::UseWholeLibrary(false),
+                "Use selected subtree scope",
+                !self.people_whole_library,
+            ));
+            controls.push(button(
+                A::CycleSort,
+                &format!("Sort People by {}", people_sort_label(self.people_sort)),
+                false,
+                false,
+            ));
+            controls.push(switch(
+                A::ToggleAnalysisPause,
+                "Pause automatic face analysis",
+                self.face_analysis_paused,
+            ));
+            if self.people_diagnostics.as_ref().is_some_and(|result| {
+                result
+                    .as_ref()
+                    .is_ok_and(|d| d.analysis_errors + d.recognition_refresh_errors > 0)
+            }) {
+                controls.push(button(
+                    A::RetryFailedAnalysis,
+                    "Retry failed face analysis",
+                    false,
+                    false,
+                ));
+            }
+        }
+        controls
+    }
+
+    fn publish_people_accessibility(&self, window: &Window, cx: &mut Context<Self>) {
+        let snapshot = if self.people_operation_dialog.is_some() {
+            accessibility::people_dialog_snapshot("People operation")
+        } else if self.selected_person.is_some() || self.people_special_page.is_some() {
+            let items = match &self.people_faces {
+                PeoplePageLoad::Loaded(page) => page
+                    .items
+                    .iter()
+                    .map(|face| {
+                        let key = PeopleFaceKey {
+                            face_id: face.face_id,
+                            person_id: face.person_id,
+                        };
+                        let file_name = face.path.file_name().map_or_else(
+                            || face.path.display().to_string(),
+                            |name| name.to_string_lossy().into_owned(),
+                        );
+                        let pending = self
+                            .pending_people_decisions
+                            .iter()
+                            .any(|(face_id, _)| *face_id == face.face_id);
+                        let decision = match face.kind {
+                            catalog::people::FaceAssignmentKind::Suggested => "suggested",
+                            catalog::people::FaceAssignmentKind::Confirmed => "confirmed",
+                            catalog::people::FaceAssignmentKind::Rejected => "rejected",
+                            catalog::people::FaceAssignmentKind::Unassigned => "unassigned",
+                            catalog::people::FaceAssignmentKind::Ignored => "not a face",
+                        };
+                        (
+                            file_name,
+                            accessibility::FaceAccessibilityItem {
+                                face_id: face.face_id,
+                                person_id: face.person_id,
+                                file_name: "",
+                                person_name: face.person_name.as_deref(),
+                                decision,
+                                selected: self.people_face_selection.selected.contains(&key),
+                                context: self.people_face_uses_context(key),
+                                pending,
+                                can_accept: face.kind
+                                    == catalog::people::FaceAssignmentKind::Suggested,
+                                can_reject: matches!(
+                                    face.kind,
+                                    catalog::people::FaceAssignmentKind::Suggested
+                                        | catalog::people::FaceAssignmentKind::Confirmed
+                                ),
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            };
+            let borrowed = items
+                .iter()
+                .map(|(file_name, item)| accessibility::FaceAccessibilityItem {
+                    file_name,
+                    ..*item
+                })
+                .collect::<Vec<_>>();
+            accessibility::people_faces_snapshot(&borrowed, self.people_context_mode)
+        } else {
+            let items = match &self.people_overview {
+                PeoplePageLoad::Loaded(page) => page
+                    .items
+                    .iter()
+                    .map(|person| accessibility::PersonAccessibilityItem {
+                        id: person.id,
+                        name: &person.name,
+                        confirmed: person.confirmed_faces,
+                        suggested: person.suggested_faces,
+                    })
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            };
+            accessibility::people_overview_snapshot(&items)
+        };
+        let mut snapshot = snapshot;
+        snapshot.generation = self.people_query_generation;
+        snapshot.append_controls(&self.people_accessibility_controls());
+        self.people_accessibility
+            .update(snapshot, window.is_window_active());
+        for (generation, action) in self.people_accessibility.take_actions() {
+            cx.defer_in(window, move |this, window, cx| {
+                if generation != this.people_query_generation
+                    || this.directory_view_mode != DirectoryViewMode::People
+                    || !matches!(this.main_view, MainView::Dir(_, _))
+                {
+                    return;
+                }
+                match action {
+                    accessibility::PeopleAccessibilityAction::OpenPerson(person_id) => {
+                        if let PeoplePageLoad::Loaded(page) = &this.people_overview
+                            && let Some(person) =
+                                page.items.iter().find(|person| person.id == person_id)
+                        {
+                            this.selected_person_name = Some(person.name.clone());
+                        }
+                        this.selected_person = Some(person_id);
+                        this.people_special_page = None;
+                        this.people_page = 0;
+                        this.set_people_context_default(false, cx);
+                        this.refresh_people_page(cx);
+                    }
+                    accessibility::PeopleAccessibilityAction::SelectFace { face_id, person_id } => {
+                        this.select_people_face(
+                            PeopleFaceKey { face_id, person_id },
+                            false,
+                            false,
+                            cx,
+                        );
+                    }
+                    accessibility::PeopleAccessibilityAction::ToggleFaceContext {
+                        face_id,
+                        person_id,
+                    } => {
+                        this.toggle_people_face_context(PeopleFaceKey { face_id, person_id }, cx);
+                    }
+                    accessibility::PeopleAccessibilityAction::AcceptFace { face_id, person_id } => {
+                        if this.people_face_action_enabled(
+                            face_id,
+                            person_id,
+                            PeopleDecision::Confirm,
+                        ) {
+                            this.apply_people_decision(
+                                face_id,
+                                person_id,
+                                PeopleDecision::Confirm,
+                                cx,
+                            );
+                        }
+                    }
+                    accessibility::PeopleAccessibilityAction::RejectFace { face_id, person_id } => {
+                        if this.people_face_action_enabled(
+                            face_id,
+                            person_id,
+                            PeopleDecision::Reject,
+                        ) {
+                            this.apply_people_decision(
+                                face_id,
+                                person_id,
+                                PeopleDecision::Reject,
+                                cx,
+                            );
+                        }
+                    }
+                    accessibility::PeopleAccessibilityAction::ToggleGridContext => {
+                        this.set_people_context_default(!this.people_context_mode, cx);
+                    }
+                    accessibility::PeopleAccessibilityAction::Back => {
+                        this.selected_person = None;
+                        this.selected_person_name = None;
+                        this.people_special_page = None;
+                        this.set_people_context_default(false, cx);
+                        this.people_page = 0;
+                        this.refresh_people_page(cx);
+                    }
+                    accessibility::PeopleAccessibilityAction::PreviousPage
+                        if this.people_page > 0 =>
+                    {
+                        this.change_people_page(-1, cx);
+                    }
+                    accessibility::PeopleAccessibilityAction::NextPage
+                        if this.people_has_next_page() =>
+                    {
+                        this.change_people_page(1, cx);
+                    }
+                    accessibility::PeopleAccessibilityAction::RenamePerson(person_id)
+                        if this.selected_person == Some(person_id)
+                            && !this.people_operation_pending =>
+                    {
+                        this.open_people_name_dialog(
+                            PeopleNameOperation::Rename { person_id },
+                            this.selected_person_name.clone().unwrap_or_default(),
+                            window,
+                            cx,
+                        );
+                    }
+                    accessibility::PeopleAccessibilityAction::MergePerson(person_id)
+                        if this.selected_person == Some(person_id)
+                            && !this.people_operation_pending =>
+                    {
+                        this.open_people_target_dialog(
+                            PeopleTargetOperation::Merge {
+                                source_person_id: person_id,
+                            },
+                            window,
+                            cx,
+                        );
+                    }
+                    accessibility::PeopleAccessibilityAction::UndoReview
+                        if can_start_people_undo(
+                            this.people_undo_pending,
+                            this.pending_people_decisions.len(),
+                        ) =>
+                    {
+                        this.undo_people_decision_batch(cx);
+                    }
+                    accessibility::PeopleAccessibilityAction::OpenPhoto(path)
+                        if this.current_people_face_path(&path) =>
+                    {
+                        this.show_image(path, cx);
+                    }
+                    accessibility::PeopleAccessibilityAction::MarkNotFace {
+                        face_id,
+                        person_id,
+                    } if this.people_face_action_enabled(
+                        face_id,
+                        person_id,
+                        PeopleDecision::NotFace,
+                    ) =>
+                    {
+                        this.apply_people_decision(face_id, person_id, PeopleDecision::NotFace, cx);
+                    }
+                    accessibility::PeopleAccessibilityAction::OpenReviewQueue => {
+                        this.selected_person = None;
+                        this.people_special_page = Some(PeopleSpecialPage::Review);
+                        this.people_page = 0;
+                        this.refresh_people_page(cx);
+                    }
+                    accessibility::PeopleAccessibilityAction::OpenUnnamedFaces => {
+                        this.selected_person = None;
+                        this.people_special_page = Some(PeopleSpecialPage::Unnamed);
+                        this.people_page = 0;
+                        this.refresh_people_page(cx);
+                    }
+                    accessibility::PeopleAccessibilityAction::UseWholeLibrary(value) => {
+                        this.people_whole_library = value;
+                        this.people_page = 0;
+                        this.people_representative_offsets.clear();
+                        this.refresh_people_page(cx);
+                    }
+                    accessibility::PeopleAccessibilityAction::CycleSort => {
+                        this.people_sort = next_people_sort(this.people_sort);
+                        this.people_page = 0;
+                        this.people_representative_offsets.clear();
+                        this.refresh_people_page(cx);
+                    }
+                    accessibility::PeopleAccessibilityAction::ToggleAnalysisPause => {
+                        this.face_analysis_paused = !this.face_analysis_paused;
+                        this.face_analysis.set_paused(this.face_analysis_paused);
+                        this.recognition_refresh
+                            .set_paused(this.face_analysis_paused);
+                        this.people_summary_rebuild
+                            .set_paused(this.face_analysis_paused);
+                        if !this.face_analysis_paused {
+                            this.refresh_face_inventory(cx);
+                        }
+                        cx.notify();
+                    }
+                    accessibility::PeopleAccessibilityAction::RetryFailedAnalysis => {
+                        this.retry_failed_people_analysis(cx);
+                    }
+                    accessibility::PeopleAccessibilityAction::RetryPage => {
+                        this.refresh_people_page(cx);
+                    }
+                    accessibility::PeopleAccessibilityAction::SelectTarget(person_id)
+                        if !this.people_operation_target_loading
+                            && this
+                                .people_operation_targets
+                                .iter()
+                                .any(|(id, _)| *id == person_id) =>
+                    {
+                        this.select_people_operation_target(person_id, cx);
+                    }
+                    accessibility::PeopleAccessibilityAction::BulkDecision { decision, faces }
+                        if !this.people_undo_pending
+                            && !faces.is_empty()
+                            && faces.iter().all(|(face_id, person_id)| {
+                                this.people_face_selection
+                                    .selected
+                                    .contains(&PeopleFaceKey {
+                                        face_id: *face_id,
+                                        person_id: *person_id,
+                                    })
+                                    && this
+                                        .people_face_action_enabled(*face_id, *person_id, decision)
+                            }) =>
+                    {
+                        this.apply_people_decision_batch(
+                            faces
+                                .into_iter()
+                                .map(|(face_id, person_id)| (face_id, person_id, decision))
+                                .collect(),
+                            cx,
+                        );
+                    }
+                    accessibility::PeopleAccessibilityAction::CreatePerson
+                        if !this.people_face_selection.selected.is_empty() =>
+                    {
+                        if let Ok(face_ids) = prepare_selected_face_ids(&this.people_face_selection)
+                        {
+                            this.open_people_name_dialog(
+                                PeopleNameOperation::Create { face_ids },
+                                String::new(),
+                                window,
+                                cx,
+                            );
+                        }
+                    }
+                    accessibility::PeopleAccessibilityAction::MoveSelected(person_id)
+                        if this.selected_person == Some(person_id) =>
+                    {
+                        if let Ok(face_ids) = this.selected_confirmed_face_ids(person_id) {
+                            this.open_people_target_dialog(
+                                PeopleTargetOperation::Move {
+                                    source_person_id: person_id,
+                                    face_ids,
+                                },
+                                window,
+                                cx,
+                            );
+                        }
+                    }
+                    accessibility::PeopleAccessibilityAction::UseAsRepresentative => {
+                        this.choose_selected_people_representative(cx);
+                    }
+                    accessibility::PeopleAccessibilityAction::ClearSelection => {
+                        this.people_face_selection.clear();
+                        cx.notify();
+                    }
+                    accessibility::PeopleAccessibilityAction::CancelDialog => {
+                        this.people_operation_dialog = None;
+                        this.people_operation_pending = false;
+                        cx.notify();
+                    }
+                    accessibility::PeopleAccessibilityAction::ConfirmDialog
+                        if !this.people_operation_pending =>
+                    {
+                        this.submit_people_operation(cx);
+                    }
+                    accessibility::PeopleAccessibilityAction::PreviousTargetPage
+                        if this.people_operation_target_page > 0 =>
+                    {
+                        this.load_people_operation_target_page(
+                            this.people_operation_target_page - 1,
+                            cx,
+                        );
+                    }
+                    accessibility::PeopleAccessibilityAction::NextTargetPage
+                        if ((this.people_operation_target_page + 1) as u64 * 100)
+                            < this.people_operation_target_total =>
+                    {
+                        this.load_people_operation_target_page(
+                            this.people_operation_target_page + 1,
+                            cx,
+                        );
+                    }
+                    _ => {}
+                }
+            });
+        }
+    }
+
+    fn select_people_face(
+        &mut self,
+        key: PeopleFaceKey,
+        shift: bool,
+        toggle: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let order = self.visible_people_face_keys();
+        self.people_face_selection.click(key, &order, shift, toggle);
+        cx.notify();
+    }
+
+    fn handle_people_selection_key(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        modifiers: gpui::Modifiers,
+        cx: &mut Context<Self>,
+    ) {
+        let order = self.visible_people_face_keys();
+        let delta = match event.keystroke.key.as_str() {
+            "left" => Some(-1),
+            "right" => Some(1),
+            "up" => Some(-3),
+            "down" => Some(3),
+            _ => None,
+        };
+        if let Some(delta) = delta {
+            self.people_face_selection
+                .move_focus(&order, delta, modifiers.shift);
+        } else if event.keystroke.key == "a" && modifiers.secondary() {
+            self.people_face_selection.select_all(&order);
+        } else if event.keystroke.key == "escape" {
+            self.people_face_selection.clear();
+        } else {
+            return;
+        }
+        cx.notify();
+    }
+
+    fn apply_selected_people_decision(&mut self, decision: PeopleDecision, cx: &mut Context<Self>) {
+        let selected = self.people_face_selection.selected.clone();
+        let eligible = match &self.people_faces {
+            PeoplePageLoad::Loaded(page) => page
+                .items
+                .iter()
+                .filter(|face| {
+                    selected.contains(&PeopleFaceKey {
+                        face_id: face.face_id,
+                        person_id: face.person_id,
+                    }) && match decision {
+                        PeopleDecision::Confirm => {
+                            face.kind == catalog::people::FaceAssignmentKind::Suggested
+                                && face.person_id != 0
+                        }
+                        PeopleDecision::Reject => {
+                            matches!(
+                                face.kind,
+                                catalog::people::FaceAssignmentKind::Suggested
+                                    | catalog::people::FaceAssignmentKind::Confirmed
+                            ) && face.person_id != 0
+                        }
+                        PeopleDecision::NotFace => true,
+                    }
+                })
+                .map(|face| PeopleFaceKey {
+                    face_id: face.face_id,
+                    person_id: face.person_id,
+                })
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        let mut ignored_faces = HashSet::new();
+        let mut decisions = Vec::new();
+        for key in eligible {
+            if decision == PeopleDecision::NotFace && !ignored_faces.insert(key.face_id) {
+                continue;
+            }
+            decisions.push((key.face_id, key.person_id, decision));
+        }
+        self.apply_people_decision_batch(decisions, cx);
+        cx.notify();
+    }
+
+    fn open_people_name_dialog(
+        &mut self,
+        operation: PeopleNameOperation,
+        input: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.people_operation_status = None;
+        let cursor = input.chars().count();
+        self.people_operation_dialog = Some(PeopleOperationDialog::Name {
+            operation,
+            input,
+            cursor,
+            selection_anchor: None,
+        });
+        self.people_operation_focus.focus(window);
+        cx.notify();
+    }
+
+    fn open_people_target_dialog(
+        &mut self,
+        operation: PeopleTargetOperation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.people_operation_status = None;
+        self.people_operation_targets.clear();
+        self.people_merge_preview = None;
+        self.people_operation_target_cancelled
+            .store(true, Ordering::Release);
+        self.people_operation_target_cancelled = Arc::new(AtomicBool::new(false));
+        self.people_operation_target_page = 0;
+        self.people_operation_target_total = 0;
+        self.people_operation_dialog = Some(PeopleOperationDialog::Target {
+            operation,
+            target_person_id: None,
+        });
+        self.people_operation_focus.focus(window);
+        self.load_people_operation_target_page(0, cx);
+    }
+
+    fn load_people_operation_target_page(&mut self, page: usize, cx: &mut Context<Self>) {
+        self.people_operation_target_cancelled
+            .store(true, Ordering::Release);
+        self.people_operation_target_cancelled = Arc::new(AtomicBool::new(false));
+        self.people_operation_target_generation =
+            self.people_operation_target_generation.wrapping_add(1);
+        let generation = self.people_operation_target_generation;
+        let cancelled = self.people_operation_target_cancelled.clone();
+        self.people_operation_target_loading = true;
+        self.people_operation_status = None;
+        let root = self.settings.root.clone();
+        let scope =
+            (!self.people_whole_library).then(|| self.model.node(self.selected).path.to_path_buf());
+        const TARGET_PAGE_SIZE: usize = 100;
+        let work = cx.background_executor().spawn(async move {
+            catalog::people::list_people_page_sorted_cancellable(
+                &root,
+                scope.as_deref(),
+                catalog::people::PeopleSort::Name,
+                page.saturating_mul(TARGET_PAGE_SIZE) as u64,
+                TARGET_PAGE_SIZE,
+                HashMap::new(),
+                cancelled,
+            )
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(result_page)
+                        if matches!(
+                            this.people_operation_dialog,
+                            Some(PeopleOperationDialog::Target { .. })
+                        ) && this.people_operation_target_generation == generation =>
+                    {
+                        this.people_operation_targets = result_page
+                            .items
+                            .into_iter()
+                            .map(|person| (person.id, person.name))
+                            .collect();
+                        this.people_operation_target_page = page;
+                        this.people_operation_target_total = result_page.total;
+                    }
+                    Ok(_) => {}
+                    Err(error) if this.people_operation_target_generation == generation => {
+                        this.people_operation_status =
+                            Some(Arc::from(format!("Could not load people: {error:#}")));
+                    }
+                    Err(_) => {}
+                }
+                if this.people_operation_target_generation == generation {
+                    this.people_operation_target_loading = false;
+                }
+                cx.notify();
+            })?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn select_people_operation_target(&mut self, target: i64, cx: &mut Context<Self>) {
+        let source = match &mut self.people_operation_dialog {
+            Some(PeopleOperationDialog::Target {
+                operation,
+                target_person_id,
+            }) => {
+                *target_person_id = Some(target);
+                match operation {
+                    PeopleTargetOperation::Merge { source_person_id } => Some(*source_person_id),
+                    PeopleTargetOperation::Move { .. } | PeopleTargetOperation::Assign { .. } => {
+                        None
+                    }
+                }
+            }
+            _ => return,
+        };
+        let Some(source) = source else {
+            self.people_merge_preview = None;
+            cx.notify();
+            return;
+        };
+        self.people_merge_preview = Some(PeopleMergePreviewLoad::Loading(target));
+        let root = self.settings.root.clone();
+        let work = cx
+            .background_executor()
+            .spawn(async move { catalog::people::preview_people_merge(&root, source, target) });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            this.update(cx, |this, cx| {
+                let current = matches!(
+                    this.people_operation_dialog,
+                    Some(PeopleOperationDialog::Target {
+                        target_person_id: Some(id), ..
+                    }) if id == target
+                );
+                if current {
+                    this.people_merge_preview = Some(match result {
+                        Ok(preview) => PeopleMergePreviewLoad::Loaded(Arc::new(preview)),
+                        Err(error) => PeopleMergePreviewLoad::Error(
+                            target,
+                            Arc::from(format!("Could not preview merge: {error:#}")),
+                        ),
+                    });
+                }
+                cx.notify();
+            })?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn handle_people_operation_key(&mut self, event: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
+        if event.keystroke.key == "escape" {
+            if !self.people_operation_pending {
+                self.dismiss_people_operation();
+            }
+        } else if event.keystroke.key == "enter" {
+            self.submit_people_operation(cx);
+        } else if let Some(PeopleOperationDialog::Name {
+            input,
+            cursor,
+            selection_anchor,
+            ..
+        }) = &mut self.people_operation_dialog
+        {
+            let secondary = event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
+            let shift = event.keystroke.modifiers.shift;
+            let old_cursor = *cursor;
+            let len = input.chars().count();
+            if secondary && event.keystroke.key == "a" {
+                *selection_anchor = Some(0);
+                *cursor = len;
+            } else if secondary && matches!(event.keystroke.key.as_str(), "c" | "x") {
+                let selected = people_editor_selected_text(input, *cursor, *selection_anchor);
+                if !selected.is_empty() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(selected));
+                    if event.keystroke.key == "x" {
+                        people_editor_replace(input, cursor, selection_anchor, "");
+                    }
+                }
+            } else if secondary && event.keystroke.key == "v" {
+                if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                    people_editor_replace(input, cursor, selection_anchor, &text);
+                }
+            } else if matches!(
+                event.keystroke.key.as_str(),
+                "left" | "right" | "home" | "end"
+            ) {
+                *cursor = match event.keystroke.key.as_str() {
+                    "left" => cursor.saturating_sub(1),
+                    "right" => cursor.saturating_add(1).min(len),
+                    "home" => 0,
+                    "end" => len,
+                    _ => *cursor,
+                };
+                if shift {
+                    selection_anchor.get_or_insert(old_cursor);
+                } else {
+                    *selection_anchor = None;
+                }
+            } else if matches!(event.keystroke.key.as_str(), "backspace" | "delete") {
+                if people_editor_range(*cursor, *selection_anchor).is_empty() {
+                    if event.keystroke.key == "backspace" && *cursor > 0 {
+                        *selection_anchor = Some(*cursor - 1);
+                    } else if event.keystroke.key == "delete" && *cursor < len {
+                        *selection_anchor = Some(*cursor + 1);
+                    }
+                }
+                people_editor_replace(input, cursor, selection_anchor, "");
+            } else if !event.keystroke.modifiers.control
+                && !event.keystroke.modifiers.platform
+                && let Some(text) = &event.keystroke.key_char
+            {
+                people_editor_replace(input, cursor, selection_anchor, text);
+            }
+        }
+        cx.notify();
+    }
+
+    fn dismiss_people_operation(&mut self) {
+        self.people_operation_target_cancelled
+            .store(true, Ordering::Release);
+        self.people_operation_dialog = None;
+        self.people_merge_preview = None;
+        self.people_restore_grid_focus = true;
+    }
+
+    fn submit_people_operation(&mut self, cx: &mut Context<Self>) {
+        if self.people_operation_pending {
+            return;
+        }
+        let Some(dialog) = self.people_operation_dialog.clone() else {
+            return;
+        };
+        if let Err(error) = validate_people_operation_dialog(&dialog) {
+            self.people_operation_status = Some(Arc::from(error));
+            cx.notify();
+            return;
+        }
+        if let PeopleOperationDialog::Target {
+            operation: PeopleTargetOperation::Merge { .. },
+            target_person_id: Some(target),
+        } = &dialog
+            && !matches!(
+                self.people_merge_preview,
+                Some(PeopleMergePreviewLoad::Loaded(ref preview))
+                    if preview.target_person_id == *target
+            )
+        {
+            self.people_operation_status =
+                Some(Arc::from("Wait for the merge consequence preview"));
+            cx.notify();
+            return;
+        }
+        self.people_operation_pending = true;
+        self.people_operation_status = None;
+        let root = self.settings.root.clone();
+        let foreground = self.maintenance_admission.begin_foreground_activity();
+        let work = cx.background_executor().spawn(async move {
+            let _foreground = foreground;
+            let result: anyhow::Result<(String, Option<(i64, String)>)> = match dialog {
+                PeopleOperationDialog::Name {
+                    operation, input, ..
+                } => match operation {
+                    PeopleNameOperation::Rename { person_id } => {
+                        catalog::people::rename_person(&root, person_id, &input)?;
+                        Ok((
+                            "Person renamed".to_owned(),
+                            Some((person_id, input.trim().to_owned())),
+                        ))
+                    }
+                    PeopleNameOperation::Create { face_ids } => {
+                        let person_id =
+                            catalog::people::create_person_from_faces(&root, &input, &face_ids)?;
+                        Ok((
+                            format!("Created {}", input.trim()),
+                            Some((person_id, input.trim().to_owned())),
+                        ))
+                    }
+                },
+                PeopleOperationDialog::Target {
+                    operation,
+                    target_person_id,
+                } => {
+                    let target = target_person_id.expect("validated target");
+                    match operation {
+                        PeopleTargetOperation::Merge { source_person_id } => {
+                            catalog::people::merge_people(&root, source_person_id, target)?;
+                            Ok(("People merged".to_owned(), None))
+                        }
+                        PeopleTargetOperation::Move {
+                            source_person_id,
+                            face_ids,
+                        } => {
+                            catalog::people::move_confirmed_faces(
+                                &root,
+                                source_person_id,
+                                target,
+                                &face_ids,
+                            )?;
+                            Ok((format!("Moved {} face(s)", face_ids.len()), None))
+                        }
+                        PeopleTargetOperation::Assign { face_ids } => {
+                            catalog::people::assign_faces_to_person(&root, target, &face_ids)?;
+                            Ok((format!("Assigned {} face(s)", face_ids.len()), None))
+                        }
+                    }
+                }
+            };
+            result
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            this.update(cx, |this, cx| {
+                this.people_operation_pending = false;
+                match result {
+                    Ok((message, selected)) => {
+                        this.people_operation_dialog = None;
+                        this.people_operation_status = Some(Arc::from(message));
+                        this.people_face_selection.clear();
+                        if let Some((person_id, name)) = selected {
+                            this.selected_person = Some(person_id);
+                            this.selected_person_name = Some(name);
+                            this.people_special_page = None;
+                        } else if this.selected_person.is_some() {
+                            this.selected_person = None;
+                            this.selected_person_name = None;
+                        }
+                        this.people_page = 0;
+                        this.refresh_people_page(cx);
+                    }
+                    Err(error) => {
+                        this.people_operation_status =
+                            Some(Arc::from(format!("Could not update people: {error:#}")));
+                    }
+                }
+                cx.notify();
+            })?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn choose_selected_people_representative(&mut self, cx: &mut Context<Self>) {
+        let Some(person_id) = self.selected_person else {
+            return;
+        };
+        let face_ids = match self.selected_confirmed_face_ids(person_id) {
+            Ok(face_ids) => face_ids,
+            Err(error) => {
+                self.people_operation_status = Some(Arc::from(error));
+                cx.notify();
+                return;
+            }
+        };
+        if face_ids.len() != 1 {
+            self.people_operation_status = Some(Arc::from("Select exactly one confirmed face"));
+            cx.notify();
+            return;
+        }
+        let root = self.settings.root.clone();
+        let face_id = face_ids[0];
+        self.people_operation_pending = true;
+        let work = cx.background_executor().spawn(async move {
+            catalog::people::choose_person_representative(&root, person_id, face_id)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            this.update(cx, |this, cx| {
+                this.people_operation_pending = false;
+                match result {
+                    Ok(()) => {
+                        this.people_operation_status = Some(Arc::from("Representative updated"));
+                        this.refresh_people_page(cx);
+                    }
+                    Err(error) => {
+                        this.people_operation_status = Some(Arc::from(format!(
+                            "Could not set representative: {error:#}"
+                        )));
+                    }
+                }
+                cx.notify();
+            })?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .detach();
+    }
+
+    fn selected_confirmed_face_ids(&self, person_id: i64) -> Result<Vec<i64>, String> {
+        let selected = &self.people_face_selection.selected;
+        let Some(page) = (match &self.people_faces {
+            PeoplePageLoad::Loaded(page) => Some(page),
+            _ => None,
+        }) else {
+            return Err("Faces are still loading".to_owned());
+        };
+        let face_ids = page
+            .items
+            .iter()
+            .filter(|face| {
+                face.person_id == person_id
+                    && face.kind == catalog::people::FaceAssignmentKind::Confirmed
+                    && selected.contains(&PeopleFaceKey {
+                        face_id: face.face_id,
+                        person_id: face.person_id,
+                    })
+            })
+            .map(|face| face.face_id)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if face_ids.is_empty() {
+            Err("Select at least one confirmed face for this person".to_owned())
+        } else {
+            Ok(face_ids)
+        }
+    }
+
+    fn render_people_operation_targets(
+        &mut self,
+        rows: Range<usize>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let (source, selected) = match &self.people_operation_dialog {
+            Some(PeopleOperationDialog::Target {
+                operation,
+                target_person_id,
+            }) => {
+                let source = match operation {
+                    PeopleTargetOperation::Merge { source_person_id }
+                    | PeopleTargetOperation::Move {
+                        source_person_id, ..
+                    } => Some(*source_person_id),
+                    PeopleTargetOperation::Assign { .. } => None,
+                };
+                (source, *target_person_id)
+            }
+            _ => return Vec::new(),
+        };
+        rows.filter_map(|row| self.people_operation_targets.get(row).cloned())
+            .map(|(id, name)| {
+                if Some(id) == source {
+                    return div().h(px(0.0)).into_any_element();
+                }
+                div()
+                    .id(("people-target", id as usize))
+                    .tab_index(0)
+                    .h(px(42.0))
+                    .p_2()
+                    .mb_1()
+                    .rounded_sm()
+                    .bg(rgb(if selected == Some(id) {
+                        0x46658c
+                    } else {
+                        0x30343d
+                    }))
+                    .cursor_pointer()
+                    .child(name)
+                    .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, _, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            this.select_people_operation_target(id, cx);
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_people_operation_target(id, cx);
+                    }))
+                    .into_any_element()
+            })
+            .collect()
+    }
+
+    fn apply_people_decision(
+        &mut self,
+        face_id: i64,
+        person_id: i64,
+        decision: PeopleDecision,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_people_decision_batch(vec![(face_id, person_id, decision)], cx);
+    }
+
+    fn apply_people_decision_batch(
+        &mut self,
+        decisions: Vec<(i64, i64, PeopleDecision)>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !can_start_people_review_save(self.people_undo_pending) {
+            self.people_decision_error = Some(Arc::from("Wait for undo to finish"));
+            cx.notify();
+            return false;
+        }
+        if let Err(error) = validate_people_decision_batch(&decisions) {
+            self.people_decision_error = Some(Arc::from(error));
+            cx.notify();
+            return false;
+        }
+        let busy_faces = self
+            .pending_people_decisions
+            .iter()
+            .map(|(face_id, _)| *face_id)
+            .collect::<HashSet<_>>();
+        let decisions = decisions
+            .into_iter()
+            .filter(|(face_id, _, _)| !busy_faces.contains(face_id))
+            .collect::<Vec<_>>();
+        if decisions.is_empty() {
+            return false;
+        }
+        for (face_id, person_id, _) in &decisions {
+            self.pending_people_decisions.insert((*face_id, *person_id));
+        }
+        self.people_decision_error = None;
+        let mut snapshots = Vec::new();
+        if let PeoplePageLoad::Loaded(page) = &mut self.people_faces {
+            for face in &mut page.items {
+                if let Some((_, _, decision)) = decisions.iter().find(|decision| {
+                    people_decision_affects_row(decision, face.face_id, face.person_id)
+                }) {
+                    snapshots.push((face.face_id, face.person_id, face.kind));
+                    face.kind = match decision {
+                        PeopleDecision::Confirm => catalog::people::FaceAssignmentKind::Confirmed,
+                        PeopleDecision::Reject => catalog::people::FaceAssignmentKind::Rejected,
+                        PeopleDecision::NotFace => catalog::people::FaceAssignmentKind::Ignored,
+                    };
+                }
+            }
+        }
+        let root = self.settings.root.clone();
+        let query_identity = (
+            self.people_query_generation,
+            self.selected_person,
+            self.people_special_page,
+            self.people_page,
+        );
+        let batch_prefix = format!(
+            "ui-{}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos()),
+            self.people_query_generation
+        );
+        let chunks = coordinate_people_decision_chunks(&decisions);
+        let foreground = self.maintenance_admission.begin_foreground_activity();
+        let work = cx.background_executor().spawn(async move {
+            let _foreground = foreground;
+            chunks
+                .into_iter()
+                .enumerate()
+                .map(|(index, chunk)| {
+                    let commands = chunk
+                        .iter()
+                        .map(
+                            |(face_id, person_id, decision)| catalog::people::DecisionCommand {
+                                face_id: *face_id,
+                                person_id: (*decision != PeopleDecision::NotFace)
+                                    .then_some(*person_id),
+                                action: match decision {
+                                    PeopleDecision::Confirm => {
+                                        catalog::people::DecisionAction::Confirm
+                                    }
+                                    PeopleDecision::Reject => {
+                                        catalog::people::DecisionAction::Reject
+                                    }
+                                    PeopleDecision::NotFace => {
+                                        catalog::people::DecisionAction::Ignore
+                                    }
+                                },
+                            },
+                        )
+                        .collect();
+                    let result = catalog::people::apply_decisions(
+                        &root,
+                        &catalog::people::DecisionBatch {
+                            id: format!("{batch_prefix}/chunk/{index}"),
+                            commands,
+                        },
+                    );
+                    (chunk, result)
+                })
+                .collect::<Vec<_>>()
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            this.update(cx, |this, cx| {
+                for (face_id, person_id, _) in &decisions {
+                    this.pending_people_decisions
+                        .remove(&(*face_id, *person_id));
+                }
+                let completion_is_current = query_identity
+                    == (
+                        this.people_query_generation,
+                        this.selected_person,
+                        this.people_special_page,
+                        this.people_page,
+                    );
+                let mut failed = Vec::new();
+                let mut successful = Vec::new();
+                let mut errors = Vec::new();
+                for (chunk, chunk_result) in result {
+                    match chunk_result {
+                        Ok(_) => successful.extend(chunk),
+                        Err(error) => {
+                            errors.push(format!("{error:#}"));
+                            failed.extend(chunk);
+                        }
+                    }
+                }
+                if !successful.is_empty() {
+                    // The transaction has committed its durable refresh rows;
+                    // wake recognition now instead of waiting for the poller.
+                    this.recognition_refresh
+                        .enqueue(this.settings.root.clone(), 0);
+                }
+                if completion_is_current
+                    && let PeoplePageLoad::Loaded(page) = &mut this.people_faces
+                {
+                    for (face_id, person_id, old_kind) in snapshots {
+                        let must_rollback = failed
+                            .iter()
+                            .any(|decision| people_decision_affects_row(decision, face_id, person_id));
+                        if must_rollback
+                            && let Some(face) = page.items.iter_mut().find(|face| {
+                                face.face_id == face_id && face.person_id == person_id
+                            })
+                        {
+                            face.kind = old_kind;
+                        }
+                    }
+                }
+                for (face_id, person_id, decision) in successful {
+                    if !completion_is_current {
+                        continue;
+                    }
+                    if decision == PeopleDecision::NotFace {
+                        this.people_face_selection
+                            .selected
+                            .retain(|key| key.face_id != face_id);
+                    } else {
+                        this.people_face_selection.selected.remove(&PeopleFaceKey {
+                            face_id,
+                            person_id,
+                        });
+                    }
+                }
+                if !completion_is_current {
+                    return;
+                } else if failed.is_empty() {
+                    this.people_decision_error = None;
+                } else {
+                    this.people_decision_error = Some(Arc::from(format!(
+                        "Saved {} face decision(s); {} remain selected for retry across {} failed chunk(s): {}",
+                        decisions.len().saturating_sub(failed.len()),
+                        failed.len(),
+                        errors.len(),
+                        errors.join(" · ")
+                    )));
+                }
+                this.refresh_people_render_demand(cx);
+                this.people_restore_grid_focus = true;
+                cx.notify();
+            })?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .detach();
+        cx.notify();
+        true
+    }
+
+    fn undo_people_decision_batch(&mut self, cx: &mut Context<Self>) {
+        if !can_start_people_undo(
+            self.people_undo_pending,
+            self.pending_people_decisions.len(),
+        ) {
+            self.people_decision_error = Some(Arc::from(
+                "Wait for the current review save to finish before undoing",
+            ));
+            cx.notify();
+            return;
+        }
+        self.people_undo_pending = true;
+        self.people_decision_error = None;
+        let root = self.settings.root.clone();
+        let work = cx
+            .background_executor()
+            .spawn(async move { catalog::people::undo_most_recent_decision_batch(&root) });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            this.update(cx, |this, cx| {
+                this.people_undo_pending = false;
+                match result {
+                    Ok(Some(_)) => {
+                        this.recognition_refresh
+                            .enqueue(this.settings.root.clone(), 0);
+                        this.refresh_people_page(cx);
+                    }
+                    Ok(None) => {
+                        this.people_decision_error =
+                            Some(Arc::from("There is no review batch to undo"));
+                    }
+                    Err(error) => {
+                        this.people_decision_error =
+                            Some(Arc::from(format!("Could not undo review batch: {error:#}")));
+                    }
+                }
+                cx.notify();
+            })?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .detach();
+    }
+
+    fn people_grid_columns(&self, window: &Window) -> usize {
+        const CARD_WIDTH: f32 = 220.0;
+        const CARD_GAP: f32 = 12.0;
+        const VIEW_PADDING: f32 = 40.0;
+        let inspector_width = if self.show_job_queue {
+            JOB_QUEUE_PANEL_WIDTH
+        } else {
+            0.0
+        } + if self.show_develop_inspector {
+            DEVELOP_PANEL_WIDTH
+        } else {
+            0.0
+        };
+        let available = (f32::from(window.viewport_size().width)
+            - self.sidebar_width
+            - inspector_width
+            - VIEW_PADDING)
+            .max(CARD_WIDTH);
+        people_grid_column_count(available, CARD_WIDTH, CARD_GAP)
+    }
+
+    fn render_people_face_rows(
+        &mut self,
+        rows: Range<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let columns = self.people_grid_columns(window);
+        if self.people_restore_grid_focus {
+            self.people_restore_grid_focus = false;
+            self.people_grid_focus.focus(window);
+        }
+        let previous_visible = self.people_rendered_face_indices.clone();
+        self.people_rendered_face_indices.clear();
+        for row in rows.clone() {
+            self.people_rendered_face_indices
+                .extend(row.saturating_mul(columns)..row.saturating_add(1).saturating_mul(columns));
+        }
+        if self.people_rendered_face_indices != previous_visible {
+            cx.spawn(async move |this, cx| {
+                this.update(cx, |this, cx| this.refresh_people_render_demand(cx))?;
+                Ok::<_, anyhow::Error>(())
+            })
+            .detach();
+        }
+        let PeoplePageLoad::Loaded(page) = &self.people_faces else {
+            return Vec::new();
+        };
+        rows.map(|row| {
+            div()
+                .flex()
+                .gap_3()
+                .w_full()
+                .h(px(350.0))
+                .children(
+                    page.items[row.saturating_mul(columns)
+                        ..(row.saturating_add(1) * columns).min(page.items.len())]
+                        .iter()
+                        .map(|face| people_review_tile(self, face, cx)),
+                )
+                .into_any_element()
+        })
+        .collect()
+    }
+
+    fn render_people_overview_rows(
+        &mut self,
+        rows: Range<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let columns = self.people_grid_columns(window);
+        let previous = self.people_rendered_overview_indices.clone();
+        self.people_rendered_overview_indices.clear();
+        for row in rows.clone() {
+            self.people_rendered_overview_indices
+                .extend(row.saturating_mul(columns)..row.saturating_add(1).saturating_mul(columns));
+        }
+        if previous != self.people_rendered_overview_indices {
+            cx.spawn(async move |this, cx| {
+                this.update(cx, |this, cx| this.refresh_people_render_demand(cx))?;
+                Ok::<_, anyhow::Error>(())
+            })
+            .detach();
+        }
+        let PeoplePageLoad::Loaded(page) = &self.people_overview else {
+            return Vec::new();
+        };
+        rows.map(|row| {
+            div()
+                .flex()
+                .gap_3()
+                .children(
+                    page.items[row.saturating_mul(columns)
+                        ..(row.saturating_add(1) * columns).min(page.items.len())]
+                        .iter()
+                        .enumerate()
+                        .map(|(column, person)| {
+                            let person_index = row * columns + column;
+                            let person_id = person.id;
+                            let person_name = person.name.clone();
+                            let keyboard_name = person_name.clone();
+                            let image = person.representative.as_ref().map_or_else(
+                                || {
+                                    div()
+                                        .size_full()
+                                        .child("No confirmed face")
+                                        .into_any_element()
+                                },
+                                |face| {
+                                    people_face_image(
+                                        &self.thumbnails,
+                                        &face.path,
+                                        self.render_identity_for(&face.path),
+                                        RenderVariant::face_crop(face.face_id, face.bounds, 320),
+                                        None,
+                                    )
+                                },
+                            );
+                            div()
+                                .id(("person-card", person_id as usize))
+                                .debug_selector(move || format!("#person-card-{person_id}"))
+                                .tab_index(0)
+                                .when(person_index == 0, |card| {
+                                    card.track_focus(&self.people_primary_card_focus)
+                                })
+                                .w(px(220.))
+                                .p_4()
+                                .rounded_md()
+                                .bg(rgb(0x252932))
+                                .cursor_pointer()
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .h(px(170.))
+                                        .mb_3()
+                                        .overflow_hidden()
+                                        .child(image),
+                                )
+                                .child(div().text_lg().child(person.name.clone()))
+                                .child(format!(
+                                    "{} confirmed · {} suggestions",
+                                    person.confirmed_faces, person.suggested_faces
+                                ))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.selected_person = Some(person_id);
+                                    this.people_special_page = None;
+                                    this.selected_person_name = Some(person_name.clone());
+                                    this.people_page = 0;
+                                    this.people_context_mode = false;
+                                    this.people_face_context_overrides.clear();
+                                    this.refresh_people_page(cx);
+                                }))
+                                .on_key_down(cx.listener(
+                                    move |this, event: &gpui::KeyDownEvent, _, cx| {
+                                        if matches!(event.keystroke.key.as_str(), "enter" | "space")
+                                        {
+                                            this.selected_person = Some(person_id);
+                                            this.people_special_page = None;
+                                            this.selected_person_name = Some(keyboard_name.clone());
+                                            this.people_page = 0;
+                                            this.people_context_mode = false;
+                                            this.people_face_context_overrides.clear();
+                                            this.refresh_people_page(cx);
+                                            cx.stop_propagation();
+                                        }
+                                    },
+                                ))
+                        }),
+                )
+                .into_any_element()
+        })
+        .collect()
+    }
+
+    fn render_people_view(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        self.publish_people_accessibility(window, cx);
+        let page_size = 30_u64;
+        let columns = self.people_grid_columns(window);
+        if self.selected_person.is_some() || self.people_special_page.is_some() {
+            let content = match &self.people_faces {
+                PeoplePageLoad::Loading => people_loading_skeletons(12),
+                PeoplePageLoad::Error(error) => people_error_panel(error, cx),
+                PeoplePageLoad::Loaded(page) if page.items.is_empty() => div()
+                    .p_8()
+                    .text_color(rgb(0xaeb4bf))
+                    .child("No faces on this page.")
+                    .into_any_element(),
+                PeoplePageLoad::Loaded(page) => uniform_list(
+                    "people-face-rows",
+                    page.items.len().div_ceil(columns),
+                    cx.processor(Self::render_people_face_rows),
+                )
+                .h_full()
+                .track_scroll(self.people_face_scroll.clone())
+                .with_sizing_behavior(ListSizingBehavior::Auto)
+                .into_any_element(),
+            };
+            let total = match &self.people_faces {
+                PeoplePageLoad::Loaded(page) => page.total,
+                _ => 0,
+            };
+            let selected_count = self.people_face_selection.selected.len();
+            return div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .tab_index(0)
+                .track_focus(&self.people_grid_focus)
+                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                    this.handle_people_selection_key(event, event.keystroke.modifiers, cx);
+                }))
+                .p_5()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .mb_4()
+                        .child(
+                            div()
+                                .id("people-back")
+                                .debug_selector(|| "#people-back".to_owned())
+                                .tab_index(0)
+                                .track_focus(&self.people_back_focus)
+                                .cursor_pointer()
+                                .child(format!(
+                                    "← People / {}",
+                                    self.selected_person_name.as_deref().unwrap_or(
+                                        match self.people_special_page {
+                                            Some(PeopleSpecialPage::Unnamed) => "Unnamed faces",
+                                            Some(PeopleSpecialPage::Review) => "Review queue",
+                                            None => "Person",
+                                        }
+                                    )
+                                ))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.selected_person = None;
+                                    this.selected_person_name = None;
+                                    this.people_special_page = None;
+                                    this.people_context_mode = false;
+                                    this.people_face_context_overrides.clear();
+                                    this.people_page = 0;
+                                    this.refresh_people_page(cx);
+                                }))
+                                .on_key_down(cx.listener(
+                                    |this, event: &gpui::KeyDownEvent, _, cx| {
+                                        if matches!(event.keystroke.key.as_str(), "enter" | "space")
+                                        {
+                                            this.selected_person = None;
+                                            this.selected_person_name = None;
+                                            this.people_special_page = None;
+                                            this.people_context_mode = false;
+                                            this.people_face_context_overrides.clear();
+                                            this.people_page = 0;
+                                            this.refresh_people_page(cx);
+                                            cx.stop_propagation();
+                                        }
+                                    },
+                                )),
+                        )
+                        .child(div().flex_1())
+                        .child(people_page_controls(self.people_page, total, page_size, cx))
+                        .children(self.selected_person.map(|person_id| {
+                            div()
+                                .flex()
+                                .gap_2()
+                                .ml_3()
+                                .child(
+                                    div()
+                                        .id("rename-person")
+                                        .tab_index(0)
+                                        .px_3()
+                                        .py_1()
+                                        .rounded_sm()
+                                        .bg(rgb(0x30343d))
+                                        .cursor_pointer()
+                                        .child("Rename")
+                                        .on_key_down(cx.listener(
+                                            move |this, event: &gpui::KeyDownEvent, window, cx| {
+                                                if matches!(
+                                                    event.keystroke.key.as_str(),
+                                                    "enter" | "space"
+                                                ) {
+                                                    this.open_people_name_dialog(
+                                                        PeopleNameOperation::Rename { person_id },
+                                                        this.selected_person_name
+                                                            .clone()
+                                                            .unwrap_or_default(),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                    cx.stop_propagation();
+                                                }
+                                            },
+                                        ))
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.open_people_name_dialog(
+                                                PeopleNameOperation::Rename { person_id },
+                                                this.selected_person_name
+                                                    .clone()
+                                                    .unwrap_or_default(),
+                                                window,
+                                                cx,
+                                            );
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id("merge-person")
+                                        .tab_index(0)
+                                        .px_3()
+                                        .py_1()
+                                        .rounded_sm()
+                                        .bg(rgb(0x30343d))
+                                        .cursor_pointer()
+                                        .child("Merge…")
+                                        .on_key_down(cx.listener(
+                                            move |this, event: &gpui::KeyDownEvent, window, cx| {
+                                                if matches!(
+                                                    event.keystroke.key.as_str(),
+                                                    "enter" | "space"
+                                                ) {
+                                                    this.open_people_target_dialog(
+                                                        PeopleTargetOperation::Merge {
+                                                            source_person_id: person_id,
+                                                        },
+                                                        window,
+                                                        cx,
+                                                    );
+                                                    cx.stop_propagation();
+                                                }
+                                            },
+                                        ))
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.open_people_target_dialog(
+                                                PeopleTargetOperation::Merge {
+                                                    source_person_id: person_id,
+                                                },
+                                                window,
+                                                cx,
+                                            );
+                                        })),
+                                )
+                        }))
+                        .child(
+                            div()
+                                .id("people-undo-review")
+                                .tab_index(0)
+                                .ml_3()
+                                .px_3()
+                                .py_1()
+                                .rounded_sm()
+                                .bg(rgb(0x30343d))
+                                .cursor_pointer()
+                                .child(if self.people_undo_pending {
+                                    "Undoing…"
+                                } else if !self.pending_people_decisions.is_empty() {
+                                    "Saving review…"
+                                } else {
+                                    "Undo last review"
+                                })
+                                .on_key_down(cx.listener(
+                                    |this, event: &gpui::KeyDownEvent, _, cx| {
+                                        if matches!(event.keystroke.key.as_str(), "enter" | "space")
+                                        {
+                                            this.undo_people_decision_batch(cx);
+                                        }
+                                    },
+                                ))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.undo_people_decision_batch(cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("people-context-toggle")
+                                .debug_selector(|| "#people-context-toggle".to_owned())
+                                .tab_index(0)
+                                .ml_3()
+                                .px_3()
+                                .py_1()
+                                .rounded_sm()
+                                .bg(rgb(0x30343d))
+                                .cursor_pointer()
+                                .child(if self.people_context_mode {
+                                    "Show face crops"
+                                } else {
+                                    "Show full context"
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.set_people_context_default(!this.people_context_mode, cx);
+                                }))
+                                .on_key_down(cx.listener(
+                                    |this, event: &gpui::KeyDownEvent, _, cx| {
+                                        if matches!(event.keystroke.key.as_str(), "enter" | "space")
+                                        {
+                                            this.set_people_context_default(
+                                                !this.people_context_mode,
+                                                cx,
+                                            );
+                                            cx.stop_propagation();
+                                        }
+                                    },
+                                )),
+                        ),
+                )
+                .children(self.people_decision_error.as_ref().map(|error| {
+                    div()
+                        .mb_3()
+                        .p_3()
+                        .rounded_sm()
+                        .bg(rgb(0x613e42))
+                        .child(error.to_string())
+                }))
+                .children(self.people_operation_status.as_ref().map(|status| {
+                    div()
+                        .mb_3()
+                        .p_3()
+                        .rounded_sm()
+                        .bg(rgb(0x31445b))
+                        .child(status.to_string())
+                }))
+                .children(
+                    (selected_count > 0).then(|| {
+                        people_selection_toolbar(selected_count, self.selected_person, cx)
+                    }),
+                )
+                .child(div().flex_1().overflow_hidden().child(content))
+                .children(
+                    self.people_operation_dialog
+                        .as_ref()
+                        .map(|dialog| people_operation_dialog(self, dialog, cx)),
+                )
+                .into_any_element();
+        }
+
+        let content = match &self.people_overview {
+            PeoplePageLoad::Loading => people_loading_skeletons(10),
+            PeoplePageLoad::Error(error) => people_error_panel(error, cx),
+            PeoplePageLoad::Loaded(page)
+                if page.items.is_empty() && page.unnamed_faces == 0 && page.review_faces == 0 =>
+            {
+                div()
+                    .p_8()
+                    .text_color(rgb(0xaeb4bf))
+                    .child("No people found in this scope.")
+                    .into_any_element()
+            }
+            PeoplePageLoad::Loaded(page) => div()
+                .h_full()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(
+                    div()
+                        .flex()
+                        .gap_3()
+                        .child(people_special_overview_card(true, page.review_faces, cx))
+                        .child(people_special_overview_card(false, page.unnamed_faces, cx)),
+                )
+                .child(
+                    uniform_list(
+                        "people-overview-rows",
+                        page.items.len().div_ceil(columns),
+                        cx.processor(Self::render_people_overview_rows),
+                    )
+                    .h_full()
+                    .track_scroll(self.people_overview_scroll.clone())
+                    .with_sizing_behavior(ListSizingBehavior::Auto),
+                )
+                .into_any_element(),
+        };
+        let total = match &self.people_overview {
+            PeoplePageLoad::Loaded(page) => page.total,
+            _ => 0,
+        };
+        let maintenance = self.face_analysis.stats();
+        let index_status = match &self.people_overview {
+            PeoplePageLoad::Loading => "Loading catalog index…".to_owned(),
+            PeoplePageLoad::Error(_) => "Catalog index unavailable".to_owned(),
+            PeoplePageLoad::Loaded(page) if page.analysis_errors > 0 => format!(
+                "{} pending · {} analysis errors",
+                page.analysis_pending, page.analysis_errors
+            ),
+            PeoplePageLoad::Loaded(page) => {
+                format!(
+                    "Catalog ready · {} pending analysis · {} queued / {} running",
+                    page.analysis_pending, maintenance.queued, maintenance.running
+                )
+            }
+        };
+        let diagnostics = self.people_diagnostics.as_ref().map(|result| match result {
+            Ok(diagnostics) => div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .text_sm()
+                .text_color(rgb(0xaeb4bf))
+                .child(format!(
+                    "Schema {} · detector {} · recognizer {} · policy v{} {} ({}) · {} indexed assets · {} faces · {} stale · {} reconciliation conflicts · {} failed",
+                    diagnostics.schema_version,
+                    diagnostics.detector_model_id,
+                    diagnostics.recognizer_model_id,
+                    diagnostics.recognition_policy_version,
+                    if diagnostics.recognition_policy_active { "active" } else { "inactive" },
+                    &diagnostics.recognition_policy_digest[..12],
+                    diagnostics.indexed_assets,
+                    diagnostics.active_faces,
+                    diagnostics.stale_artifacts,
+                    diagnostics.reconciliation_conflicts,
+                    diagnostics.analysis_errors + diagnostics.recognition_refresh_errors
+                ))
+                .children(
+                    ((diagnostics.analysis_errors + diagnostics.recognition_refresh_errors) > 0)
+                        .then(|| {
+                            div()
+                                .id("people-retry-failed-analysis")
+                                .tab_index(0)
+                                .px_2()
+                                .py_1()
+                                .rounded_sm()
+                                .bg(rgb(0x3f5570))
+                                .cursor_pointer()
+                                .child("Retry failed analysis")
+                                .on_key_down(cx.listener(
+                                    |this, event: &gpui::KeyDownEvent, _, cx| {
+                                        if matches!(
+                                            event.keystroke.key.as_str(),
+                                            "enter" | "space"
+                                        ) {
+                                            this.retry_failed_people_analysis(cx);
+                                            cx.stop_propagation();
+                                        }
+                                    },
+                                ))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.retry_failed_people_analysis(cx);
+                                }))
+                        }),
+                )
+                .into_any_element(),
+            Err(error) => div()
+                .text_sm()
+                .text_color(rgb(0xffa0a0))
+                .child(error.to_string())
+                .into_any_element(),
+        });
+        div()
+            .size_full()
+            .p_5()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .mb_4()
+                    .child(
+                        div()
+                            .id("people-library-scope")
+                            .debug_selector(|| "#people-library-scope".to_owned())
+                            .tab_index(0)
+                            .px_3()
+                            .py_1()
+                            .rounded_sm()
+                            .bg(rgb(if self.people_whole_library {
+                                0x46658c
+                            } else {
+                                0x30343d
+                            }))
+                            .cursor_pointer()
+                            .child("Whole library")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.people_whole_library = true;
+                                this.people_page = 0;
+                                this.people_representative_offsets.clear();
+                                this.refresh_people_page(cx);
+                            }))
+                            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                    this.people_whole_library = true;
+                                    this.people_page = 0;
+                                    this.people_representative_offsets.clear();
+                                    this.refresh_people_page(cx);
+                                    cx.stop_propagation();
+                                }
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("people-subtree-scope")
+                            .debug_selector(|| "#people-subtree-scope".to_owned())
+                            .tab_index(0)
+                            .ml_2()
+                            .px_3()
+                            .py_1()
+                            .rounded_sm()
+                            .bg(rgb(if self.people_whole_library {
+                                0x30343d
+                            } else {
+                                0x46658c
+                            }))
+                            .cursor_pointer()
+                            .child("Selected subtree")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.people_whole_library = false;
+                                this.people_page = 0;
+                                this.people_representative_offsets.clear();
+                                this.refresh_people_page(cx);
+                            }))
+                            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                    this.people_whole_library = false;
+                                    this.people_page = 0;
+                                    this.people_representative_offsets.clear();
+                                    this.refresh_people_page(cx);
+                                    cx.stop_propagation();
+                                }
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("people-sort")
+                            .debug_selector(|| "#people-sort".to_owned())
+                            .tab_index(0)
+                            .ml_3()
+                            .px_3()
+                            .py_1()
+                            .rounded_sm()
+                            .bg(rgb(0x30343d))
+                            .cursor_pointer()
+                            .child(format!("Sort: {}", people_sort_label(self.people_sort)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.people_sort = match this.people_sort {
+                                    catalog::people::PeopleSort::Name => {
+                                        catalog::people::PeopleSort::Confirmed
+                                    }
+                                    catalog::people::PeopleSort::Confirmed => {
+                                        catalog::people::PeopleSort::Review
+                                    }
+                                    catalog::people::PeopleSort::Review => {
+                                        catalog::people::PeopleSort::RecentlyChanged
+                                    }
+                                    catalog::people::PeopleSort::RecentlyChanged => {
+                                        catalog::people::PeopleSort::Name
+                                    }
+                                };
+                                this.people_page = 0;
+                                this.people_representative_offsets.clear();
+                                this.refresh_people_page(cx);
+                            }))
+                            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                    this.people_sort = match this.people_sort {
+                                        catalog::people::PeopleSort::Name => {
+                                            catalog::people::PeopleSort::Confirmed
+                                        }
+                                        catalog::people::PeopleSort::Confirmed => {
+                                            catalog::people::PeopleSort::Review
+                                        }
+                                        catalog::people::PeopleSort::Review => {
+                                            catalog::people::PeopleSort::RecentlyChanged
+                                        }
+                                        catalog::people::PeopleSort::RecentlyChanged => {
+                                            catalog::people::PeopleSort::Name
+                                        }
+                                    };
+                                    this.people_page = 0;
+                                    this.people_representative_offsets.clear();
+                                    this.refresh_people_page(cx);
+                                    cx.stop_propagation();
+                                }
+                            })),
+                    )
+                    .child(
+                        div()
+                            .ml_3()
+                            .text_sm()
+                            .text_color(rgb(0x8b929e))
+                            .child(index_status),
+                    )
+                    .child(
+                        div()
+                            .id("people-analysis-pause")
+                            .tab_index(0)
+                            .ml_3()
+                            .px_3()
+                            .py_1()
+                            .rounded_sm()
+                            .bg(rgb(0x30343d))
+                            .cursor_pointer()
+                            .child(if self.face_analysis_paused {
+                                "Resume analysis"
+                            } else {
+                                "Pause analysis"
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.face_analysis_paused = !this.face_analysis_paused;
+                                this.face_analysis.set_paused(this.face_analysis_paused);
+                                this.recognition_refresh
+                                    .set_paused(this.face_analysis_paused);
+                                this.people_summary_rebuild
+                                    .set_paused(this.face_analysis_paused);
+                                if !this.face_analysis_paused {
+                                    this.refresh_face_inventory(cx);
+                                }
+                                cx.notify();
+                            }))
+                            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                    this.face_analysis_paused = !this.face_analysis_paused;
+                                    this.face_analysis.set_paused(this.face_analysis_paused);
+                                    this.recognition_refresh
+                                        .set_paused(this.face_analysis_paused);
+                                    this.people_summary_rebuild
+                                        .set_paused(this.face_analysis_paused);
+                                    if !this.face_analysis_paused {
+                                        this.refresh_face_inventory(cx);
+                                    }
+                                    cx.notify();
+                                    cx.stop_propagation();
+                                }
+                            })),
+                    )
+                    .child(div().flex_1())
+                    .child(people_page_controls(self.people_page, total, page_size, cx)),
+            )
+            .children(diagnostics)
+            .child(content)
+            .into_any_element()
     }
 
     fn set_online_map_permission(
@@ -3538,7 +7144,72 @@ impl PictureBrowser {
         self.show_job_queue = !self.show_job_queue;
         self.show_view_menu = false;
         self.job_queue_snapshot = self.scheduler.snapshot();
+        self.face_job_queue_snapshot = self.face_analysis.snapshot();
+        self.recognition_job_queue_snapshot = self.recognition_refresh.snapshot();
+        self.summary_job_queue_snapshot = self.people_summary_rebuild.snapshot();
+        if self.show_job_queue {
+            self.refresh_maintenance_diagnostics(cx);
+        }
         cx.notify();
+    }
+
+    fn refresh_maintenance_diagnostics(&mut self, cx: &mut Context<Self>) {
+        if !self.maintenance_diagnostics_throttle.request() {
+            return;
+        }
+        self.start_maintenance_diagnostics_query(cx);
+    }
+
+    fn start_maintenance_diagnostics_query(&mut self, cx: &mut Context<Self>) {
+        let root = self.settings.root.clone();
+        let diagnostics = cx
+            .background_executor()
+            .spawn(async move { catalog::people::diagnostics(&root) });
+        cx.spawn(async move |this, cx| {
+            let result = diagnostics.await;
+            this.update(cx, |this, cx| {
+                this.people_diagnostics = Some(
+                    result
+                        .map(Arc::new)
+                        .map_err(|error| Arc::from(format!("Diagnostics failed: {error:#}"))),
+                );
+                let trailing = this.maintenance_diagnostics_throttle.complete();
+                if trailing {
+                    this.start_maintenance_diagnostics_query(cx);
+                }
+                cx.notify();
+            })?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .detach();
+    }
+
+    fn schedule_maintenance_throughput_expiry(&mut self, cx: &mut Context<Self>) {
+        if self.maintenance_throughput_expiry_scheduled {
+            return;
+        }
+        let Some(delay) = MaintenanceCoordinator::PRODUCTION
+            .throughput_after(self.face_analysis.stats().completed_last_minute)
+        else {
+            return;
+        };
+        self.maintenance_throughput_expiry_scheduled = true;
+        let timer = cx.background_executor().timer(delay);
+        cx.spawn(async move |this, cx| {
+            timer.await;
+            this.update(cx, |this, cx| {
+                this.maintenance_throughput_expiry_scheduled = false;
+                if MaintenanceCoordinator::PRODUCTION
+                    .throughput_after(this.face_analysis.stats().completed_last_minute)
+                    .is_some()
+                {
+                    this.schedule_maintenance_throughput_expiry(cx);
+                }
+                cx.notify();
+            })?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .detach();
     }
 
     fn open_settings(&mut self, _: &OpenSettings, _: &mut Window, cx: &mut Context<Self>) {
@@ -3555,6 +7226,10 @@ impl PictureBrowser {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.show_cache_statistics(cx);
+    }
+
+    fn show_cache_statistics(&mut self, cx: &mut Context<Self>) {
         self.show_cache_statistics = true;
         self.disk_cache_usage = None;
         self.settings_draft = None;
@@ -3640,13 +7315,44 @@ impl PictureBrowser {
         .detach();
     }
 
+    fn clear_render_disk_cache(&mut self, cx: &mut Context<Self>) {
+        let renderer = self.render_pipeline.clone();
+        self.settings_status = Some("Clearing persistent image cache…".to_owned());
+        let clearing = cx
+            .background_executor()
+            .spawn(async move { renderer.clear_disk_cache() });
+        cx.spawn(async move |this, cx| {
+            let result = clearing.await;
+            this.update(cx, |this, cx| {
+                this.settings_status = Some(match result {
+                    Ok(()) => "Persistent image cache cleared.".to_owned(),
+                    Err(error) => format!("Could not clear persistent image cache: {error}"),
+                });
+                this.show_cache_statistics(cx);
+                cx.notify();
+            })?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .detach();
+    }
+
     fn save_settings(&mut self, cx: &mut Context<Self>) {
         let Some(draft) = self.settings_draft.clone() else {
             return;
         };
         match config::save(&self.settings_path, &draft) {
             Ok(()) => {
+                let purge_face_crops = self.settings.face_crop_disk_cache
+                    == config::FaceCropDiskCachePolicy::Disk
+                    && draft.face_crop_disk_cache == config::FaceCropDiskCachePolicy::MemoryOnly;
                 let cache_size_changed = draft.image_cache_size != self.settings.image_cache_size;
+                // Publish the stricter policy before starting the purge. Any
+                // scheduler work racing the clear immediately stops both disk
+                // reads and writes for face crops and cannot repopulate it.
+                self.face_crop_disk_cache_enabled.store(
+                    draft.face_crop_disk_cache == config::FaceCropDiskCachePolicy::Disk,
+                    Ordering::Release,
+                );
                 self.previews.set_capacity(draft.image_cache_size);
                 self.raw_previews.set_capacity(draft.image_cache_size);
                 self.thumbnails
@@ -3664,6 +7370,12 @@ impl PictureBrowser {
                 if self.directory_view_mode == DirectoryViewMode::Map {
                     self.request_map_render(cx);
                 }
+                // Face-crop cache keys deliberately contain no separate privacy-policy
+                // generation. Purge the shared derivative cache on the stricter
+                // transition so a crop written under Disk can never be read later.
+                if purge_face_crops {
+                    self.clear_render_disk_cache(cx);
+                }
             }
             Err(error) => {
                 self.settings_status = Some(format!("Could not save settings: {error:#}"))
@@ -3680,6 +7392,15 @@ impl PictureBrowser {
             SettingsNumber::ImageCacheSize => &mut draft.image_cache_size,
             SettingsNumber::JobParallelism => &mut draft.job_parallelism,
             SettingsNumber::RawParallelism => &mut draft.raw_parallelism,
+            SettingsNumber::FaceWorkers => &mut draft.face_workers,
+            SettingsNumber::FaceMemoryMiB => {
+                let mib = 1024 * 1024;
+                let current = draft.face_worker_memory_bytes.div_ceil(mib).max(64);
+                draft.face_worker_memory_bytes =
+                    current.saturating_add_signed(delta as i64).max(64) * mib;
+                cx.notify();
+                return;
+            }
             SettingsNumber::MapCacheGiB => {
                 let gib = 1024_u64.pow(3);
                 let current = draft.map_cache_bytes.div_ceil(gib).max(1);
@@ -3749,6 +7470,14 @@ impl PictureBrowser {
             let Some(catalog_path) = catalog_path else {
                 return;
             };
+            this.update(cx, |this, cx| {
+                this.lightroom_import_dialog = Some(LightroomImportDialog {
+                    path: catalog_path.clone(),
+                    state: LightroomImportState::Running,
+                });
+                cx.notify();
+            })
+            .ok();
             let work = this
                 .update(cx, |this, cx| {
                     let id = this.work.start(format!(
@@ -3761,17 +7490,30 @@ impl PictureBrowser {
                 .ok()
                 .unwrap_or_default();
             let import_root = root.clone();
+            let import_catalog = catalog_path.clone();
             let result = background
                 .spawn(async move {
-                    catalog::import_lightroom(&import_root, &catalog_path)?;
-                    catalog::load_recipes(&import_root)
+                    let report = catalog::import_lightroom(&import_root, &import_catalog)?;
+                    let recipes = catalog::load_recipes(&import_root)?;
+                    Ok::<_, anyhow::Error>((report, recipes))
                 })
                 .await;
             this.update(cx, |this, cx| {
                 this.work.finish(work);
                 match result {
-                    Ok(recipes) => {
+                    Ok((report, recipes)) => {
                         this.recipes = Some(Arc::new(recipes));
+                        this.lightroom_import_dialog = Some(LightroomImportDialog {
+                            path: catalog_path.clone(),
+                            state: LightroomImportState::Succeeded {
+                                images: report.matched_files,
+                                recipes: report.imported_recipes,
+                                faces: report.imported_faces,
+                            },
+                        });
+                        if this.directory_view_mode == DirectoryViewMode::People {
+                            this.refresh_people_page(cx);
+                        }
                         this.previews.clear();
                         this.raw_previews.clear();
                         this.thumbnails.clear();
@@ -3779,7 +7521,14 @@ impl PictureBrowser {
                             this.request_map_card_thumbnail(cx);
                         }
                     }
-                    Err(error) => eprintln!("cannot import Lightroom catalog: {error:#}"),
+                    Err(error) => {
+                        let message: Arc<str> = Arc::from(format!("{error:#}"));
+                        eprintln!("cannot import Lightroom catalog: {message}");
+                        this.lightroom_import_dialog = Some(LightroomImportDialog {
+                            path: catalog_path.clone(),
+                            state: LightroomImportState::Failed(message),
+                        });
+                    }
                 }
                 cx.notify();
             })
@@ -4105,7 +7854,7 @@ impl PictureBrowser {
         &mut self,
         range: Range<usize>,
         _: &mut Window,
-        _: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> Vec<gpui::AnyElement> {
         range
             .filter_map(|index| {
@@ -4143,6 +7892,162 @@ impl PictureBrowser {
                     );
                 }
                 let scheduler_index = index.saturating_sub(usize::from(self.map_job.is_some()));
+                if scheduler_index >= self.job_queue_snapshot.jobs.len() {
+                    let mut maintenance_index = scheduler_index - self.job_queue_snapshot.jobs.len();
+                    if self.face_inventory_progress.stage.load(Ordering::Acquire) != 0 {
+                        if maintenance_index == 0 {
+                            let label = self
+                                .face_inventory_progress
+                                .label()
+                                .unwrap_or_else(|| "Face inventory maintenance".to_owned());
+                            let cancelled = self
+                                .face_inventory_cancelled
+                                .load(Ordering::Acquire);
+                            return Some(
+                                div()
+                                    .id("face-inventory-job-queue-row")
+                                    .debug_selector(|| {
+                                        "#face-inventory-job-queue-row".to_owned()
+                                    })
+                                    .h(px(76.0))
+                                    .px_3()
+                                    .py_2()
+                                    .border_b_1()
+                                    .border_color(rgb(0x30343d))
+                                    .cursor_pointer()
+                                    .child("Face-analysis inventory")
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(0x9da7b6))
+                                            .child(format!(
+                                                "RUN · maintenance rank -100{} · {label} · click to cancel",
+                                                if cancelled { " · cancelling" } else { "" }
+                                            )),
+                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.face_inventory_cancelled
+                                            .store(true, Ordering::Release);
+                                        cx.notify();
+                                    }))
+                                    .into_any_element(),
+                            );
+                        }
+                        maintenance_index -= 1;
+                    }
+                    let face_snapshot = &self.face_job_queue_snapshot;
+                    if let Some(job) = face_snapshot.get(maintenance_index) {
+                        let key = job.job.clone();
+                        let file = key
+                            .root
+                            .file_name()
+                            .unwrap_or(key.root.as_os_str())
+                            .to_string_lossy()
+                            .into_owned();
+                        return Some(
+                            div()
+                                .id(("face-analysis-job-queue-row", job.job.asset_id as usize))
+                                .debug_selector(|| "#face-analysis-job-queue-row".to_owned())
+                                .h(px(76.0))
+                                .px_3()
+                                .py_2()
+                                .border_b_1()
+                                .border_color(rgb(0x30343d))
+                                .cursor_pointer()
+                                .child(format!("Analyze asset {} · {file}", job.job.asset_id))
+                                .child(div().text_xs().text_color(rgb(0x9da7b6)).child(format!(
+                                    "{:?} · {:?} · rank {}{} · click to cancel",
+                                    job.status,
+                                    job.stage,
+                                    job.rank,
+                                    if job.cancelled { " · cancelling" } else { "" }
+                                )))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.face_analysis.cancel(&key);
+                                    cx.notify();
+                                }))
+                                .into_any_element(),
+                        );
+                    }
+                    if maintenance_index < face_snapshot.len() {
+                        return None;
+                    }
+                    let mut service_index = maintenance_index - face_snapshot.len();
+                    let recognition = self.recognition_refresh.stats();
+                    let recognition_snapshot = &self.recognition_job_queue_snapshot;
+                    if let Some(job) = recognition_snapshot.get(service_index) {
+                        let root = job.job.root.clone();
+                        return Some(
+                            div()
+                                .id("recognition-job-queue-row")
+                                .debug_selector(|| "#recognition-job-queue-row".to_owned())
+                                .h(px(76.0))
+                                .px_3()
+                                .py_2()
+                                .border_b_1()
+                                .border_color(rgb(0x30343d))
+                                .cursor_pointer()
+                                .child("Recognition maintenance")
+                                .child(div().text_xs().text_color(rgb(0x9da7b6)).child(format!(
+                                    "{:?} · rank {}{} · {} complete / {} failed · click to cancel{}",
+                                    job.status,
+                                    job.rank,
+                                    if job.cancelled { " · cancelling" } else { "" },
+                                    recognition.completed,
+                                    recognition.failed,
+                                    recognition.last_error.as_deref().map_or_else(
+                                        String::new,
+                                        |error| format!(" · last error: {error}"),
+                                    )
+                                )))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.recognition_refresh.cancel(&root);
+                                    cx.notify();
+                                }))
+                                .into_any_element(),
+                        );
+                    }
+                    service_index = service_index.saturating_sub(recognition_snapshot.len());
+                    if service_index != 0 {
+                        return None;
+                    }
+                    let summary_job = self.summary_job_queue_snapshot.get(service_index)?;
+                    let summary = self.people_summary_rebuild.stats();
+                    let root = summary_job.job.root.clone();
+                    return Some(
+                        div()
+                            .id("people-summary-job-queue-row")
+                            .debug_selector(|| "#people-summary-job-queue-row".to_owned())
+                            .h(px(76.0))
+                            .px_3()
+                            .py_2()
+                            .border_b_1()
+                            .border_color(rgb(0x30343d))
+                            .cursor_pointer()
+                            .child("People summary rebuild")
+                            .child(div().text_xs().text_color(rgb(0x9da7b6)).child(format!(
+                                "{:?} · rank {}{} · {} complete / {} failed · click to cancel{}",
+                                summary_job.status,
+                                summary_job.rank,
+                                if summary_job.cancelled {
+                                    " · cancelling"
+                                } else {
+                                    ""
+                                },
+                                summary.completed,
+                                summary.failed,
+                                summary.last_error.as_deref().map_or_else(
+                                    String::new,
+                                    |error| format!(" · last error: {error}"),
+                                )
+                            )))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.people_summary_rebuild.cancel(&root);
+                                cx.notify();
+                            }))
+                            .into_any_element(),
+                    );
+                }
                 let job = self.job_queue_snapshot.jobs.get(scheduler_index)?;
                 let status = match job.status {
                     JobSnapshotStatus::Running => "RUN",
@@ -4168,7 +8073,7 @@ impl PictureBrowser {
                 );
                 Some(
                     div()
-                        .h(px(58.0))
+                        .h(px(76.0))
                         .px_3()
                         .py_2()
                         .border_b_1()
@@ -4200,6 +8105,10 @@ impl PictureBrowser {
             })
             .collect()
     }
+}
+
+fn people_grid_column_count(available: f32, card_width: f32, gap: f32) -> usize {
+    ((available + gap) / (card_width + gap)).floor().max(1.0) as usize
 }
 
 fn visible_rows(
@@ -4294,6 +8203,1139 @@ fn visible_thumbnail_demands(
         .collect()
 }
 
+fn people_loading_skeletons(count: usize) -> AnyElement {
+    div()
+        .flex()
+        .flex_wrap()
+        .gap_3()
+        .children((0..count).map(|index| {
+            div()
+                .id(("people-skeleton", index))
+                .w(px(220.0))
+                .h(px(245.0))
+                .rounded_md()
+                .bg(rgb(0x252932))
+        }))
+        .into_any_element()
+}
+
+fn people_sort_label(sort: catalog::people::PeopleSort) -> &'static str {
+    match sort {
+        catalog::people::PeopleSort::Name => "Name",
+        catalog::people::PeopleSort::Confirmed => "Confirmed",
+        catalog::people::PeopleSort::Review => "Review",
+        catalog::people::PeopleSort::RecentlyChanged => "Recent",
+    }
+}
+
+fn next_people_sort(sort: catalog::people::PeopleSort) -> catalog::people::PeopleSort {
+    match sort {
+        catalog::people::PeopleSort::Name => catalog::people::PeopleSort::Confirmed,
+        catalog::people::PeopleSort::Confirmed => catalog::people::PeopleSort::Review,
+        catalog::people::PeopleSort::Review => catalog::people::PeopleSort::RecentlyChanged,
+        catalog::people::PeopleSort::RecentlyChanged => catalog::people::PeopleSort::Name,
+    }
+}
+
+fn people_error_panel(error: &Arc<str>, cx: &mut Context<PictureBrowser>) -> AnyElement {
+    div()
+        .p_6()
+        .rounded_md()
+        .bg(rgb(0x3d292d))
+        .child(div().child(format!("Could not load People: {error}")))
+        .child(
+            div()
+                .id("people-retry")
+                .tab_index(0)
+                .mt_3()
+                .px_3()
+                .py_1()
+                .rounded_sm()
+                .bg(rgb(0x613e42))
+                .cursor_pointer()
+                .child("Retry")
+                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                        this.refresh_people_page(cx);
+                        cx.stop_propagation();
+                    }
+                }))
+                .on_click(cx.listener(|this, _, _, cx| this.refresh_people_page(cx))),
+        )
+        .into_any_element()
+}
+
+fn people_page_controls(
+    page: usize,
+    total: u64,
+    page_size: u64,
+    cx: &mut Context<PictureBrowser>,
+) -> AnyElement {
+    let has_previous = page > 0;
+    let has_next = ((page as u64).saturating_add(1)).saturating_mul(page_size) < total;
+    div()
+        .flex()
+        .items_center()
+        .child(
+            div()
+                .id("people-page-previous")
+                .debug_selector(|| "#people-page-previous".to_owned())
+                .tab_index(if has_previous { 0 } else { -1 })
+                .px_2()
+                .text_color(rgb(if has_previous { 0xd7dbe2 } else { 0x676d78 }))
+                .when(has_previous, |element| {
+                    element
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.change_people_page(-1, cx);
+                        }))
+                        .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                            if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                this.change_people_page(-1, cx);
+                                cx.stop_propagation();
+                            }
+                        }))
+                })
+                .child("Previous"),
+        )
+        .child(div().px_2().child(format!("Page {}", page + 1)))
+        .child(
+            div()
+                .id("people-page-next")
+                .debug_selector(|| "#people-page-next".to_owned())
+                .tab_index(if has_next { 0 } else { -1 })
+                .px_2()
+                .text_color(rgb(if has_next { 0xd7dbe2 } else { 0x676d78 }))
+                .when(has_next, |element| {
+                    element
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.change_people_page(1, cx);
+                        }))
+                        .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                            if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                this.change_people_page(1, cx);
+                                cx.stop_propagation();
+                            }
+                        }))
+                })
+                .child("Next"),
+        )
+        .into_any_element()
+}
+
+fn people_face_image(
+    cache: &PreviewCache,
+    path: &std::path::Path,
+    identity: RenderIdentity,
+    variant: RenderVariant,
+    context_bounds: Option<[f32; 4]>,
+) -> AnyElement {
+    match cache.state_for_variant(path, identity, variant) {
+        PreviewState::Loaded(preview) => {
+            let image =
+                img(preview.image.clone())
+                    .size_full()
+                    .object_fit(if context_bounds.is_some() {
+                        gpui::ObjectFit::Contain
+                    } else {
+                        gpui::ObjectFit::Cover
+                    });
+            let Some(canonical_bounds) = context_bounds else {
+                return image.into_any_element();
+            };
+            let bounds = face_overlay_bounds(&preview.metadata, canonical_bounds);
+            let (image_width, image_height) = preview.metadata.output_dimensions;
+            let aspect = image_width as f32 / image_height.max(1) as f32;
+            let (offset_x, offset_y, scale_x, scale_y) = if aspect >= 1.0 {
+                (0.0, (1.0 - 1.0 / aspect) * 0.5, 1.0, 1.0 / aspect)
+            } else {
+                ((1.0 - aspect) * 0.5, 0.0, aspect, 1.0)
+            };
+            div()
+                .relative()
+                .size_full()
+                .child(image)
+                .child(
+                    div()
+                        .absolute()
+                        .left(relative(offset_x + bounds[0] * scale_x))
+                        .top(relative(offset_y + bounds[1] * scale_y))
+                        .w(relative((bounds[2] - bounds[0]) * scale_x))
+                        .h(relative((bounds[3] - bounds[1]) * scale_y))
+                        .border_2()
+                        .border_color(rgb(0x61d18b)),
+                )
+                .into_any_element()
+        }
+        PreviewState::Error(_) => div().child("Unavailable").into_any_element(),
+        _ => div().child("Loading…").into_any_element(),
+    }
+}
+
+fn people_review_tile(
+    browser: &PictureBrowser,
+    face: &catalog::people::FaceReviewItem,
+    cx: &mut Context<PictureBrowser>,
+) -> AnyElement {
+    let face_id = face.face_id;
+    let person_id = face.person_id;
+    let selection_key = PeopleFaceKey { face_id, person_id };
+    let selected = browser
+        .people_face_selection
+        .selected
+        .contains(&selection_key);
+    let row_key = format!("{face_id}-{person_id}");
+    let path = face.path.clone();
+    let keyboard_path = path.clone();
+    let file_name = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let pending = browser
+        .pending_people_decisions
+        .iter()
+        .any(|(pending_face_id, _)| *pending_face_id == face_id);
+    let tile_selector = format!("#people-face-tile-{row_key}");
+    let context_mode = browser.people_face_uses_context(selection_key);
+    let variant = if context_mode {
+        RenderVariant::face_context(320)
+    } else {
+        RenderVariant::face_crop(face_id, face.bounds, 320)
+    };
+    let mut tile = div()
+        .id(SharedString::from(format!("people-face-tile-{row_key}")))
+        .debug_selector(move || tile_selector)
+        .tab_group()
+        .tab_index(0)
+        .w(px(220.0))
+        .p_3()
+        .rounded_md()
+        .bg(rgb(if selected { 0x303f54 } else { 0x252932 }))
+        .border_2()
+        .border_color(rgb(if selected { 0x70a5df } else { 0x3b4658 }))
+        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+            let modifiers = window.modifiers();
+            this.people_grid_focus.focus(window);
+            this.select_people_face(selection_key, modifiers.shift, modifiers.secondary(), cx);
+        }))
+        .on_key_down(
+            cx.listener(move |this, event: &gpui::KeyDownEvent, window, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    let modifiers = window.modifiers();
+                    this.select_people_face(
+                        selection_key,
+                        modifiers.shift,
+                        modifiers.secondary(),
+                        cx,
+                    );
+                    cx.stop_propagation();
+                }
+            }),
+        )
+        .child(
+            div()
+                .relative()
+                .w(px(190.0))
+                .h(px(190.0))
+                .overflow_hidden()
+                .rounded_sm()
+                .child(people_face_image(
+                    &browser.thumbnails,
+                    &face.path,
+                    browser.render_identity_for(&face.path),
+                    variant,
+                    context_mode.then_some(face.bounds),
+                ))
+                .child(
+                    div()
+                        .id(SharedString::from(format!("toggle-face-context-{row_key}")))
+                        .debug_selector(move || {
+                            format!("#toggle-face-context-{face_id}-{person_id}")
+                        })
+                        .tab_index(0)
+                        .absolute()
+                        .top_2()
+                        .right_2()
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .bg(rgb(0x30343d))
+                        .cursor_pointer()
+                        .child(if context_mode { "Crop" } else { "Context" })
+                        .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, _, cx| {
+                            if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                this.toggle_people_face_context(selection_key, cx);
+                                cx.stop_propagation();
+                            }
+                        }))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.toggle_people_face_context(selection_key, cx);
+                            cx.stop_propagation();
+                        })),
+                ),
+        )
+        .child(
+            div()
+                .mt_2()
+                .text_sm()
+                .text_color(rgb(0xaeb4bf))
+                .child(format!(
+                    "{}{:?} · {}{}",
+                    face.person_name
+                        .as_ref()
+                        .map_or_else(String::new, |name| format!("Suggested: {name} · ")),
+                    face.origin,
+                    face.provenance,
+                    face.confidence.map_or_else(String::new, |confidence| {
+                        format!(" · {:.0}%", confidence * 100.0)
+                    })
+                )),
+        )
+        .child(div().text_xs().text_color(rgb(0x8f98a8)).child(file_name));
+    if face.kind == catalog::people::FaceAssignmentKind::Suggested {
+        tile = tile.child(
+            div()
+                .flex()
+                .mt_2()
+                .gap_2()
+                .child(
+                    div()
+                        .id(SharedString::from(format!("accept-face-{row_key}")))
+                        .debug_selector(move || format!("#accept-face-{face_id}-{person_id}"))
+                        .tab_index(0)
+                        .px_3()
+                        .py_1()
+                        .rounded_sm()
+                        .bg(rgb(if pending { 0x3b4658 } else { 0x365f48 }))
+                        .when(!pending, |button| button.cursor_pointer())
+                        .child(if pending { "Saving…" } else { "Accept" })
+                        .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, _, cx| {
+                            if !pending && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                            {
+                                this.apply_people_decision(
+                                    face_id,
+                                    person_id,
+                                    PeopleDecision::Confirm,
+                                    cx,
+                                );
+                            }
+                        }))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if !pending {
+                                this.apply_people_decision(
+                                    face_id,
+                                    person_id,
+                                    PeopleDecision::Confirm,
+                                    cx,
+                                );
+                            }
+                            cx.stop_propagation();
+                        })),
+                )
+                .child(
+                    div()
+                        .id(SharedString::from(format!("reject-face-{row_key}")))
+                        .debug_selector(move || format!("#reject-face-{face_id}-{person_id}"))
+                        .tab_index(0)
+                        .px_3()
+                        .py_1()
+                        .rounded_sm()
+                        .bg(rgb(if pending { 0x3b4658 } else { 0x613e42 }))
+                        .when(!pending, |button| button.cursor_pointer())
+                        .child(if pending { "Saving…" } else { "Reject" })
+                        .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, _, cx| {
+                            if !pending && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                            {
+                                this.apply_people_decision(
+                                    face_id,
+                                    person_id,
+                                    PeopleDecision::Reject,
+                                    cx,
+                                );
+                            }
+                        }))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if !pending {
+                                this.apply_people_decision(
+                                    face_id,
+                                    person_id,
+                                    PeopleDecision::Reject,
+                                    cx,
+                                );
+                            }
+                            cx.stop_propagation();
+                        })),
+                ),
+        );
+    } else if face.kind == catalog::people::FaceAssignmentKind::Confirmed {
+        tile = tile
+            .child(div().mt_2().text_color(rgb(0x75b58b)).child("Confirmed"))
+            .child(
+                div()
+                    .id(SharedString::from(format!("reject-face-{row_key}")))
+                    .debug_selector(move || format!("#reject-face-{face_id}-{person_id}"))
+                    .tab_index(0)
+                    .mt_2()
+                    .px_3()
+                    .py_1()
+                    .rounded_sm()
+                    .bg(rgb(if pending { 0x3b4658 } else { 0x613e42 }))
+                    .when(!pending, |button| button.cursor_pointer())
+                    .child(if pending {
+                        "Saving…"
+                    } else {
+                        "Reject identity"
+                    })
+                    .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, _, cx| {
+                        if !pending && matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            this.apply_people_decision(
+                                face_id,
+                                person_id,
+                                PeopleDecision::Reject,
+                                cx,
+                            );
+                        }
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !pending {
+                            this.apply_people_decision(
+                                face_id,
+                                person_id,
+                                PeopleDecision::Reject,
+                                cx,
+                            );
+                        }
+                        cx.stop_propagation();
+                    })),
+            );
+    } else {
+        let state = match face.kind {
+            catalog::people::FaceAssignmentKind::Rejected => "Rejected identity",
+            catalog::people::FaceAssignmentKind::Ignored => "Ignored — not a face",
+            _ => "Unassigned",
+        };
+        tile = tile.child(div().mt_2().text_color(rgb(0xaeb4bf)).child(state));
+    }
+    tile.child(
+        div()
+            .flex()
+            .mt_2()
+            .gap_2()
+            .child(
+                div()
+                    .id(SharedString::from(format!("open-face-photo-{row_key}")))
+                    .tab_index(0)
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .bg(rgb(0x30343d))
+                    .cursor_pointer()
+                    .child("Open photo")
+                    .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, _, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            this.show_image(keyboard_path.clone(), cx);
+                        }
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.show_image(path.clone(), cx);
+                        cx.stop_propagation();
+                    })),
+            )
+            .children(
+                (face.kind != catalog::people::FaceAssignmentKind::Ignored).then(|| {
+                    div()
+                        .id(SharedString::from(format!("ignore-face-{row_key}")))
+                        .debug_selector(move || format!("#ignore-face-{face_id}-{person_id}"))
+                        .tab_index(0)
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .bg(rgb(if pending { 0x3b4658 } else { 0x613e42 }))
+                        .when(!pending, |button| button.cursor_pointer())
+                        .child(if pending { "Saving…" } else { "Not a face" })
+                        .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, _, cx| {
+                            if !pending && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                            {
+                                this.apply_people_decision(
+                                    face_id,
+                                    person_id,
+                                    PeopleDecision::NotFace,
+                                    cx,
+                                );
+                            }
+                        }))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if !pending {
+                                this.apply_people_decision(
+                                    face_id,
+                                    person_id,
+                                    PeopleDecision::NotFace,
+                                    cx,
+                                );
+                            }
+                            cx.stop_propagation();
+                        }))
+                }),
+            ),
+    )
+    .into_any_element()
+}
+
+fn people_operation_dialog(
+    browser: &PictureBrowser,
+    dialog: &PeopleOperationDialog,
+    cx: &mut Context<PictureBrowser>,
+) -> AnyElement {
+    let (title, body) = match dialog {
+        PeopleOperationDialog::Name {
+            operation, input, ..
+        } => {
+            let (title, consequence) = match operation {
+                PeopleNameOperation::Rename { .. } => {
+                    ("Rename person", "Enter a new name.".to_owned())
+                }
+                PeopleNameOperation::Create { face_ids } => (
+                    "Create person",
+                    format!(
+                        "Assign {} selected face(s) to the new person.",
+                        face_ids.len()
+                    ),
+                ),
+            };
+            let _ = input;
+            (title, consequence)
+        }
+        PeopleOperationDialog::Target { operation, .. } => {
+            let body = match operation {
+                PeopleTargetOperation::Merge { .. } => {
+                    "Choose the surviving person. Exact consequences are calculated before confirmation.".to_owned()
+                }
+                PeopleTargetOperation::Move { face_ids, .. } => format!(
+                    "Choose the target for {} confirmed face(s). This removes those confirmations from the current person.",
+                    face_ids.len()
+                ),
+                PeopleTargetOperation::Assign { face_ids } => format!(
+                    "Choose the existing person for {} selected face(s).",
+                    face_ids.len()
+                ),
+            };
+            ("Choose target person", body)
+        }
+    };
+    let panel = div()
+        .w(px(560.0))
+        .max_h(px(620.0))
+        .overflow_hidden()
+        .p_5()
+        .rounded_md()
+        .bg(rgb(0x252932))
+        .border_1()
+        .border_color(rgb(0x52749a))
+        .child(div().text_lg().mb_3().child(title))
+        .child(div().mb_3().text_color(rgb(0xaeb4bf)).child(body))
+        .children(
+            matches!(dialog, PeopleOperationDialog::Name { .. }).then(|| {
+                div()
+                    .p_3()
+                    .mb_3()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgb(0x6d91b8))
+                    .child(match dialog {
+                        PeopleOperationDialog::Name {
+                            input,
+                            cursor,
+                            selection_anchor,
+                            ..
+                        } => people_editor_display(input, *cursor, *selection_anchor),
+                        _ => String::new(),
+                    })
+            }),
+        )
+        .children(
+            matches!(dialog, PeopleOperationDialog::Target { .. }).then(|| {
+                uniform_list(
+                    "people-target-list",
+                    browser.people_operation_targets.len(),
+                    cx.processor(PictureBrowser::render_people_operation_targets),
+                )
+                .h(px(380.0))
+                .track_scroll(browser.people_operation_target_scroll.clone())
+                .with_sizing_behavior(ListSizingBehavior::Auto)
+            }),
+        )
+        .children(
+            matches!(dialog, PeopleOperationDialog::Target { .. }).then(|| {
+                let page = browser.people_operation_target_page;
+                let has_next =
+                    (page + 1).saturating_mul(100) < browser.people_operation_target_total as usize;
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .mb_3()
+                    .child(
+                        div()
+                            .id("people-target-previous")
+                            .debug_selector(|| "#people-target-previous".to_owned())
+                            .tab_index(0)
+                            .px_3()
+                            .py_1()
+                            .rounded_sm()
+                            .bg(rgb(0x30343d))
+                            .child("Previous")
+                            .on_key_down(cx.listener(
+                                move |this, event: &gpui::KeyDownEvent, _, cx| {
+                                    if page > 0
+                                        && !this.people_operation_target_loading
+                                        && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                                    {
+                                        this.load_people_operation_target_page(page - 1, cx);
+                                        cx.stop_propagation();
+                                    }
+                                },
+                            ))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if page > 0 && !this.people_operation_target_loading {
+                                    this.load_people_operation_target_page(page - 1, cx);
+                                }
+                            })),
+                    )
+                    .child(format!(
+                        "Page {} · {} people{}",
+                        page + 1,
+                        browser.people_operation_target_total,
+                        if browser.people_operation_target_loading {
+                            " · Loading…"
+                        } else {
+                            ""
+                        }
+                    ))
+                    .child(
+                        div()
+                            .id("people-target-next")
+                            .debug_selector(|| "#people-target-next".to_owned())
+                            .tab_index(0)
+                            .px_3()
+                            .py_1()
+                            .rounded_sm()
+                            .bg(rgb(0x30343d))
+                            .child("Next")
+                            .on_key_down(cx.listener(
+                                move |this, event: &gpui::KeyDownEvent, _, cx| {
+                                    if has_next
+                                        && !this.people_operation_target_loading
+                                        && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                                    {
+                                        this.load_people_operation_target_page(page + 1, cx);
+                                        cx.stop_propagation();
+                                    }
+                                },
+                            ))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if has_next && !this.people_operation_target_loading {
+                                    this.load_people_operation_target_page(page + 1, cx);
+                                }
+                            })),
+                    )
+            }),
+        )
+        .children(browser.people_operation_status.as_ref().map(|error| {
+            div()
+                .mb_3()
+                .text_color(rgb(0xffa0a0))
+                .child(error.to_string())
+        }))
+        .children(browser.people_merge_preview.as_ref().map(|preview| {
+            let text = match preview {
+                PeopleMergePreviewLoad::Loading(target) => {
+                    format!("Calculating merge consequences for target {target}…")
+                }
+                PeopleMergePreviewLoad::Loaded(preview) => people_merge_preview_text(preview),
+                PeopleMergePreviewLoad::Error(target, error) => {
+                    format!("Target {target}: {error}")
+                }
+            };
+            div()
+                .mb_3()
+                .p_3()
+                .rounded_sm()
+                .bg(rgb(0x31445b))
+                .child(text)
+        }))
+        .child(
+            div()
+                .flex()
+                .justify_end()
+                .gap_2()
+                .child(
+                    div()
+                        .id("cancel-people-operation")
+                        .debug_selector(|| "#cancel-people-operation".to_owned())
+                        .tab_index(0)
+                        .px_3()
+                        .py_2()
+                        .rounded_sm()
+                        .bg(rgb(0x30343d))
+                        .when(!browser.people_operation_pending, |button| {
+                            button.cursor_pointer()
+                        })
+                        .child(if browser.people_operation_pending {
+                            "Saving…"
+                        } else {
+                            "Cancel"
+                        })
+                        .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                            if !this.people_operation_pending
+                                && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                            {
+                                this.dismiss_people_operation();
+                                cx.stop_propagation();
+                                cx.notify();
+                            }
+                        }))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if !this.people_operation_pending {
+                                this.dismiss_people_operation();
+                            }
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    div()
+                        .id("confirm-people-operation")
+                        .debug_selector(|| "#confirm-people-operation".to_owned())
+                        .tab_index(0)
+                        .px_3()
+                        .py_2()
+                        .rounded_sm()
+                        .bg(rgb(0x365f48))
+                        .when(!browser.people_operation_pending, |button| {
+                            button.cursor_pointer()
+                        })
+                        .child(if browser.people_operation_pending {
+                            "Saving…"
+                        } else {
+                            "Confirm"
+                        })
+                        .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                            if !this.people_operation_pending
+                                && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                            {
+                                this.submit_people_operation(cx);
+                                cx.stop_propagation();
+                            }
+                        }))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.submit_people_operation(cx);
+                        })),
+                ),
+        );
+    div()
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(gpui::rgba(0x000000aa))
+        .track_focus(&browser.people_operation_focus)
+        .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+            this.handle_people_operation_key(event, cx);
+            cx.stop_propagation();
+        }))
+        .child(panel)
+        .into_any_element()
+}
+
+fn people_special_overview_card(
+    review: bool,
+    count: u64,
+    cx: &mut Context<PictureBrowser>,
+) -> AnyElement {
+    let (id, title, suffix) = if review {
+        ("people-review-queue", "Review queue", "suggestions")
+    } else {
+        ("people-unnamed", "Unnamed faces", "faces")
+    };
+    div()
+        .id(id)
+        .debug_selector(move || format!("#{id}"))
+        .tab_index(0)
+        .w(px(220.))
+        .p_4()
+        .rounded_md()
+        .bg(rgb(0x2d3542))
+        .cursor_pointer()
+        .child(div().text_lg().child(title))
+        .child(format!("{count} {suffix}"))
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.selected_person = None;
+            this.people_special_page = Some(if review {
+                PeopleSpecialPage::Review
+            } else {
+                PeopleSpecialPage::Unnamed
+            });
+            this.people_page = 0;
+            this.refresh_people_page(cx);
+        }))
+        .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, _, cx| {
+            if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                this.selected_person = None;
+                this.people_special_page = Some(if review {
+                    PeopleSpecialPage::Review
+                } else {
+                    PeopleSpecialPage::Unnamed
+                });
+                this.people_page = 0;
+                this.refresh_people_page(cx);
+                cx.stop_propagation();
+            }
+        }))
+        .into_any_element()
+}
+
+fn people_selection_toolbar(
+    selected_count: usize,
+    selected_person: Option<i64>,
+    cx: &mut Context<PictureBrowser>,
+) -> AnyElement {
+    let action = |id: &'static str,
+                  label: &'static str,
+                  color: u32,
+                  decision: PeopleDecision,
+                  cx: &mut Context<PictureBrowser>| {
+        div()
+            .id(id)
+            .debug_selector(move || format!("#{id}"))
+            .tab_index(0)
+            .px_3()
+            .py_2()
+            .rounded_sm()
+            .bg(rgb(color))
+            .cursor_pointer()
+            .child(label)
+            .on_key_down(
+                cx.listener(move |this, event: &gpui::KeyDownEvent, window, cx| {
+                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                        this.people_grid_focus.focus(window);
+                        this.apply_selected_people_decision(decision, cx);
+                        cx.stop_propagation();
+                    }
+                }),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.people_grid_focus.focus(window);
+                this.apply_selected_people_decision(decision, cx);
+                cx.stop_propagation();
+            }))
+    };
+    div()
+        .id("people-selection-actions")
+        .debug_selector(|| "#people-selection-actions".to_owned())
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap_2()
+        .mb_3()
+        .p_2()
+        .rounded_md()
+        .bg(rgb(0x202a38))
+        .border_1()
+        .border_color(rgb(0x52749a))
+        .child(format!("{selected_count} selected"))
+        .child(action(
+            "accept-selected-faces",
+            "Accept",
+            0x365f48,
+            PeopleDecision::Confirm,
+            cx,
+        ))
+        .child(action(
+            "reject-selected-faces",
+            "Reject",
+            0x613e42,
+            PeopleDecision::Reject,
+            cx,
+        ))
+        .child(action(
+            "ignore-selected-faces",
+            "Not a face",
+            0x613e42,
+            PeopleDecision::NotFace,
+            cx,
+        ))
+        .child(
+            div()
+                .id("create-person-from-selected")
+                .debug_selector(|| "#create-person-from-selected".to_owned())
+                .tab_index(0)
+                .px_3()
+                .py_2()
+                .rounded_sm()
+                .bg(rgb(0x3f5570))
+                .cursor_pointer()
+                .child("Create person…")
+                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                        match prepare_selected_face_ids(&this.people_face_selection) {
+                            Ok(face_ids) => this.open_people_name_dialog(
+                                PeopleNameOperation::Create { face_ids },
+                                String::new(),
+                                window,
+                                cx,
+                            ),
+                            Err(error) => {
+                                this.people_operation_status = Some(Arc::from(error));
+                                cx.notify();
+                            }
+                        }
+                        cx.stop_propagation();
+                    }
+                }))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    match prepare_selected_face_ids(&this.people_face_selection) {
+                        Ok(face_ids) => this.open_people_name_dialog(
+                            PeopleNameOperation::Create { face_ids },
+                            String::new(),
+                            window,
+                            cx,
+                        ),
+                        Err(error) => {
+                            this.people_operation_status = Some(Arc::from(error));
+                            cx.notify();
+                        }
+                    }
+                    cx.stop_propagation();
+                })),
+        )
+        .children(selected_person.is_none().then(|| {
+            div()
+                .id("assign-existing-person")
+                .debug_selector(|| "#assign-existing-person".to_owned())
+                .tab_index(0)
+                .px_3()
+                .py_2()
+                .rounded_sm()
+                .bg(rgb(0x3f5570))
+                .cursor_pointer()
+                .child("Assign to existing…")
+                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                        match prepare_selected_face_ids(&this.people_face_selection) {
+                            Ok(face_ids) => this.open_people_target_dialog(
+                                PeopleTargetOperation::Assign { face_ids },
+                                window,
+                                cx,
+                            ),
+                            Err(error) => {
+                                this.people_operation_status = Some(Arc::from(error));
+                                cx.notify();
+                            }
+                        }
+                        cx.stop_propagation();
+                    }
+                }))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    match prepare_selected_face_ids(&this.people_face_selection) {
+                        Ok(face_ids) => this.open_people_target_dialog(
+                            PeopleTargetOperation::Assign { face_ids },
+                            window,
+                            cx,
+                        ),
+                        Err(error) => {
+                            this.people_operation_status = Some(Arc::from(error));
+                            cx.notify();
+                        }
+                    }
+                    cx.stop_propagation();
+                }))
+        }))
+        .children(selected_person.map(|person_id| {
+            div()
+                .flex()
+                .gap_2()
+                .child(
+                    div()
+                        .id("move-selected-faces")
+                        .debug_selector(|| "#move-selected-faces".to_owned())
+                        .tab_index(0)
+                        .px_3()
+                        .py_2()
+                        .rounded_sm()
+                        .bg(rgb(0x3f5570))
+                        .cursor_pointer()
+                        .child("Move to…")
+                        .on_key_down(cx.listener(
+                            move |this, event: &gpui::KeyDownEvent, window, cx| {
+                                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                    match this.selected_confirmed_face_ids(person_id) {
+                                        Ok(face_ids) => this.open_people_target_dialog(
+                                            PeopleTargetOperation::Move {
+                                                source_person_id: person_id,
+                                                face_ids,
+                                            },
+                                            window,
+                                            cx,
+                                        ),
+                                        Err(error) => {
+                                            this.people_operation_status = Some(Arc::from(error));
+                                            cx.notify();
+                                        }
+                                    }
+                                    cx.stop_propagation();
+                                }
+                            },
+                        ))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            match this.selected_confirmed_face_ids(person_id) {
+                                Ok(face_ids) => this.open_people_target_dialog(
+                                    PeopleTargetOperation::Move {
+                                        source_person_id: person_id,
+                                        face_ids,
+                                    },
+                                    window,
+                                    cx,
+                                ),
+                                Err(error) => {
+                                    this.people_operation_status = Some(Arc::from(error));
+                                    cx.notify();
+                                }
+                            }
+                            cx.stop_propagation();
+                        })),
+                )
+                .child(
+                    div()
+                        .id("set-person-representative")
+                        .debug_selector(|| "#set-person-representative".to_owned())
+                        .tab_index(0)
+                        .px_3()
+                        .py_2()
+                        .rounded_sm()
+                        .bg(rgb(0x3f5570))
+                        .cursor_pointer()
+                        .child("Use as example")
+                        .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                            if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                this.choose_selected_people_representative(cx);
+                                cx.stop_propagation();
+                            }
+                        }))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.choose_selected_people_representative(cx);
+                            cx.stop_propagation();
+                        })),
+                )
+        }))
+        .child(
+            div()
+                .id("clear-selected-faces")
+                .debug_selector(|| "#clear-selected-faces".to_owned())
+                .tab_index(0)
+                .px_3()
+                .py_2()
+                .rounded_sm()
+                .bg(rgb(0x30343d))
+                .cursor_pointer()
+                .child("Clear")
+                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                        this.people_face_selection.clear();
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.people_face_selection.clear();
+                    cx.stop_propagation();
+                    cx.notify();
+                })),
+        )
+        .into_any_element()
+}
+
+#[cfg(test)]
+fn people_representative_faces<'a>(
+    people: &'a catalog::people::PeopleCatalog,
+    person_id: i64,
+    visible_face_ids: &HashSet<i64>,
+) -> Vec<&'a catalog::people::FaceRecord> {
+    let Some(person) = people.people.iter().find(|person| person.id == person_id) else {
+        return Vec::new();
+    };
+    let confirmed = |face_id| {
+        people.assignments.iter().any(|assignment| {
+            assignment.person_id == person_id
+                && assignment.face_id == face_id
+                && assignment.kind == catalog::people::FaceAssignmentKind::Confirmed
+        })
+    };
+    let preferred = person
+        .representative_face_id
+        .filter(|face_id| visible_face_ids.contains(face_id) && confirmed(*face_id))
+        .and_then(|face_id| people.faces.iter().find(|face| face.id == face_id));
+    let mut candidates = people
+        .assignments
+        .iter()
+        .filter(|assignment| {
+            assignment.person_id == person_id
+                && assignment.kind == catalog::people::FaceAssignmentKind::Confirmed
+                && visible_face_ids.contains(&assignment.face_id)
+        })
+        .filter_map(|assignment| {
+            people
+                .faces
+                .iter()
+                .find(|face| face.id == assignment.face_id)
+                .map(|face| (assignment, face))
+        })
+        .filter(|(_, face)| {
+            let area = (face.bounds[2] - face.bounds[0]) * (face.bounds[3] - face.bounds[1]);
+            !face.ignored && area >= 0.0025
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(
+        |(left_assignment, left_face), (right_assignment, right_face)| {
+            let left_local = left_assignment.provenance == "rekesz";
+            let right_local = right_assignment.provenance == "rekesz";
+            right_local.cmp(&left_local).then_with(|| {
+                let area = |face: &catalog::people::FaceRecord| {
+                    (face.bounds[2] - face.bounds[0]) * (face.bounds[3] - face.bounds[1])
+                };
+                area(right_face).total_cmp(&area(left_face))
+            })
+        },
+    );
+    let mut faces = candidates
+        .into_iter()
+        .map(|(_, face)| face)
+        .collect::<Vec<_>>();
+    if let Some(preferred) = preferred
+        && !preferred.ignored
+        && let Some(index) = faces.iter().position(|face| face.id == preferred.id)
+    {
+        let preferred = faces.remove(index);
+        faces.insert(0, preferred);
+    }
+    faces
+}
+
+fn face_overlay_bounds(
+    metadata: &rendering::RenderMetadata,
+    canonical_bounds: [f32; 4],
+) -> [f32; 4] {
+    metadata.face_transform.map_or_else(
+        || {
+            rendering::oriented_face_bounds(
+                canonical_bounds,
+                metadata.orientation_applied.unwrap_or(1),
+            )
+        },
+        |transform| transform.bounds(canonical_bounds),
+    )
+}
+
 fn collect_recursive_images(
     scanner: &DirectoryScanner,
     metadata_loader: &MetadataLoader,
@@ -4376,13 +9418,66 @@ fn speculative_indices(
 impl Render for PictureBrowser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.job_queue_snapshot = self.scheduler.snapshot();
+        self.face_job_queue_snapshot = self.face_analysis.snapshot();
+        self.recognition_job_queue_snapshot = self.recognition_refresh.snapshot();
+        self.summary_job_queue_snapshot = self.people_summary_rebuild.snapshot();
+        let face_jobs = self.face_analysis.stats();
+        let recognition_jobs = self.recognition_refresh.stats();
+        let summary_jobs = self.people_summary_rebuild.stats();
+        let maintenance_delta = (
+            face_jobs.completed + recognition_jobs.completed + summary_jobs.completed,
+            face_jobs.failed + recognition_jobs.failed + summary_jobs.failed,
+            face_jobs.cancelled + recognition_jobs.cancelled + summary_jobs.cancelled,
+        );
+        if maintenance_delta != self.maintenance_diagnostics_observed {
+            self.maintenance_diagnostics_observed = maintenance_delta;
+            self.refresh_maintenance_diagnostics(cx);
+            self.schedule_maintenance_throughput_expiry(cx);
+        }
+        let face_throughput = face_jobs.completed_last_minute;
+        let face_instrumentation = self.face_analysis.instrumentation();
+        let durable_face_summary = self
+            .people_diagnostics
+            .as_ref()
+            .and_then(|result| result.as_ref().ok())
+            .map_or_else(
+                || {
+                    format!(
+                        "{face_throughput} assets/min · {}/{} inference sessions · summary {}/{}",
+                        face_instrumentation.active_inference,
+                        face_instrumentation.engines_constructed,
+                        summary_jobs.queued,
+                        summary_jobs.running
+                    )
+                },
+                |diagnostics| {
+                    format!(
+                        "{} analyzed · {} pending · {} errors · {} reconciliation conflicts · {face_throughput} assets/min · {}/{} inference sessions (peak {}) · summary {}/{}",
+                        diagnostics.indexed_assets,
+                        diagnostics.analysis_pending,
+                        diagnostics.analysis_errors,
+                        diagnostics.reconciliation_conflicts,
+                        face_instrumentation.active_inference,
+                        face_instrumentation.engines_constructed,
+                        face_instrumentation.max_active_inference,
+                        summary_jobs.queued,
+                        summary_jobs.running,
+                    )
+                },
+            );
         let scheduler_jobs = self
             .job_queue_snapshot
             .jobs
             .iter()
             .filter(|job| !job.cancelled)
             .count()
-            + usize::from(self.map_job.is_some());
+            + usize::from(self.map_job.is_some())
+            + face_jobs.queued
+            + face_jobs.running
+            + recognition_jobs.queued
+            + recognition_jobs.running
+            + summary_jobs.queued
+            + summary_jobs.running;
         if self.show_job_queue || scheduler_jobs > 0 || self.work.active > 0 {
             self.schedule_scheduler_refresh(cx);
         }
@@ -4462,6 +9557,11 @@ impl Render for PictureBrowser {
                     .iter()
                     .any(|path| self.render_identity_for(path).mode == RenderMode::Developed),
             };
+        if self.directory_view_mode != DirectoryViewMode::People
+            || !matches!(self.main_view, MainView::Dir(_, _))
+        {
+            self.people_accessibility.deactivate();
+        }
         let (title, show_back, main_content) = match &self.main_view {
             MainView::Image(state) => {
                 let path = state.path.clone();
@@ -4485,7 +9585,9 @@ impl Render for PictureBrowser {
                     RenderVariant::Full => self
                         .previews
                         .state_for(&path, self.render_identity_for(&path)),
-                    RenderVariant::Thumbnail { .. } => unreachable!(),
+                    RenderVariant::Thumbnail { .. }
+                    | RenderVariant::FaceCrop { .. }
+                    | RenderVariant::FaceContext { .. } => unreachable!(),
                 };
                 let content = match state {
                     PreviewState::Loaded(preview) => match zoom {
@@ -4658,10 +9760,13 @@ impl Render for PictureBrowser {
                         DirectoryContents::Loaded(_) => thumbnail_grid(),
                     }
                 };
-                let directory_content = if self.directory_view_mode == DirectoryViewMode::Map {
-                    self.render_map_view(cx)
-                } else {
-                    grid_content
+                if self.directory_view_mode != DirectoryViewMode::People {
+                    self.people_accessibility.deactivate();
+                }
+                let directory_content = match self.directory_view_mode {
+                    DirectoryViewMode::Grid => grid_content,
+                    DirectoryViewMode::Map => self.render_map_view(cx),
+                    DirectoryViewMode::People => self.render_people_view(window, cx),
                 };
                 let content = div()
                     .size_full()
@@ -4755,177 +9860,250 @@ impl Render for PictureBrowser {
                 )
             }
         };
-        let main_view =
-            div()
-                .flex_1()
-                .min_w_0()
-                .h_full()
-                .flex()
-                .flex_col()
-                .relative()
-                .track_focus(&self.main_focus)
-                .key_context("MainView")
-                .on_action(cx.listener(Self::open_selected_image))
-                .on_action(cx.listener(Self::close_image))
-                .on_action(cx.listener(Self::grid_left))
-                .on_action(cx.listener(Self::grid_right))
-                .on_action(cx.listener(Self::grid_up))
-                .on_action(cx.listener(Self::grid_down))
-                .on_action(cx.listener(Self::grid_extend_left))
-                .on_action(cx.listener(Self::grid_extend_right))
-                .on_action(cx.listener(Self::grid_extend_up))
-                .on_action(cx.listener(Self::grid_extend_down))
-                .bg(rgb(0x101217))
-                .child(
-                    div()
-                        .h(px(44.0))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .px_4()
-                        .border_b_1()
-                        .border_color(rgb(0x30343d))
-                        .text_sm()
-                        .text_color(rgb(0xaeb4bf))
-                        .when(show_back, |this| {
-                            this.child(
-                                div()
-                                    .id("back-to-directory")
-                                    .mr_3()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_sm()
-                                    .bg(rgb(0x30343d))
-                                    .hover(|this| this.bg(rgb(0x445066)))
-                                    .child("← Back")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.close_image(&CloseImage, window, cx);
-                                    })),
-                            )
-                        })
-                        .child(title)
-                        .child(div().flex_1())
-                        .when(
-                            !show_back
-                                && self.settings.map_switcher_placement
-                                    == config::MapSwitcherPlacement::Header,
-                            |this| {
-                                this.child(
-                                    div()
-                                        .flex()
-                                        .mr_3()
-                                        .rounded_sm()
-                                        .bg(rgb(0x252932))
-                                        .child(
-                                            div()
-                                                .id("show-grid-view")
-                                                .debug_selector(|| "#show-grid-view".to_owned())
-                                                .px_3()
-                                                .py_1()
-                                                .rounded_sm()
-                                                .bg(rgb(
-                                                    if self.directory_view_mode
-                                                        == DirectoryViewMode::Grid
-                                                    {
-                                                        0x46658c
-                                                    } else {
-                                                        0x30343d
-                                                    },
-                                                ))
-                                                .child("Grid")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.set_directory_view_mode(
-                                                        DirectoryViewMode::Grid,
-                                                        cx,
-                                                    );
-                                                })),
-                                        )
-                                        .child(
-                                            div()
-                                                .id("show-map-view")
-                                                .debug_selector(|| "#show-map-view".to_owned())
-                                                .px_3()
-                                                .py_1()
-                                                .rounded_sm()
-                                                .bg(rgb(
-                                                    if self.directory_view_mode
-                                                        == DirectoryViewMode::Map
-                                                    {
-                                                        0x46658c
-                                                    } else {
-                                                        0x30343d
-                                                    },
-                                                ))
-                                                .child("Map")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.set_directory_view_mode(
-                                                        DirectoryViewMode::Map,
-                                                        cx,
-                                                    );
-                                                })),
-                                        ),
-                                )
-                            },
-                        )
-                        .child(
+        let main_view = div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .flex_col()
+            .relative()
+            .track_focus(&self.main_focus)
+            .key_context("MainView")
+            .on_action(cx.listener(Self::open_selected_image))
+            .on_action(cx.listener(Self::close_image))
+            .on_action(cx.listener(Self::grid_left))
+            .on_action(cx.listener(Self::grid_right))
+            .on_action(cx.listener(Self::grid_up))
+            .on_action(cx.listener(Self::grid_down))
+            .on_action(cx.listener(Self::grid_extend_left))
+            .on_action(cx.listener(Self::grid_extend_right))
+            .on_action(cx.listener(Self::grid_extend_up))
+            .on_action(cx.listener(Self::grid_extend_down))
+            .bg(rgb(0x101217))
+            .child(
+                div()
+                    .h(px(44.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .px_4()
+                    .border_b_1()
+                    .border_color(rgb(0x30343d))
+                    .text_sm()
+                    .text_color(rgb(0xaeb4bf))
+                    .when(show_back, |this| {
+                        this.child(
                             div()
-                                .id("toggle-developed")
-                                .debug_selector(|| "#toggle-developed".to_owned())
+                                .id("back-to-directory")
+                                .mr_3()
                                 .px_2()
                                 .py_1()
                                 .rounded_sm()
-                                .bg(rgb(if has_active_recipe {
-                                    0x36547a
-                                } else {
-                                    0x30343d
-                                }))
+                                .bg(rgb(0x30343d))
                                 .hover(|this| this.bg(rgb(0x445066)))
-                                .child(if has_active_recipe {
-                                    "Developed"
-                                } else if self.developed {
-                                    "Baseline (no adjustments)"
-                                } else {
-                                    "Baseline"
-                                })
+                                .child("← Back")
                                 .on_click(cx.listener(|this, _, window, cx| {
-                                    this.toggle_developed(&ToggleDeveloped, window, cx);
+                                    this.close_image(&CloseImage, window, cx);
                                 })),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .text_color(rgb(0x8d96a5))
-                        .child(main_content),
-                )
-                .when(
-                    !show_back
-                        && self.settings.map_switcher_placement
-                            == config::MapSwitcherPlacement::Floating,
-                    |this| {
-                        this.child(
-                            div()
-                                .absolute()
-                                .bottom(px(18.0))
-                                .left_1_2()
-                                .flex()
-                                .p_1()
-                                .rounded_md()
-                                .bg(gpui::rgba(0x202630ee))
-                                .child(map_control("floating-grid-view", "Grid").on_click(
-                                    cx.listener(|this, _, _, cx| {
-                                        this.set_directory_view_mode(DirectoryViewMode::Grid, cx);
-                                    }),
-                                ))
-                                .child(map_control("floating-map-view", "Map").on_click(
-                                    cx.listener(|this, _, _, cx| {
-                                        this.set_directory_view_mode(DirectoryViewMode::Map, cx);
-                                    }),
-                                )),
                         )
-                    },
-                );
+                    })
+                    .child(title)
+                    .child(div().flex_1())
+                    .when(
+                        !show_back
+                            && self.settings.map_switcher_placement
+                                == config::MapSwitcherPlacement::Header,
+                        |this| {
+                            this.child(
+                                div()
+                                    .flex()
+                                    .mr_3()
+                                    .rounded_sm()
+                                    .bg(rgb(0x252932))
+                                    .child(
+                                        div()
+                                            .id("show-grid-view")
+                                            .debug_selector(|| "#show-grid-view".to_owned())
+                                            .tab_index(0)
+                                            .px_3()
+                                            .py_1()
+                                            .rounded_sm()
+                                            .bg(rgb(
+                                                if self.directory_view_mode
+                                                    == DirectoryViewMode::Grid
+                                                {
+                                                    0x46658c
+                                                } else {
+                                                    0x30343d
+                                                },
+                                            ))
+                                            .child("Grid")
+                                            .on_key_down(cx.listener(
+                                                |this, event: &gpui::KeyDownEvent, _, cx| {
+                                                    if matches!(
+                                                        event.keystroke.key.as_str(),
+                                                        "enter" | "space"
+                                                    ) {
+                                                        this.set_directory_view_mode(
+                                                            DirectoryViewMode::Grid,
+                                                            cx,
+                                                        );
+                                                        cx.stop_propagation();
+                                                    }
+                                                },
+                                            ))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.set_directory_view_mode(
+                                                    DirectoryViewMode::Grid,
+                                                    cx,
+                                                );
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("show-map-view")
+                                            .debug_selector(|| "#show-map-view".to_owned())
+                                            .tab_index(0)
+                                            .px_3()
+                                            .py_1()
+                                            .rounded_sm()
+                                            .bg(rgb(
+                                                if self.directory_view_mode
+                                                    == DirectoryViewMode::Map
+                                                {
+                                                    0x46658c
+                                                } else {
+                                                    0x30343d
+                                                },
+                                            ))
+                                            .child("Map")
+                                            .on_key_down(cx.listener(
+                                                |this, event: &gpui::KeyDownEvent, _, cx| {
+                                                    if matches!(
+                                                        event.keystroke.key.as_str(),
+                                                        "enter" | "space"
+                                                    ) {
+                                                        this.set_directory_view_mode(
+                                                            DirectoryViewMode::Map,
+                                                            cx,
+                                                        );
+                                                        cx.stop_propagation();
+                                                    }
+                                                },
+                                            ))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.set_directory_view_mode(
+                                                    DirectoryViewMode::Map,
+                                                    cx,
+                                                );
+                                            })),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("show-people-view")
+                                    .debug_selector(|| "#show-people-view".to_owned())
+                                    .tab_index(0)
+                                    .track_focus(&self.people_view_switch_focus)
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .bg(rgb(
+                                        if self.directory_view_mode == DirectoryViewMode::People {
+                                            0x46658c
+                                        } else {
+                                            0x30343d
+                                        },
+                                    ))
+                                    .child("People")
+                                    .on_key_down(cx.listener(
+                                        |this, event: &gpui::KeyDownEvent, _, cx| {
+                                            if matches!(
+                                                event.keystroke.key.as_str(),
+                                                "enter" | "space"
+                                            ) {
+                                                this.set_directory_view_mode(
+                                                    DirectoryViewMode::People,
+                                                    cx,
+                                                );
+                                                cx.stop_propagation();
+                                            }
+                                        },
+                                    ))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.set_directory_view_mode(DirectoryViewMode::People, cx);
+                                    })),
+                            )
+                        },
+                    )
+                    .child(
+                        div()
+                            .id("toggle-developed")
+                            .debug_selector(|| "#toggle-developed".to_owned())
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .bg(rgb(if has_active_recipe {
+                                0x36547a
+                            } else {
+                                0x30343d
+                            }))
+                            .hover(|this| this.bg(rgb(0x445066)))
+                            .child(if has_active_recipe {
+                                "Developed"
+                            } else if self.developed {
+                                "Baseline (no adjustments)"
+                            } else {
+                                "Baseline"
+                            })
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_developed(&ToggleDeveloped, window, cx);
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .text_color(rgb(0x8d96a5))
+                    .child(main_content),
+            )
+            .when(
+                !show_back
+                    && self.settings.map_switcher_placement
+                        == config::MapSwitcherPlacement::Floating,
+                |this| {
+                    this.child(
+                        div()
+                            .absolute()
+                            .bottom(px(18.0))
+                            .left_1_2()
+                            .flex()
+                            .p_1()
+                            .rounded_md()
+                            .bg(gpui::rgba(0x202630ee))
+                            .child(
+                                map_control("floating-grid-view", "Grid").on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.set_directory_view_mode(DirectoryViewMode::Grid, cx);
+                                    },
+                                )),
+                            )
+                            .child(
+                                map_control("floating-map-view", "Map").on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.set_directory_view_mode(DirectoryViewMode::Map, cx);
+                                    },
+                                )),
+                            )
+                            .child(map_control("floating-people-view", "People").on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.set_directory_view_mode(DirectoryViewMode::People, cx);
+                                }),
+                            )),
+                    )
+                },
+            );
         let splitter = div()
             .id("sidebar-splitter")
             .debug_selector(|| "#sidebar-splitter".to_owned())
@@ -4988,23 +10166,74 @@ impl Render for PictureBrowser {
                                 .border_b_1()
                                 .border_color(rgb(0x30343d))
                                 .child("Job queue")
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0x778292))
+                                        .child(durable_face_summary.clone()),
+                                )
                                 .child(div().text_xs().text_color(rgb(0x9da7b6)).child(format!(
                                     "{} running · {} queued",
                                     self.job_queue_snapshot.running
+                                        + self.face_analysis.stats().running
+                                        + self.recognition_refresh.stats().running
+                                        + self.people_summary_rebuild.stats().running
                                         + usize::from(self.map_job.as_ref().is_some_and(|job| {
                                             job.status == MapJobStatus::Running
                                         })),
                                     self.job_queue_snapshot.queued
+                                        + self.face_analysis.stats().queued
+                                        + self.recognition_refresh.stats().queued
+                                        + self.people_summary_rebuild.stats().queued
                                         + usize::from(self.map_job.as_ref().is_some_and(|job| {
                                             job.status == MapJobStatus::Queued
                                         }))
-                                ))),
+                                )))
+                                .child(
+                                    div()
+                                        .id("job-queue-face-analysis-toggle")
+                                        .debug_selector(|| {
+                                            "#job-queue-face-analysis-toggle".to_owned()
+                                        })
+                                        .tab_index(0)
+                                        .ml_2()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_sm()
+                                        .bg(rgb(0x30343d))
+                                        .cursor_pointer()
+                                        .child(if self.face_analysis_paused {
+                                            "Resume faces"
+                                        } else {
+                                            "Pause faces"
+                                        })
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.face_analysis_paused = !this.face_analysis_paused;
+                                            this.face_analysis
+                                                .set_paused(this.face_analysis_paused);
+                                            this.recognition_refresh
+                                                .set_paused(this.face_analysis_paused);
+                                            this.people_summary_rebuild
+                                                .set_paused(this.face_analysis_paused);
+                                            if !this.face_analysis_paused {
+                                                this.refresh_face_inventory(cx);
+                                            }
+                                            cx.notify();
+                                        })),
+                                ),
                         )
                         .child(
                             uniform_list(
                                 "job-queue-rows",
                                 self.job_queue_snapshot.jobs.len()
-                                    + usize::from(self.map_job.is_some()),
+                                    + usize::from(self.map_job.is_some())
+                                    + usize::from(
+                                        self.face_inventory_progress.stage.load(Ordering::Acquire)
+                                            != 0,
+                                    )
+                                    + self.face_job_queue_snapshot.len()
+                                    + self.recognition_job_queue_snapshot.len()
+                                    + self.summary_job_queue_snapshot.len(),
                                 cx.processor(Self::render_job_queue_rows),
                             )
                             .flex_1()
@@ -5015,7 +10244,9 @@ impl Render for PictureBrowser {
                 )
             });
         let progress_active = self.work.active > 0 || scheduler_jobs > 0 || self.map_job.is_some();
-        let progress = if self.work.active > 0 {
+        let progress = if let Some(inventory) = self.face_inventory_progress.fraction() {
+            inventory.clamp(0.005, 1.0)
+        } else if self.work.active > 0 {
             self.work.fraction().clamp(0.08, 1.0)
         } else {
             0.35
@@ -5024,6 +10255,7 @@ impl Render for PictureBrowser {
             .map_job
             .as_ref()
             .map(map_job_progress_label)
+            .or_else(|| self.face_inventory_progress.label())
             .or_else(|| scheduler_progress_label(&self.job_queue_snapshot))
             .or_else(|| self.work.current_activity().map(str::to_owned))
             .unwrap_or_else(|| "Finishing background work…".to_owned());
@@ -5160,6 +10392,10 @@ impl Render for PictureBrowser {
                 cx,
             )
         });
+        let lightroom_import_dialog = self
+            .lightroom_import_dialog
+            .clone()
+            .map(|dialog| render_lightroom_import_dialog(dialog, cx));
         div()
             .size_full()
             .relative()
@@ -5414,7 +10650,84 @@ impl Render for PictureBrowser {
             )
             .when_some(settings_dialog, |this, dialog| this.child(dialog))
             .when_some(cache_statistics_dialog, |this, dialog| this.child(dialog))
+            .when_some(lightroom_import_dialog, |this, dialog| this.child(dialog))
     }
+}
+
+fn render_lightroom_import_dialog(
+    dialog: LightroomImportDialog,
+    cx: &mut Context<PictureBrowser>,
+) -> gpui::Div {
+    let running = matches!(dialog.state, LightroomImportState::Running);
+    let status = match &dialog.state {
+        LightroomImportState::Running => "Reading and importing the Lightroom catalog…".to_owned(),
+        LightroomImportState::Succeeded {
+            images,
+            recipes,
+            faces,
+        } => format!(
+            "Import finished: {images} matched images, {recipes} develop recipes, {faces} faces."
+        ),
+        LightroomImportState::Failed(error) => format!("Import failed: {error}"),
+    };
+    div()
+        .absolute()
+        .inset_0()
+        .occlude()
+        .bg(gpui::rgba(0x000000aa))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            div()
+                .id("lightroom-import-dialog")
+                .w(px(620.0))
+                .p_5()
+                .rounded_md()
+                .border_1()
+                .border_color(rgb(0x4a5260))
+                .bg(rgb(0x252932))
+                .text_color(rgb(0xd8dde7))
+                .child(div().text_xl().mb_2().child("Import Lightroom Catalog"))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(0x9da7b6))
+                        .mb_4()
+                        .child(dialog.path.to_string_lossy().into_owned()),
+                )
+                .child(status)
+                .when(running, |panel| {
+                    panel.child(
+                        div()
+                            .relative()
+                            .w_full()
+                            .h(px(12.0))
+                            .mt_4()
+                            .rounded_sm()
+                            .overflow_hidden()
+                            .bg(rgb(0x181a20))
+                            .child(div().h_full().w(relative(0.65)).bg(rgb(0x315b8f))),
+                    )
+                })
+                .when(!running, |panel| {
+                    panel.child(
+                        div()
+                            .id("close-lightroom-import-dialog")
+                            .mt_4()
+                            .px_4()
+                            .py_2()
+                            .rounded_sm()
+                            .bg(rgb(0x315b8f))
+                            .cursor_pointer()
+                            .child("Close")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.lightroom_import_dialog = None;
+                                cx.notify();
+                            })),
+                    )
+                }),
+        )
 }
 
 fn settings_number_row(
@@ -5500,15 +10813,50 @@ fn render_settings_dialog(
         .justify_center()
         .child(
             div()
+                .id("settings-dialog-panel")
                 .w(px(620.0))
-                .max_h(px(680.0))
+                .max_h(px(860.0))
                 .p_5()
                 .rounded_md()
                 .bg(rgb(0x252932))
                 .text_color(rgb(0xd8dde7))
                 .border_1()
                 .border_color(rgb(0x4a5260))
-                .child(div().text_xl().mb_2().child("Settings"))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .mb_2()
+                        .child(div().text_xl().child("Settings"))
+                        .child(div().flex_1())
+                        .child(
+                            div()
+                                .id("settings-cancel")
+                                .debug_selector(|| "#settings-cancel".to_owned())
+                                .px_3()
+                                .py_1()
+                                .rounded_sm()
+                                .bg(rgb(0x343943))
+                                .child("Cancel")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.settings_draft = None;
+                                    this.settings_status = None;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("settings-save")
+                                .debug_selector(|| "#settings-save".to_owned())
+                                .ml_2()
+                                .px_3()
+                                .py_1()
+                                .rounded_sm()
+                                .bg(rgb(0x315b8f))
+                                .child("Save")
+                                .on_click(cx.listener(|this, _, _, cx| this.save_settings(cx))),
+                        ),
+                )
                 .child(
                     div()
                         .text_sm()
@@ -5572,6 +10920,81 @@ fn render_settings_dialog(
                     SettingsNumber::RawParallelism,
                     cx,
                 ))
+                .child(settings_number_row(
+                    "Face-analysis workers",
+                    draft.face_workers,
+                    SettingsNumber::FaceWorkers,
+                    cx,
+                ))
+                .child(settings_number_row(
+                    "Face worker memory allowance (MiB)",
+                    draft.face_worker_memory_bytes.div_ceil(1024 * 1024) as usize,
+                    SettingsNumber::FaceMemoryMiB,
+                    cx,
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .py_2()
+                        .border_b_1()
+                        .border_color(rgb(0x30343d))
+                        .child("Automatic face analysis")
+                        .child(
+                            div()
+                                .id("settings-automatic-face-analysis")
+                                .px_3()
+                                .py_1()
+                                .rounded_sm()
+                                .bg(rgb(0x343943))
+                                .cursor_pointer()
+                                .child(if draft.automatic_face_analysis {
+                                    "Enabled"
+                                } else {
+                                    "Disabled"
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(draft) = &mut this.settings_draft {
+                                        draft.automatic_face_analysis =
+                                            !draft.automatic_face_analysis;
+                                    }
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .py_2()
+                        .border_b_1()
+                        .border_color(rgb(0x30343d))
+                        .child("Face-crop disk cache")
+                        .child(
+                            div()
+                                .id("settings-face-crop-disk-cache")
+                                .px_3()
+                                .py_1()
+                                .rounded_sm()
+                                .bg(rgb(0x343943))
+                                .cursor_pointer()
+                                .child(match draft.face_crop_disk_cache {
+                                    config::FaceCropDiskCachePolicy::MemoryOnly => "Memory only",
+                                    config::FaceCropDiskCachePolicy::Disk => "Local disk",
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(draft) = &mut this.settings_draft {
+                                        draft.face_crop_disk_cache = match draft.face_crop_disk_cache {
+                                            config::FaceCropDiskCachePolicy::MemoryOnly => config::FaceCropDiskCachePolicy::Disk,
+                                            config::FaceCropDiskCachePolicy::Disk => config::FaceCropDiskCachePolicy::MemoryOnly,
+                                        };
+                                    }
+                                    cx.notify();
+                                })),
+                        ),
+                )
                 .child(settings_number_row(
                     "Downloaded map cache (GiB)",
                     draft.map_cache_bytes.div_ceil(1024_u64.pow(3)) as usize,
@@ -5752,8 +11175,7 @@ fn render_settings_dialog(
                         .gap_2()
                         .child(
                             div()
-                                .id("settings-cancel")
-                                .debug_selector(|| "#settings-cancel".to_owned())
+                                .id("settings-cancel-bottom")
                                 .px_4()
                                 .py_2()
                                 .rounded_sm()
@@ -5768,8 +11190,7 @@ fn render_settings_dialog(
                         )
                         .child(
                             div()
-                                .id("settings-save")
-                                .debug_selector(|| "#settings-save".to_owned())
+                                .id("settings-save-bottom")
                                 .px_4()
                                 .py_2()
                                 .rounded_sm()
@@ -5853,6 +11274,19 @@ fn render_cache_statistics_dialog(
                 ))
                 .child(div().my_2().border_t_1().border_color(rgb(0x30343d)))
                 .child(render_disk_cache_usage(disk_usage))
+                .child(
+                    div()
+                        .id("clear-persistent-image-cache")
+                        .debug_selector(|| "#clear-persistent-image-cache".to_owned())
+                        .mt_2()
+                        .px_3()
+                        .py_2()
+                        .rounded_sm()
+                        .bg(rgb(0x593b3b))
+                        .hover(|this| this.bg(rgb(0x754949)))
+                        .child("Clear Persistent Image Cache")
+                        .on_click(cx.listener(|this, _, _, cx| this.clear_render_disk_cache(cx))),
+                )
                 .child(div().my_2().border_t_1().border_color(rgb(0x30343d)))
                 .child(row(
                     "Downloaded map tiles",

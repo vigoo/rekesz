@@ -1,0 +1,72 @@
+{
+  "artifact_format": 2,
+  "policy_version": 1,
+  "prototype_algorithm_version": 1,
+  "model_id": "sface-2021dec",
+  "model_sha256": "0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79",
+  "calibration_report": {
+    "report_id": "rekesz-sface-policy-2026-08-30-v3",
+    "generated_by": "rekesz-calibration-verifier-v4",
+    "generated_at": "2026-08-30T00:00:00Z",
+    "upstream_benchmark": {
+      "name": "LFW 6000-pair verification protocol",
+      "source": "OpenCV Zoo SFace 2021-12 model card",
+      "source_url": "https://github.com/opencv/opencv_zoo/tree/main/models/face_recognition_sface",
+      "pair_count": 6000,
+      "published_cosine_threshold": 0.363,
+      "published_accuracy": 0.996
+    },
+    "held_out_data": {
+      "provenance": "Five hash-pinned contact sheets generated specifically for Rekesz from prompts requesting 20 fictional adult identities in three pose, expression, and lighting variants. The image tool exposed no reproducible model identifier or seed; prompt intent and limitations are hash-bound in calibration/README.md. Every derived pixel variant is processed by the exact packaged YuNet and SFace models. Identity-disjoint calibration and untouched holdout partitions are fixed before threshold selection. No user photographs or persisted embeddings.",
+      "verifier_version": "rekesz-calibration-verifier-v4",
+      "verifier_source_sha256": "887bf9c8f2058157a0a0e3079d74207522d242021884639f7047259005a548d3",
+      "extractor_source_sha256": "3989cc579043bd226f5b1cf5fbd562bb2138966528d79719102d6f34581553f7",
+      "production_inference_source_sha256": "e706122c5f0b5ab0f1ecafd35ec312377a244100ca9d99ab873fb2c3cc10a58f",
+      "production_policy_source_sha256": "3d2e0693777abdf37fe0085feb7badf66a7fb3859c448e23676eb36ceb4a8bda",
+      "corpus_provenance_sha256": "119d83ca04a64beab77799daa79396474a34d5a2a2dbb19a188e1e818b1926da",
+      "dependency_lock_sha256": "ed8bc45092173bc6cdf5787246eda531f7b3f5def5592d0836c6117687d86d8c",
+      "generator_spec_sha256": "55c247be64c019ce6f797b55d488c7628921e799e5b816ceeaddc87448a9b54e",
+      "identity_count": 20,
+      "calibration_queries": 28,
+      "query_count": 16,
+      "positive_queries": 6,
+      "negative_queries": 10,
+      "embedding_dimensions": 128,
+      "split_protocol": "Identity-disjoint partitions: calibration uses eight known and four unknown identities; untouched holdout uses six known and two unknown identities. Four actual-pixel YuNet/SFace outputs per known identity are gallery exemplars; production's robust centroid discards the lowest-similarity quarter before normalization; the untouched third portrait is the positive query. All five pixel variants of unknown identities are negative queries. Thresholds are selected solely for zero observed calibration false accepts and misidentifications, maximizing recall with stricter grid tie-breaking, then frozen before holdout inference."
+    },
+    "selection_constraints": {
+      "maximum_unknown_false_accept_rate": 0.0,
+      "maximum_identification_error_rate": 0.0,
+      "maximum_combined_safety_error_rate": 0.0,
+      "minimum_precision": 1.0,
+      "objective": "maximize observed calibration recall subject to zero observed safety errors; ties choose larger absolute, exemplar, then margin grid values",
+      "statistical_claim": "none; observed rates on this small synthetic corpus do not establish population constraints"
+    },
+    "operating_point": {
+      "absolute_threshold": 0.70,
+      "nearest_exemplar_threshold": 0.70,
+      "second_best_margin": 0.20
+    },
+    "held_out_results": {
+      "true_positive": 6,
+      "false_negative": 0,
+      "false_positive": 0,
+      "true_negative": 10,
+      "unknown_false_accepts": 0,
+      "misidentifications": 0,
+      "false_accept_rate": 0.0,
+      "false_reject_rate": 0.0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "identification_error_rate": 0.0,
+      "safety_error_rate": 0.0,
+      "unknown_far_one_sided_95_upper_bound": 0.2588655508930523
+    },
+    "limitations": "This is model-authentic regression evidence from 100 derived pixel samples of 20 prompt-fictional identities, not a demographic or product-population validation corpus. The tool did not expose a reproducible generator model or seed, and fictional prompt intent cannot prove absence of coincidental resemblance. Calibration has only 20 unknown queries and holdout only 10; zero holdout false accepts has an exact one-sided 95% upper bound of approximately 25.9%, so the named constraints are observed-sample rules, not population guarantees. The 0.70 absolute/exemplar values are the tested grid ceiling and 0.20 is a selected grid point, not statistically identified operating boundaries. The published SFace/LFW result is an upstream anchor only. These gates authorize review-only suggestions and must never auto-confirm identity. A larger consented, representative benchmark remains required before claiming demographic performance or automatic acceptance."
+  },
+  "license": {
+    "model": "Apache-2.0",
+    "file": "LICENSE-SFACE",
+    "calibration_metadata": "Rekesz project source license"
+  }
+}

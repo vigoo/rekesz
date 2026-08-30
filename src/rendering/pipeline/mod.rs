@@ -159,28 +159,28 @@ struct CacheWriter {
 impl CacheWriter {
     fn write(&self, mut write: CacheWrite, durable: bool, cancelled: &AtomicBool) {
         loop {
-            let result = self
-                .sender
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|sender| sender.try_send(write));
+            let guard = self.sender.lock().unwrap();
+            let Some(sender) = guard.as_ref() else {
+                return;
+            };
+            let result = sender.try_send(write);
+            drop(guard);
             match result {
-                Some(Ok(())) => return,
-                Some(Err(mpsc::TrySendError::Full(returned))) if durable => {
+                Ok(()) => return,
+                Err(mpsc::TrySendError::Full(returned)) if durable => {
                     if cancelled.load(Ordering::Acquire) {
                         return;
                     }
                     write = returned;
                     thread::sleep(std::time::Duration::from_millis(10));
                 }
-                Some(Err(mpsc::TrySendError::Full(_))) => {
+                Err(mpsc::TrySendError::Full(_)) => {
                     self.metrics
                         .dropped_cache_writes
                         .fetch_add(1, Ordering::Relaxed);
                     return;
                 }
-                Some(Err(mpsc::TrySendError::Disconnected(_))) | None => return,
+                Err(mpsc::TrySendError::Disconnected(_)) => return,
             }
         }
     }
@@ -385,6 +385,10 @@ impl RenderPipeline {
         self.backend.disk_cache_usage()
     }
 
+    pub fn clear_disk_cache(&self) -> Result<(), String> {
+        self.backend.clear_disk_cache()
+    }
+
     pub fn set_source_cache_capacity(&self, capacity: usize) {
         self.decoded_sources.set_capacity(capacity);
     }
@@ -416,6 +420,29 @@ impl RenderPipeline {
         invocation: RenderInvocation<'_>,
         cancelled: &Arc<AtomicBool>,
     ) -> Result<Arc<RenderedImage>, Arc<str>> {
+        self.render_with_decode_cache(invocation, cancelled, true, None)
+    }
+
+    pub(crate) fn render_analysis(
+        &self,
+        invocation: RenderInvocation<'_>,
+        cancelled: &Arc<AtomicBool>,
+    ) -> Result<Arc<RenderedImage>, Arc<str>> {
+        self.render_with_decode_cache(
+            invocation,
+            cancelled,
+            false,
+            Some(crate::rendering::analysis_memory_budget()),
+        )
+    }
+
+    fn render_with_decode_cache(
+        &self,
+        invocation: RenderInvocation<'_>,
+        cancelled: &Arc<AtomicBool>,
+        cache_decoded_source: bool,
+        analysis_memory_budget: Option<usize>,
+    ) -> Result<Arc<RenderedImage>, Arc<str>> {
         let RenderInvocation {
             path,
             variant,
@@ -424,8 +451,11 @@ impl RenderPipeline {
             interactive,
             durable_cache_write,
         } = invocation;
-        let plan = RenderPlan::compile(path.clone(), variant, render_identity, recipe)
+        let mut plan = RenderPlan::compile(path.clone(), variant, render_identity, recipe)
             .map_err(Arc::from)?;
+        if let Some(budget) = analysis_memory_budget {
+            plan.set_analysis_memory_budget(budget);
+        }
         let request = plan.request().clone();
         if cancelled.load(Ordering::Acquire) {
             return Err("render cancelled".into());
@@ -441,7 +471,12 @@ impl RenderPipeline {
             let identity = self.backend.source_identity(&request).unwrap_or(None);
             self.metrics.source_identity.record(started);
             let started = Instant::now();
-            let cached = self.backend.lookup_cache(&request, identity.as_ref());
+            let cached =
+                if matches!(variant, RenderVariant::FaceCrop { .. }) && !durable_cache_write {
+                    Ok(None)
+                } else {
+                    self.backend.lookup_cache(&request, identity.as_ref())
+                };
             self.metrics.cache_lookup.record(started);
             (identity, cached)
         };
@@ -484,7 +519,7 @@ impl RenderPipeline {
                 return Err("render cancelled".into());
             }
             let decode_started = Instant::now();
-            let decoded = if plan.caches_decoded_source() {
+            let decoded = if cache_decoded_source && plan.caches_decoded_source() {
                 let key = identity.clone().map(|identity| DecodedSourceKey {
                     path: path.clone(),
                     identity,
@@ -517,9 +552,9 @@ impl RenderPipeline {
                 // If the tiny maintenance queue is full, this cache write is
                 // disposable and a future request may regenerate it.
                 let rendered = Arc::new(rendered);
-                if plan.includes(RenderStage::CacheWriteEligible)
-                    && let Some(identity) = identity
-                {
+                let cache_write_allowed = plan.includes(RenderStage::CacheWriteEligible)
+                    && (!matches!(variant, RenderVariant::FaceCrop { .. }) || durable_cache_write);
+                if cache_write_allowed && let Some(identity) = identity {
                     self.cache_writer.write(
                         CacheWrite {
                             request,

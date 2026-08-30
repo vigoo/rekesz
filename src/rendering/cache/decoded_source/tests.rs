@@ -33,6 +33,7 @@ fn source(value: u8) -> Arc<DecodedSource> {
         source_pipeline: SourcePipeline::Raw,
         photographic: None,
         orientation_applied: None,
+        face_transform: crate::rendering::FaceTransform::IDENTITY,
     })
 }
 

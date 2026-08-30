@@ -45,6 +45,20 @@ pub fn assert_hevc_decoder_available() -> anyhow::Result<()> {
     Ok(())
 }
 
+pub(crate) const DECODER_MODEL_ID: &str = "renderer-6";
+static ANALYSIS_MEMORY_BUDGET: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(768 * 1024 * 1024);
+
+pub(crate) fn configure_analysis_memory_budget(bytes: u64) {
+    ANALYSIS_MEMORY_BUDGET.store(bytes.max(64 * 1024 * 1024), Ordering::Release);
+}
+
+pub(crate) fn analysis_memory_budget() -> usize {
+    ANALYSIS_MEMORY_BUDGET
+        .load(Ordering::Acquire)
+        .min(usize::MAX as u64) as usize
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct RenderRequest {
     pub path: PathBuf,
@@ -88,8 +102,55 @@ pub struct RenderIdentity {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RenderVariant {
     Full,
-    Thumbnail { width: u32 },
-    Preview { max_width: u32, max_height: u32 },
+    Thumbnail {
+        width: u32,
+    },
+    Preview {
+        max_width: u32,
+        max_height: u32,
+    },
+    FaceCrop {
+        face_id: i64,
+        face_revision: u64,
+        left_millionths: u32,
+        top_millionths: u32,
+        right_millionths: u32,
+        bottom_millionths: u32,
+        width: u32,
+        padding_percent: u8,
+    },
+    FaceContext {
+        width: u32,
+    },
+}
+
+impl RenderVariant {
+    pub(crate) fn face_crop(face_id: i64, bounds: [f32; 4], width: u32) -> Self {
+        let quantize = |value: f32| (value.clamp(0.0, 1.0) * 1_000_000.0).round() as u32;
+        Self::FaceCrop {
+            face_id,
+            face_revision: face_revision(face_id, bounds),
+            left_millionths: quantize(bounds[0]),
+            top_millionths: quantize(bounds[1]),
+            right_millionths: quantize(bounds[2]),
+            bottom_millionths: quantize(bounds[3]),
+            width,
+            padding_percent: 35,
+        }
+    }
+
+    pub(crate) fn face_context(width: u32) -> Self {
+        Self::FaceContext { width }
+    }
+}
+
+fn face_revision(face_id: i64, bounds: [f32; 4]) -> u64 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&face_id.to_le_bytes());
+    for value in bounds {
+        hasher.update(&value.to_bits().to_le_bytes());
+    }
+    u64::from_le_bytes(hasher.finalize().as_bytes()[..8].try_into().unwrap())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -122,6 +183,10 @@ pub struct RenderMetadata {
     pub variant: RenderVariant,
     /// EXIF orientation value applied before resizing, when known.
     pub orientation_applied: Option<u8>,
+    /// Canonical source-space to decoded display-space mapping. Older cache
+    /// entries omit this and fall back to `orientation_applied`.
+    #[serde(default)]
+    pub face_transform: Option<FaceTransform>,
     pub develop: Option<DevelopRenderMetadata>,
 }
 
@@ -173,7 +238,7 @@ impl RenderBackend {
         request: &RenderRequest,
         identity: Option<&SourceIdentity>,
     ) -> Result<Option<RenderedImage>, String> {
-        if request.variant == RenderVariant::Full {
+        if matches!(request.variant, RenderVariant::Full) {
             return Ok(None);
         }
         let Some(identity) = identity else {
@@ -184,6 +249,10 @@ impl RenderBackend {
 
     fn disk_cache_usage(&self) -> Result<cache::DiskCacheUsage, String> {
         self.disk_cache.usage()
+    }
+
+    fn clear_disk_cache(&self) -> Result<(), String> {
+        self.disk_cache.clear()
     }
 
     /// Source decode stage. This may be CPU and memory intensive.
@@ -236,6 +305,8 @@ impl RenderBackend {
         };
         applied_actions |= raw_preapplied;
         fidelity_warnings |= raw_fidelity;
+        let developed =
+            apply_face_variant(developed, plan.request().variant, decoded.face_transform);
         let image = resize::output(developed, plan.resize());
         if cancelled.load(Ordering::Acquire) {
             return Err(image::ImageError::Decoding(
@@ -255,6 +326,7 @@ impl RenderBackend {
                 output_dimensions,
                 variant: plan.request().variant,
                 orientation_applied: decoded.orientation_applied,
+                face_transform: Some(decoded.face_transform),
                 develop: (request_identity.mode == RenderMode::Developed).then_some(
                     DevelopRenderMetadata {
                         identity: request_identity,
@@ -274,7 +346,7 @@ impl RenderBackend {
         identity: &SourceIdentity,
         rendered: &RenderedImage,
     ) -> Result<bool, String> {
-        if request.variant == RenderVariant::Full {
+        if matches!(request.variant, RenderVariant::Full) {
             return Ok(false);
         }
         if self.source_identity(request)?.as_ref() != Some(identity) {
@@ -284,6 +356,203 @@ impl RenderBackend {
             .store(request, identity, &self.raw, rendered)
             .map(|()| true)
     }
+}
+
+fn apply_face_variant(
+    image: DynamicImage,
+    variant: RenderVariant,
+    face_transform: FaceTransform,
+) -> DynamicImage {
+    let RenderVariant::FaceCrop {
+        left_millionths,
+        top_millionths,
+        right_millionths,
+        bottom_millionths,
+        width,
+        padding_percent,
+        ..
+    } = variant
+    else {
+        return image;
+    };
+    let scale = 1_000_000.0_f32;
+    let bounds = face_transform.bounds([
+        left_millionths as f32 / scale,
+        top_millionths as f32 / scale,
+        right_millionths as f32 / scale,
+        bottom_millionths as f32 / scale,
+    ]);
+    let image_width = image.width() as f32;
+    let image_height = image.height() as f32;
+    let face_width = (bounds[2] - bounds[0]) * image_width;
+    let face_height = (bounds[3] - bounds[1]) * image_height;
+    let padding = f32::from(padding_percent) / 100.0;
+    let crop_width = face_width * (1.0 + padding * 2.0);
+    let crop_height = face_height * (1.0 + padding * 2.0);
+    let side = crop_width
+        .max(crop_height)
+        .clamp(1.0, image_width.min(image_height));
+    let center_x = (bounds[0] + bounds[2]) * 0.5 * image_width;
+    let center_y = (bounds[1] + bounds[3]) * 0.5 * image_height;
+    let pixel_left = (center_x - side * 0.5)
+        .clamp(0.0, image_width - side)
+        .floor() as u32;
+    let pixel_top = (center_y - side * 0.5)
+        .clamp(0.0, image_height - side)
+        .floor() as u32;
+    let pixel_width = side.ceil() as u32;
+    let pixel_height = side.ceil() as u32;
+    image
+        .crop_imm(
+            pixel_left.min(image.width().saturating_sub(1)),
+            pixel_top.min(image.height().saturating_sub(1)),
+            pixel_width
+                .min(image.width().saturating_sub(pixel_left))
+                .max(1),
+            pixel_height
+                .min(image.height().saturating_sub(pixel_top))
+                .max(1),
+        )
+        .thumbnail(width, width)
+}
+
+/// Affine mapping from canonical, unoriented source coordinates to the pixels
+/// emitted by the decoder. Coordinates are normalized at both ends, allowing
+/// the mapping to include orientation and HEIF clean-aperture crops.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FaceTransform([f32; 6]);
+
+impl FaceTransform {
+    pub(crate) const IDENTITY: Self = Self([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+
+    pub(crate) fn orientation(orientation: u8) -> Self {
+        let (x0, y0) = oriented_point(0.0, 0.0, orientation);
+        let (x1, y1) = oriented_point(1.0, 0.0, orientation);
+        let (x2, y2) = oriented_point(0.0, 1.0, orientation);
+        Self([x1 - x0, x2 - x0, x0, y1 - y0, y2 - y0, y0])
+    }
+
+    pub(crate) fn crop(left: f32, top: f32, right: f32, bottom: f32) -> Self {
+        let width = (1.0 - left - right).max(f32::EPSILON);
+        let height = (1.0 - top - bottom).max(f32::EPSILON);
+        Self([
+            1.0 / width,
+            0.0,
+            -left / width,
+            0.0,
+            1.0 / height,
+            -top / height,
+        ])
+    }
+
+    /// Returns `next(self(point))`.
+    pub(crate) fn then(self, next: Self) -> Self {
+        let [a, b, c, d, e, f] = self.0;
+        let [g, h, i, j, k, l] = next.0;
+        Self([
+            g * a + h * d,
+            g * b + h * e,
+            g * c + h * f + i,
+            j * a + k * d,
+            j * b + k * e,
+            j * c + k * f + l,
+        ])
+    }
+
+    fn point(self, x: f32, y: f32) -> (f32, f32) {
+        let [a, b, c, d, e, f] = self.0;
+        (a * x + b * y + c, d * x + e * y + f)
+    }
+
+    pub(crate) fn inverse(self) -> Option<Self> {
+        let [a, b, c, d, e, f] = self.0;
+        let determinant = a * e - b * d;
+        if !determinant.is_finite() || determinant.abs() <= f32::EPSILON {
+            return None;
+        }
+        Some(Self([
+            e / determinant,
+            -b / determinant,
+            (b * f - e * c) / determinant,
+            -d / determinant,
+            a / determinant,
+            (d * c - a * f) / determinant,
+        ]))
+    }
+
+    pub(crate) fn mapped_point(self, point: [f32; 2]) -> [f32; 2] {
+        let (x, y) = self.point(point[0], point[1]);
+        [x, y]
+    }
+
+    pub fn bounds(self, bounds: [f32; 4]) -> [f32; 4] {
+        let points = [
+            self.point(bounds[0], bounds[1]),
+            self.point(bounds[2], bounds[1]),
+            self.point(bounds[0], bounds[3]),
+            self.point(bounds[2], bounds[3]),
+        ];
+        let mut output = [
+            f32::INFINITY,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+        ];
+        for (x, y) in points {
+            output[0] = output[0].min(x);
+            output[1] = output[1].min(y);
+            output[2] = output[2].max(x);
+            output[3] = output[3].max(y);
+        }
+        output
+    }
+}
+
+pub(crate) fn oriented_face_bounds(bounds: [f32; 4], orientation: u8) -> [f32; 4] {
+    let transform = |x: f32, y: f32| oriented_point(x, y, orientation);
+    let corners = [
+        transform(bounds[0], bounds[1]),
+        transform(bounds[2], bounds[1]),
+        transform(bounds[2], bounds[3]),
+        transform(bounds[0], bounds[3]),
+    ];
+    corners.iter().fold(
+        [1.0_f32, 1.0_f32, 0.0_f32, 0.0_f32],
+        |mut result, (x, y)| {
+            result[0] = result[0].min(*x);
+            result[1] = result[1].min(*y);
+            result[2] = result[2].max(*x);
+            result[3] = result[3].max(*y);
+            result
+        },
+    )
+}
+
+fn oriented_point(x: f32, y: f32, orientation: u8) -> (f32, f32) {
+    match orientation {
+        2 => (1.0 - x, y),
+        3 => (1.0 - x, 1.0 - y),
+        4 => (x, 1.0 - y),
+        5 => (y, x),
+        6 => (1.0 - y, x),
+        7 => (1.0 - y, 1.0 - x),
+        8 => (y, 1.0 - x),
+        _ => (x, y),
+    }
+}
+
+pub(crate) fn compose_orientations(first: u8, second: u8) -> u8 {
+    let samples = [(0.2_f32, 0.3_f32), (0.7, 0.4)];
+    (1..=8)
+        .find(|candidate| {
+            samples.iter().all(|(x, y)| {
+                let after_first = oriented_point(*x, *y, first);
+                let expected = oriented_point(after_first.0, after_first.1, second);
+                let actual = oriented_point(*x, *y, *candidate);
+                (actual.0 - expected.0).abs() < 1e-6 && (actual.1 - expected.1).abs() < 1e-6
+            })
+        })
+        .unwrap_or(1)
 }
 
 #[cfg(test)]

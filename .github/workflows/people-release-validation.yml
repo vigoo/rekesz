@@ -1,0 +1,36 @@
+name: People reference release validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      reference_tag:
+        description: Reviewed reference host/configuration tag
+        required: true
+        type: string
+
+jobs:
+  people-release-validation:
+    runs-on: [self-hosted, people-reference]
+    timeout-minutes: 720
+    env:
+      PEOPLE_REFERENCE_TAG: ${{ inputs.reference_tag }}
+      PEOPLE_RELEASE_ARTIFACT_DIR: target/people-release-validation
+      PEOPLE_MAX_RSS_KIB: "2097152"
+      PEOPLE_MAX_CPU_PERCENT: "400"
+      PEOPLE_MAX_CANCEL_LATENCY_MS: "100"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run reference profiles and soak
+        run: ./scripts/people-release-validation.sh
+      - name: Final privacy gate
+        id: privacy
+        if: always()
+        run: ./scripts/check-people-artifact-privacy.sh target/people-release-validation
+      - name: Retain measurements and command output
+        if: ${{ always() && steps.privacy.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: people-release-${{ inputs.reference_tag }}-${{ github.sha }}
+          path: target/people-release-validation
+          if-no-files-found: error
+          retention-days: 90

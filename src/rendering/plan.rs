@@ -43,6 +43,7 @@ pub(super) struct RenderPlan {
     raw_applied_actions: u64,
     raw_fidelity_warnings: u64,
     stages: Vec<RenderStage>,
+    analysis_memory_budget: Option<usize>,
 }
 
 impl RenderPlan {
@@ -52,6 +53,7 @@ impl RenderPlan {
         identity: RenderIdentity,
         recipe: Option<&DevelopRecipe>,
     ) -> Result<Self, String> {
+        validate_variant(variant)?;
         let developed_recipe = if identity.mode == RenderMode::Developed {
             let recipe =
                 recipe.ok_or_else(|| "developed render is missing its recipe".to_owned())?;
@@ -73,7 +75,10 @@ impl RenderPlan {
         } else {
             DecodePlan::Standard {
                 scaled_jpeg: is_jpeg(&path)
-                    && variant != RenderVariant::Full
+                    && matches!(
+                        variant,
+                        RenderVariant::Thumbnail { .. } | RenderVariant::Preview { .. }
+                    )
                     && identity.mode != RenderMode::Developed,
             }
         };
@@ -90,6 +95,12 @@ impl RenderPlan {
             } => ResizePlan::Derivative {
                 max_width,
                 max_height,
+                before_develop: developed_recipe.is_none(),
+            },
+            RenderVariant::FaceCrop { .. } => ResizePlan::None,
+            RenderVariant::FaceContext { width, .. } => ResizePlan::Derivative {
+                max_width: width,
+                max_height: width,
                 before_develop: developed_recipe.is_none(),
             },
         };
@@ -130,7 +141,16 @@ impl RenderPlan {
             raw_applied_actions,
             raw_fidelity_warnings,
             stages,
+            analysis_memory_budget: None,
         })
+    }
+
+    pub(super) fn set_analysis_memory_budget(&mut self, budget: usize) {
+        self.analysis_memory_budget = Some(budget);
+    }
+
+    pub(super) fn analysis_memory_budget(&self) -> Option<usize> {
+        self.analysis_memory_budget
     }
 
     pub(super) fn request(&self) -> &RenderRequest {
@@ -151,6 +171,10 @@ impl RenderPlan {
 
     pub(super) fn caches_decoded_source(&self) -> bool {
         self.decode == DecodePlan::Raw
+            || matches!(
+                self.request.variant,
+                RenderVariant::FaceCrop { .. } | RenderVariant::FaceContext { .. }
+            )
     }
 
     pub(super) fn raw_recipe(&self) -> Option<&DevelopRecipe> {
@@ -176,6 +200,40 @@ impl RenderPlan {
     #[cfg(test)]
     pub(super) fn stages(&self) -> &[RenderStage] {
         &self.stages
+    }
+}
+
+fn validate_variant(variant: RenderVariant) -> Result<(), String> {
+    match variant {
+        RenderVariant::Thumbnail { width }
+        | RenderVariant::FaceContext { width }
+        | RenderVariant::FaceCrop { width, .. }
+            if width == 0 =>
+        {
+            Err("render width must be positive".to_owned())
+        }
+        RenderVariant::Preview {
+            max_width,
+            max_height,
+        } if max_width == 0 || max_height == 0 => {
+            Err("preview dimensions must be positive".to_owned())
+        }
+        RenderVariant::FaceCrop {
+            left_millionths,
+            top_millionths,
+            right_millionths,
+            bottom_millionths,
+            padding_percent,
+            ..
+        } if left_millionths >= right_millionths
+            || top_millionths >= bottom_millionths
+            || right_millionths > 1_000_000
+            || bottom_millionths > 1_000_000
+            || padding_percent > 200 =>
+        {
+            Err("invalid face crop bounds or padding".to_owned())
+        }
+        _ => Ok(()),
     }
 }
 

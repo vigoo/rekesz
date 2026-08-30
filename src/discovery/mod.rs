@@ -466,10 +466,8 @@ pub fn scan_directory(
     let mut directories = Vec::new();
     let mut image_paths = Vec::new();
     for entry in fs::read_dir(path)? {
-        let Ok(entry) = entry else { continue };
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
+        let entry = entry?;
+        let file_type = entry.file_type()?;
         let path = entry.path();
         if file_type.is_dir() {
             if entry.file_name() != crate::catalog::CATALOG_DIR {
@@ -500,6 +498,62 @@ pub fn scan_directory(
         directories,
         images: images.into_iter().map(|(_, path)| path).collect(),
     })
+}
+
+/// Builds the complete face-analysis inventory using the same eligibility and
+/// RAW/JPEG pairing rules as the browser. Intended for a background job.
+#[cfg(test)]
+pub fn scan_library_inventory(
+    root: &Path,
+    hidden_subtrees: &std::collections::HashSet<PathBuf>,
+    pair_preference: RawJpegPreference,
+    cancelled: &AtomicBool,
+) -> Result<Vec<PathBuf>, io::Error> {
+    scan_library_inventory_with_progress(
+        root,
+        hidden_subtrees,
+        pair_preference,
+        cancelled,
+        |_, _, _, _| {},
+    )
+}
+
+pub fn scan_library_inventory_with_progress(
+    root: &Path,
+    hidden_subtrees: &std::collections::HashSet<PathBuf>,
+    pair_preference: RawJpegPreference,
+    cancelled: &AtomicBool,
+    mut progress: impl FnMut(usize, usize, usize, &Path),
+) -> Result<Vec<PathBuf>, io::Error> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut images = Vec::new();
+    let mut directories_scanned = 0;
+    while let Some(directory) = pending.pop() {
+        if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "library inventory scan cancelled",
+            ));
+        }
+        if directory != root
+            && hidden_subtrees
+                .iter()
+                .any(|hidden| directory.starts_with(hidden))
+        {
+            continue;
+        }
+        let scan = scan_directory(&directory, pair_preference)?;
+        images.extend(scan.images);
+        pending.extend(scan.directories.into_iter().filter(|child| {
+            !hidden_subtrees
+                .iter()
+                .any(|hidden| child.starts_with(hidden))
+        }));
+        directories_scanned += 1;
+        progress(directories_scanned, pending.len(), images.len(), &directory);
+    }
+    images.sort();
+    Ok(images)
 }
 
 fn deduplicate_cr3_jpeg_pairs(paths: Vec<PathBuf>, preference: RawJpegPreference) -> Vec<PathBuf> {

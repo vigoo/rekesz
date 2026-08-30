@@ -71,6 +71,7 @@ fn cache_write_fixture() -> (tempfile::TempDir, RenderBackend, CacheWrite) {
             output_dimensions: (1, 1),
             variant: request.variant,
             orientation_applied: None,
+            face_transform: None,
             develop: None,
         },
     });
@@ -183,4 +184,107 @@ fn staged_pipeline_persists_generated_thumbnail() {
         std::thread::yield_now();
     }
     panic!("deferred cache write did not become visible");
+}
+
+#[test]
+fn face_crop_disk_policy_controls_persistent_cache_writes() {
+    for (durable, expected) in [(false, false), (true, true)] {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.png");
+        DynamicImage::ImageRgba8(ImageBuffer::from_pixel(32, 32, Rgba([1, 2, 3, 255])))
+            .save(&source)
+            .unwrap();
+        let pipeline =
+            RenderPipeline::with_source_cache_capacity(directory.path().join("cache"), 2, 2, 1);
+        let variant = RenderVariant::face_crop(7, [0.1, 0.1, 0.9, 0.9], 16);
+        pipeline
+            .render(
+                source.clone(),
+                variant,
+                true,
+                durable,
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
+        let request = RenderRequest::new(source, variant);
+        let identity = pipeline.backend.source_identity(&request).unwrap().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut cached = false;
+        while std::time::Instant::now() < deadline {
+            cached = pipeline
+                .backend
+                .lookup_cache(&request, Some(&identity))
+                .unwrap()
+                .is_some();
+            if cached || !expected {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert_eq!(cached, expected, "pipeline stats: {:?}", pipeline.stats());
+        if expected {
+            assert!(pipeline.disk_cache_usage().unwrap().entries > 0);
+            pipeline.clear_disk_cache().unwrap();
+            assert_eq!(pipeline.disk_cache_usage().unwrap().entries, 0);
+            assert!(
+                pipeline
+                    .backend
+                    .lookup_cache(&request, Some(&identity))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+}
+
+#[test]
+fn face_crop_disk_to_memory_only_transition_bypasses_and_purges_shared_cache() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("source.png");
+    DynamicImage::ImageRgba8(ImageBuffer::from_pixel(32, 32, Rgba([7, 8, 9, 255])))
+        .save(&source)
+        .unwrap();
+    let cache = directory.path().join("cache");
+    let variant = RenderVariant::face_crop(11, [0.1, 0.1, 0.9, 0.9], 16);
+    let disk = RenderPipeline::with_source_cache_capacity(cache.clone(), 2, 2, 1);
+    disk.render(
+        source.clone(),
+        variant,
+        true,
+        true,
+        &Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    let request = RenderRequest::new(source.clone(), variant);
+    let identity = disk.backend.source_identity(&request).unwrap().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while disk
+        .backend
+        .lookup_cache(&request, Some(&identity))
+        .unwrap()
+        .is_none()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cache write timed out"
+        );
+        std::thread::yield_now();
+    }
+
+    // A new pipeline models a restart or settings transition sharing the old
+    // cache. MemoryOnly must not consume the pre-existing disk derivative.
+    let memory_only = RenderPipeline::with_source_cache_capacity(cache, 2, 2, 1);
+    let hits_before = memory_only.stats().cache_hits;
+    memory_only
+        .render(
+            source,
+            variant,
+            true,
+            false,
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+    assert_eq!(memory_only.stats().cache_hits, hits_before);
+    memory_only.clear_disk_cache().unwrap();
+    assert_eq!(memory_only.disk_cache_usage().unwrap().entries, 0);
 }

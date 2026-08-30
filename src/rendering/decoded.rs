@@ -2,7 +2,7 @@
 
 use image::DynamicImage;
 
-use super::{AppliedPhotographicTransform, SourcePipeline};
+use super::{AppliedPhotographicTransform, FaceTransform, SourcePipeline};
 
 pub(super) struct DecodedSource {
     pub(super) image: DynamicImage,
@@ -11,6 +11,7 @@ pub(super) struct DecodedSource {
     pub(super) source_pipeline: SourcePipeline,
     pub(super) photographic: Option<AppliedPhotographicTransform>,
     pub(super) orientation_applied: Option<u8>,
+    pub(super) face_transform: FaceTransform,
 }
 
 #[derive(Clone)]

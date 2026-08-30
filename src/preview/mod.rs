@@ -47,6 +47,10 @@ impl PreviewRenderer {
         self.pipeline.disk_cache_usage()
     }
 
+    pub fn clear_disk_cache(&self) -> Result<(), String> {
+        self.pipeline.clear_disk_cache()
+    }
+
     pub fn set_source_cache_capacity(&self, capacity: usize) {
         self.pipeline.set_source_cache_capacity(capacity);
     }

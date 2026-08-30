@@ -1,8 +1,38 @@
-use std::{path::Path, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use gpui::RenderImage;
 use image::{Frame, ImageBuffer, Rgba};
 use test_r::test;
+
+#[test]
+fn failed_variants_are_evicted_at_capacity() {
+    let mut cache = PreviewCache::new(2);
+    for index in 0..3 {
+        let path = PathBuf::from(format!("missing-{index}.jpg"));
+        let variant = RenderVariant::face_crop(index, [0.1, 0.1, 0.4, 0.4], 100);
+        let request = cache
+            .begin_for(&path, variant, RenderIdentity::default())
+            .unwrap();
+        assert!(cache.finish_for(
+            &path,
+            RenderIdentity::default(),
+            variant,
+            request,
+            PreviewState::Error("missing".into()),
+        ));
+    }
+    assert!(matches!(
+        cache.state_for_variant(
+            Path::new("missing-0.jpg"),
+            RenderIdentity::default(),
+            RenderVariant::face_crop(0, [0.1, 0.1, 0.4, 0.4], 100),
+        ),
+        PreviewState::Unloaded
+    ));
+}
 
 use super::*;
 
@@ -21,6 +51,7 @@ fn image_state_for(variant: RenderVariant) -> PreviewState {
             output_dimensions: (1, 1),
             variant,
             orientation_applied: None,
+            face_transform: None,
             develop: None,
         },
     }))
@@ -29,6 +60,38 @@ fn image_state_for(variant: RenderVariant) -> PreviewState {
 fn load(cache: &mut PreviewCache, path: &Path) {
     let request = cache.begin(path, RenderVariant::Full).unwrap();
     assert!(cache.finish(path, request, image_state()));
+}
+
+#[test]
+fn distinct_face_variants_for_one_photo_coexist() {
+    let mut cache = PreviewCache::new(4);
+    let path = Path::new("group.jpg");
+    let first = RenderVariant::face_crop(1, [0.1, 0.1, 0.3, 0.3], 128);
+    let second = RenderVariant::face_crop(2, [0.6, 0.6, 0.8, 0.8], 128);
+    let first_request = cache.begin(path, first).unwrap();
+    assert!(cache.finish_for(
+        path,
+        RenderIdentity::default(),
+        first,
+        first_request,
+        image_state_for(first),
+    ));
+    let second_request = cache.begin(path, second).unwrap();
+    assert!(cache.finish_for(
+        path,
+        RenderIdentity::default(),
+        second,
+        second_request,
+        image_state_for(second),
+    ));
+    assert!(matches!(
+        cache.state_for_variant(path, RenderIdentity::default(), first),
+        PreviewState::Loaded(_)
+    ));
+    assert!(matches!(
+        cache.state_for_variant(path, RenderIdentity::default(), second),
+        PreviewState::Loaded(_)
+    ));
 }
 
 #[test]
@@ -151,11 +214,17 @@ fn baseline_and_developed_entries_coexist() {
     let baseline = cache
         .begin_for(path, RenderVariant::Full, RenderIdentity::default())
         .unwrap();
-    cache.finish_for(path, RenderIdentity::default(), baseline, image_state());
+    cache.finish_for(
+        path,
+        RenderIdentity::default(),
+        RenderVariant::Full,
+        baseline,
+        image_state(),
+    );
     let request = cache
         .begin_for(path, RenderVariant::Full, developed)
         .unwrap();
-    cache.finish_for(path, developed, request, image_state());
+    cache.finish_for(path, developed, RenderVariant::Full, request, image_state());
     assert!(matches!(
         cache.state_for(path, RenderIdentity::default()),
         PreviewState::Loaded(_)

@@ -26,6 +26,13 @@ cache uses access sidecars and a 10 GiB least-recently-used budget.
 Set `REKESZ_DIAGNOSTICS=1` to print aggregate scheduling latency, cancellation,
 and persistent-cache activity when the application shuts down.
 
+Face detection and recognition are fully local and work offline. Model integrity,
+privacy guarantees, persistent People settings, migration recovery, and release
+validation are documented in [docs/people-operations.md](docs/people-operations.md)
+and [docs/people-release-validation.md](docs/people-release-validation.md).
+Face crops remain memory-only by default. Enabling their local disk cache in
+Settings includes them in the regular cache statistics and clear operation.
+
 When a directory contains matching `name.CR3` and `name.JPG` files, the grid
 shows one item and uses CR3 by default. Pass `--cr3-jpeg-preference jpeg` to use
 the JPEG instead.

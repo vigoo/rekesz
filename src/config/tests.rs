@@ -21,6 +21,10 @@ fn persisted_settings_are_loaded_and_cli_values_override_them() {
         online_map_permission: OnlineMapPermission::Unknown,
         map_cache_bytes: DEFAULT_MAP_CACHE_BYTES,
         map_switcher_placement: MapSwitcherPlacement::Header,
+        automatic_face_analysis: true,
+        face_workers: default_face_workers(),
+        face_worker_memory_bytes: default_face_worker_memory_bytes(),
+        face_crop_disk_cache: FaceCropDiskCachePolicy::default(),
     };
     save(&path, &stored).unwrap();
     let config = from_args_with_dirs(

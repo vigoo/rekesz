@@ -12,6 +12,126 @@ use futures::executor::block_on;
 
 use super::*;
 
+#[test]
+fn maintenance_submission_after_final_empty_observation_gets_atomic_trailing_rerun() {
+    let observed_empty = Arc::new((Mutex::new(false), Condvar::new()));
+    let allow_completion = Arc::new((Mutex::new(false), Condvar::new()));
+    let executions = Arc::new(AtomicUsize::new(0));
+    let scheduler = MaintenanceScheduler::new(1, {
+        let observed_empty = observed_empty.clone();
+        let allow_completion = allow_completion.clone();
+        let executions = executions.clone();
+        Arc::new(move |_: &u8, _| {
+            let run = executions.fetch_add(1, Ordering::AcqRel);
+            if run == 0 {
+                let (lock, wake) = &*observed_empty;
+                *lock.lock().unwrap() = true;
+                wake.notify_all();
+                let (lock, wake) = &*allow_completion;
+                let mut allowed = lock.lock().unwrap();
+                while !*allowed {
+                    allowed = wake.wait(allowed).unwrap();
+                }
+            }
+            Ok(())
+        })
+    });
+    assert!(scheduler.submit(7, 0));
+    let (lock, wake) = &*observed_empty;
+    let mut observed = lock.lock().unwrap();
+    while !*observed {
+        observed = wake.wait(observed).unwrap();
+    }
+    drop(observed);
+    assert!(!scheduler.submit(7, 10));
+    let (lock, wake) = &*allow_completion;
+    *lock.lock().unwrap() = true;
+    wake.notify_all();
+    assert!(scheduler.wait_until_settled(Duration::from_secs(2)));
+    assert_eq!(executions.load(Ordering::Acquire), 2);
+    assert_eq!(scheduler.stats().completed, 2);
+}
+
+type CancellationOrderHarness = (
+    MaintenanceScheduler<u8>,
+    Arc<(Mutex<bool>, Condvar)>,
+    Arc<(Mutex<bool>, Condvar)>,
+    Arc<AtomicUsize>,
+);
+
+fn cancellation_order_scheduler() -> CancellationOrderHarness {
+    let entered = Arc::new((Mutex::new(false), Condvar::new()));
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let executions = Arc::new(AtomicUsize::new(0));
+    let scheduler = MaintenanceScheduler::new(1, {
+        let entered = entered.clone();
+        let release = release.clone();
+        let executions = executions.clone();
+        Arc::new(move |_: &u8, _| {
+            if executions.fetch_add(1, Ordering::AcqRel) == 0 {
+                *entered.0.lock().unwrap() = true;
+                entered.1.notify_all();
+                let mut open = release.0.lock().unwrap();
+                while !*open {
+                    open = release.1.wait(open).unwrap();
+                }
+            }
+            Ok(())
+        })
+    });
+    (scheduler, entered, release, executions)
+}
+
+fn wait_bool(pair: &(Mutex<bool>, Condvar)) {
+    let mut value = pair.0.lock().unwrap();
+    while !*value {
+        value = pair.1.wait(value).unwrap();
+    }
+}
+
+#[test]
+fn maintenance_submit_before_cancel_does_not_resurrect_cancelled_work() {
+    let (scheduler, entered, release, executions) = cancellation_order_scheduler();
+    assert!(scheduler.submit(1, 0));
+    wait_bool(&entered);
+    assert!(!scheduler.submit(1, 10));
+    assert!(scheduler.cancel(&1));
+    *release.0.lock().unwrap() = true;
+    release.1.notify_all();
+    assert!(scheduler.wait_until_settled(Duration::from_secs(2)));
+    assert_eq!(executions.load(Ordering::Acquire), 1);
+    assert_eq!(scheduler.stats().cancelled, 1);
+}
+
+#[test]
+fn maintenance_submit_after_cancel_gets_fresh_token_and_trailing_rerun() {
+    let (scheduler, entered, release, executions) = cancellation_order_scheduler();
+    assert!(scheduler.submit(1, 0));
+    wait_bool(&entered);
+    assert!(scheduler.cancel(&1));
+    assert!(!scheduler.submit(1, 10));
+    *release.0.lock().unwrap() = true;
+    release.1.notify_all();
+    assert!(scheduler.wait_until_settled(Duration::from_secs(2)));
+    assert_eq!(executions.load(Ordering::Acquire), 2);
+    let stats = scheduler.stats();
+    assert_eq!(stats.cancelled, 1);
+    assert_eq!(stats.completed, 1);
+}
+
+#[test]
+fn maintenance_cancel_all_blocks_trailing_resurrection() {
+    let (scheduler, entered, release, executions) = cancellation_order_scheduler();
+    assert!(scheduler.submit(1, 0));
+    wait_bool(&entered);
+    scheduler.cancel_all();
+    assert!(!scheduler.submit(1, 10));
+    *release.0.lock().unwrap() = true;
+    release.1.notify_all();
+    assert!(scheduler.wait_until_settled(Duration::from_secs(2)));
+    assert_eq!(executions.load(Ordering::Acquire), 1);
+}
+
 fn key(name: &str) -> JobKey {
     JobKey {
         path: PathBuf::from(name),
@@ -427,6 +547,59 @@ fn background_work_cannot_consume_the_reserved_interactive_slot() {
     let (lock, wake) = &*gate;
     *lock.lock().unwrap() = true;
     wake.notify_all();
+}
+
+#[test]
+fn visible_render_demand_blocks_typed_maintenance_admission() {
+    let render_gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let (visible_started_tx, visible_started_rx) = mpsc::channel();
+    let scheduler = RenderScheduler::new(1, {
+        let render_gate = render_gate.clone();
+        Arc::new(move |_, _, _| {
+            visible_started_tx.send(()).unwrap();
+            let (lock, wake) = &*render_gate;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+            error_result("done")
+        })
+    });
+    let maintenance_runs = Arc::new(AtomicUsize::new(0));
+    let maintenance =
+        MaintenanceScheduler::new_with_admission(1, scheduler.maintenance_admission(), {
+            let maintenance_runs = maintenance_runs.clone();
+            Arc::new(move |_: &u8, _| {
+                maintenance_runs.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        });
+    let visible = scheduler
+        .replace_scope(
+            DemandScopeId(9),
+            vec![demand(key("visible"), JobPriority::visible(0))],
+        )
+        .pop()
+        .unwrap();
+    visible_started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    maintenance.submit(1, 0);
+    thread::sleep(Duration::from_millis(30));
+    assert_eq!(maintenance_runs.load(Ordering::SeqCst), 0);
+
+    let (lock, wake) = &*render_gate;
+    *lock.lock().unwrap() = true;
+    wake.notify_all();
+    assert!(matches!(
+        block_on(visible.receiver).unwrap(),
+        JobCompletion::Finished(_)
+    ));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while maintenance.stats().completed == 0 && Instant::now() < deadline {
+        thread::yield_now();
+    }
+    assert_eq!(maintenance_runs.load(Ordering::SeqCst), 1);
 }
 
 #[test]

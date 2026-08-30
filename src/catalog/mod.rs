@@ -1,18 +1,44 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
+    io::Read,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
+
+pub(crate) mod people;
+pub(crate) mod recognition;
+mod recognition_policy;
 
 pub const CATALOG_DIR: &str = ".rekesz";
 const CATALOG_FILE: &str = "catalog.sqlite3";
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 6;
+const CONTENT_IDENTITY_BUFFER_BYTES: usize = 64 * 1024;
 const SQLITE_APPLICATION_ID: i64 = 0x5049_4353;
 pub const RENDERER_MODEL_VERSION: u32 = 6;
+
+#[cfg(test)]
+thread_local! {
+    static LIGHTROOM_TRANSACTION_BEGUN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn install_lightroom_transaction_begun_hook(hook: impl FnOnce() + 'static) {
+    LIGHTROOM_TRANSACTION_BEGUN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn notify_lightroom_transaction_begun() {
+    LIGHTROOM_TRANSACTION_BEGUN_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
 
 #[derive(Clone, Copy)]
 struct ImportCapabilities {
@@ -340,6 +366,16 @@ pub struct ImportReport {
     pub conflicting_sources: u64,
     pub unsupported_property_occurrences: BTreeMap<String, u64>,
     pub fidelity_warnings: BTreeMap<String, u64>,
+    pub lightroom_faces: u64,
+    pub imported_faces: u64,
+    pub confirmed_face_assignments: u64,
+    pub suggested_face_assignments: u64,
+    pub unnamed_faces: u64,
+    pub imported_face_clusters: u64,
+    pub skipped_virtual_copy_faces: u64,
+    pub orphan_face_assignments: u64,
+    pub incomplete_lightroom_embeddings: u64,
+    pub face_import_warnings: BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -414,6 +450,18 @@ pub fn load_hidden_subtrees(root: &Path) -> Result<HashSet<PathBuf>> {
         .collect()
 }
 
+/// Validate and migrate an existing owned catalog before runtime readers or
+/// maintenance workers are started. An unopened library without a catalog is
+/// left untouched; the first operation that needs persistence may create it.
+pub(crate) fn prepare_existing_catalog(root: &Path) -> Result<()> {
+    let path = catalog_path(root);
+    if !path.is_file() {
+        return Ok(());
+    }
+    let mut connection = Connection::open(path)?;
+    initialize_schema(&mut connection)
+}
+
 pub fn save_hidden_subtrees(root: &Path, hidden_subtrees: &HashSet<PathBuf>) -> Result<()> {
     let directory = root.join(CATALOG_DIR);
     fs::create_dir_all(&directory)?;
@@ -469,6 +517,7 @@ fn import_lightroom_inner(
         .with_context(|| format!("cannot resolve opened root {}", root.display()))?;
     let destination = catalog_path(&root);
     let lightroom = open_lightroom_immutable(lightroom_catalog)?;
+    let source_namespace = lightroom_source_namespace(&lightroom, lightroom_catalog)?;
     let mut report = ImportReport {
         catalog_path: destination.clone(),
         ..ImportReport::default()
@@ -543,6 +592,8 @@ fn import_lightroom_inner(
     }
     drop(rows);
     drop(query);
+    let people =
+        people::collect_lightroom_people(&root, &lightroom, &source_namespace, &mut report)?;
 
     if !apply {
         return Ok(report);
@@ -554,8 +605,8 @@ fn import_lightroom_inner(
         let mut rekesz = Connection::open(&destination)
             .with_context(|| format!("cannot open Rekesz catalog {}", destination.display()))?;
         initialize_schema(&mut rekesz)?;
-        write_planned_recipes(&mut rekesz, &planned)?;
-    } else if planned.is_empty() {
+        write_lightroom_import(&mut rekesz, &planned, &people)?;
+    } else if planned.is_empty() && people.faces.is_empty() {
         // There is nothing to persist. In particular, do not create a Rekesz
         // catalog merely to record that every Lightroom image is unedited.
         return Ok(report);
@@ -565,7 +616,7 @@ fn import_lightroom_inner(
         {
             let mut rekesz = Connection::open(&temporary)?;
             initialize_schema(&mut rekesz)?;
-            write_planned_recipes(&mut rekesz, &planned)?;
+            write_lightroom_import(&mut rekesz, &planned, &people)?;
             rekesz.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")?;
         }
         let parent = destination.parent().expect("catalog path has a parent");
@@ -583,19 +634,67 @@ fn import_lightroom_inner(
     Ok(report)
 }
 
-fn write_planned_recipes(
+fn begin_people_summary_bulk(connection: &Connection) -> Result<()> {
+    connection.execute(
+        "UPDATE people_summary_bulk_state SET dirty=CASE WHEN depth=0 THEN 0 ELSE dirty END,
+         depth=depth+1 WHERE id=1",
+        [],
+    )?;
+    Ok(())
+}
+
+fn finish_people_summary_bulk(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "UPDATE people_summary_epoch SET source_epoch=source_epoch+1 WHERE id=1
+           AND (SELECT depth=1 AND dirty=1 FROM people_summary_bulk_state WHERE id=1);
+         INSERT INTO people_summary_rebuild_queue(id,status,requested_epoch,attempts,worker_id,
+           lease_expires_at,retry_after,error,updated_at)
+         SELECT 1,'pending',source_epoch,0,NULL,NULL,NULL,NULL,datetime('now')
+           FROM people_summary_epoch
+          WHERE id=1 AND (SELECT depth=1 AND dirty=1 FROM people_summary_bulk_state WHERE id=1)
+         ON CONFLICT(id) DO UPDATE SET
+           status=CASE WHEN people_summary_rebuild_queue.status='running'
+                            AND people_summary_rebuild_queue.lease_expires_at>=datetime('now')
+                       THEN 'running' ELSE 'pending' END,
+           requested_epoch=excluded.requested_epoch,
+           worker_id=CASE WHEN people_summary_rebuild_queue.status='running'
+                               AND people_summary_rebuild_queue.lease_expires_at>=datetime('now')
+                          THEN people_summary_rebuild_queue.worker_id ELSE NULL END,
+           claimed_epoch=CASE WHEN people_summary_rebuild_queue.status='running'
+                                   AND people_summary_rebuild_queue.lease_expires_at>=datetime('now')
+                              THEN people_summary_rebuild_queue.claimed_epoch ELSE NULL END,
+           lease_expires_at=CASE WHEN people_summary_rebuild_queue.status='running'
+                                      AND people_summary_rebuild_queue.lease_expires_at>=datetime('now')
+                                 THEN people_summary_rebuild_queue.lease_expires_at ELSE NULL END,
+           retry_after=NULL,error=NULL,updated_at=excluded.updated_at;
+         UPDATE people_summary_bulk_state SET depth=depth-1,
+           dirty=CASE WHEN depth=1 THEN 0 ELSE dirty END WHERE id=1 AND depth>0;",
+    )?;
+    Ok(())
+}
+
+fn write_lightroom_import(
     rekesz: &mut Connection,
     planned: &BTreeMap<Vec<u8>, DevelopRecipe>,
+    people: &people::PeopleImport,
 ) -> Result<()> {
     let transaction = rekesz.transaction()?;
+    begin_people_summary_bulk(&transaction)?;
+    #[cfg(test)]
+    notify_lightroom_transaction_begun();
     transaction.execute("DELETE FROM develop_recipes", [])?;
-    transaction.execute("DELETE FROM assets", [])?;
     for (relative_key, recipe) in planned {
+        let relative_path = decode_relative_path(relative_key)?;
         transaction.execute(
-            "INSERT INTO assets(relative_path) VALUES (?1)",
-            [&relative_key],
+            "INSERT INTO assets(relative_path, scope_key) VALUES (?1, ?2) \
+             ON CONFLICT(relative_path) DO UPDATE SET scope_key=excluded.scope_key",
+            params![relative_key, scope_key(&relative_path)?],
         )?;
-        let asset_id = transaction.last_insert_rowid();
+        let asset_id: i64 = transaction.query_row(
+            "SELECT id FROM assets WHERE relative_path=?1",
+            [&relative_key],
+            |row| row.get(0),
+        )?;
         let json = serde_json::to_string(&recipe)?;
         recipe.validate()?;
         let digest = recipe.digest()?;
@@ -605,16 +704,117 @@ fn write_planned_recipes(
             params![asset_id, json, digest.as_slice()],
         )?;
     }
+    people::write_people_import(&transaction, people)?;
+    transaction.execute(
+        "DELETE FROM assets WHERE id NOT IN (SELECT asset_id FROM develop_recipes) \
+         AND id NOT IN (SELECT asset_id FROM faces) \
+         AND id NOT IN (SELECT asset_id FROM face_analysis_state)",
+        [],
+    )?;
     transaction.execute(
         "UPDATE catalog_meta SET renderer_model=?1, last_imported_at=datetime('now')",
         [RENDERER_MODEL_VERSION],
     )?;
+    finish_people_summary_bulk(&transaction)?;
     transaction.commit()?;
     Ok(())
 }
 
-fn catalog_path(root: &Path) -> PathBuf {
+pub(crate) fn catalog_path(root: &Path) -> PathBuf {
     root.join(CATALOG_DIR).join(CATALOG_FILE)
+}
+
+pub(crate) fn scope_key(path: &Path) -> Result<Vec<u8>> {
+    let mut key = Vec::new();
+    for component in path.components() {
+        let std::path::Component::Normal(value) = component else {
+            bail!("scope path must be relative and contain only normal components");
+        };
+        let encoded = encode_relative_path(Path::new(value))?;
+        let length = u32::try_from(encoded.len()).context("path component is too large")?;
+        key.extend_from_slice(&length.to_be_bytes());
+        key.extend_from_slice(&encoded);
+    }
+    Ok(key)
+}
+
+fn lightroom_source_namespace(connection: &Connection, catalog_path: &Path) -> Result<String> {
+    let has_variables: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='Adobe_variables')",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_variables {
+        let provider_id: Option<Vec<u8>> = connection
+            .query_row(
+                "SELECT CAST(value AS BLOB) FROM Adobe_variables
+                 WHERE name='Adobe_storeProviderID' AND value IS NOT NULL LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(provider_id) = provider_id.filter(|value| !value.is_empty()) {
+            return Ok(blake3::hash(&provider_id).to_hex().to_string());
+        }
+        // Adobe_storeProviderID is absent from some real Lightroom Classic
+        // catalogs. Adobe_variables.id_global is Lightroom's persistent object
+        // identity and survives catalog moves, so it is a safe namespace
+        // fallback without depending on a mutable file path.
+        let global_id: Option<Vec<u8>> = connection
+            .query_row(
+                "SELECT CAST(id_global AS BLOB) FROM Adobe_variables
+                 WHERE id_global IS NOT NULL AND length(CAST(id_global AS BLOB))>0
+                 ORDER BY id_local LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(global_id) = global_id {
+            return Ok(blake3::hash(&global_id).to_hex().to_string());
+        }
+    }
+
+    // Lightroom catalog versions differ considerably in where (and whether)
+    // they retain Adobe_storeProviderID. Prefer persistent object identifiers
+    // from the catalog before falling back to its location.
+    for table in [
+        "AgLibraryRootFolder",
+        "Adobe_images",
+        "AgLibraryFile",
+        "AgLibraryKeyword",
+    ] {
+        let has_global_id: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name='id_global')",
+            [table],
+            |row| row.get(0),
+        )?;
+        if !has_global_id {
+            continue;
+        }
+        let query = format!(
+            "SELECT CAST(id_global AS BLOB) FROM {table} \
+             WHERE id_global IS NOT NULL AND length(CAST(id_global AS BLOB))>0 \
+             ORDER BY id_local LIMIT 1"
+        );
+        let global_id: Option<Vec<u8>> = connection
+            .query_row(&query, [], |row| row.get(0))
+            .optional()?;
+        if let Some(global_id) = global_id {
+            let mut identity = table.as_bytes().to_vec();
+            identity.push(0);
+            identity.extend(global_id);
+            return Ok(blake3::hash(&identity).to_hex().to_string());
+        }
+    }
+
+    // Very old or compacted catalogs can contain no persistent global IDs at
+    // all. A canonical path still gives repeatable imports of that catalog and
+    // is safer than rejecting otherwise valid People data.
+    let database_path = lightroom_database_path(catalog_path)?;
+    let stable_path = database_path.canonicalize().unwrap_or(database_path);
+    Ok(blake3::hash(stable_path.as_os_str().as_encoded_bytes())
+        .to_hex()
+        .to_string())
 }
 
 fn initialize_schema(connection: &mut Connection) -> Result<()> {
@@ -629,11 +829,48 @@ fn initialize_schema(connection: &mut Connection) -> Result<()> {
         bail!("refusing to initialize a database that is not a Rekesz catalog");
     }
     if tables > 0 {
-        // Probe and reject an unsupported owned schema before any PRAGMA or DDL
-        // can mutate it. Schema migrations must be explicit future operations.
-        validate_schema(connection)?;
+        validate_owned_catalog(connection)?;
+        connection.execute_batch("PRAGMA foreign_keys=ON")?;
+        let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        match version {
+            SCHEMA_VERSION => {}
+            1 => {
+                backup_catalog_before_migration(connection, version)?;
+                migrate_v1_to_v3(connection)?;
+                migrate_v3_to_v4(connection)?;
+                migrate_v4_to_v5(connection)?;
+                migrate_v5_to_v6(connection)?;
+            }
+            2 => {
+                backup_catalog_before_migration(connection, version)?;
+                migrate_v2_to_v3(connection)?;
+                migrate_v3_to_v4(connection)?;
+                migrate_v4_to_v5(connection)?;
+                migrate_v5_to_v6(connection)?;
+            }
+            3 => {
+                backup_catalog_before_migration(connection, version)?;
+                migrate_v3_to_v4(connection)?;
+                migrate_v4_to_v5(connection)?;
+                migrate_v5_to_v6(connection)?;
+            }
+            4 => {
+                backup_catalog_before_migration(connection, version)?;
+                migrate_v4_to_v5(connection)?;
+                migrate_v5_to_v6(connection)?;
+            }
+            5 => {
+                backup_catalog_before_migration(connection, version)?;
+                migrate_v5_to_v6(connection)?;
+            }
+            _ => {
+                bail!("unsupported Rekesz catalog schema {version}; expected {SCHEMA_VERSION}")
+            }
+        }
+        connection.execute_batch(asset_inventory_schema())?;
+        ensure_analysis_decoder_columns(connection)?;
         connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;")?;
-        return Ok(());
+        return validate_schema(connection);
     }
     connection.execute_batch(&format!(
         "PRAGMA foreign_keys=ON;
@@ -648,7 +885,8 @@ fn initialize_schema(connection: &mut Connection) -> Result<()> {
          );
          CREATE TABLE IF NOT EXISTS assets(
              id INTEGER PRIMARY KEY,
-             relative_path BLOB NOT NULL UNIQUE
+             relative_path BLOB NOT NULL UNIQUE,
+             scope_key BLOB NOT NULL
          );
          CREATE TABLE IF NOT EXISTS develop_recipes(
              asset_id INTEGER PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
@@ -656,24 +894,1139 @@ fn initialize_schema(connection: &mut Connection) -> Result<()> {
              recipe_digest BLOB NOT NULL,
              imported_at TEXT NOT NULL
          );
+         CREATE INDEX IF NOT EXISTS assets_scope_key ON assets(scope_key);
+         {asset_inventory_schema}
          CREATE TABLE IF NOT EXISTS hidden_subtrees(
              relative_path BLOB PRIMARY KEY,
              hidden_at TEXT NOT NULL
          );
+         {people_schema}
+         {people_summary_schema}
          INSERT INTO catalog_meta(id, schema_version, renderer_model, created_at)
          SELECT 1, {SCHEMA_VERSION}, {RENDERER_MODEL_VERSION}, datetime('now')
          WHERE NOT EXISTS(SELECT 1 FROM catalog_meta);
-         PRAGMA user_version={SCHEMA_VERSION};"
+         PRAGMA user_version={SCHEMA_VERSION};",
+        people_schema = people_schema(),
+        people_summary_schema = people_summary_schema(),
+        asset_inventory_schema = asset_inventory_schema()
     ))?;
     validate_schema(connection)
 }
 
-fn validate_schema(connection: &Connection) -> Result<()> {
+fn backup_catalog_before_migration(connection: &Connection, source_version: i64) -> Result<()> {
+    let database_path: String = connection.query_row(
+        "SELECT file FROM pragma_database_list WHERE name='main'",
+        [],
+        |row| row.get(0),
+    )?;
+    if database_path.is_empty() {
+        bail!("cannot back up an in-memory Rekesz catalog before migration");
+    }
+    let database_path = PathBuf::from(database_path);
+    let file_name = database_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("Rekesz catalog has a non-Unicode or missing file name")?;
+    let attempt = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let backup_path = database_path.with_file_name(format!(
+        "{file_name}.pre-v{source_version}-{attempt}-backup.sqlite3"
+    ));
+    let escaped = backup_path.to_string_lossy().replace('\'', "''");
+    connection
+        .execute_batch(&format!("VACUUM main INTO '{escaped}'"))
+        .with_context(|| {
+            format!(
+                "cannot create pre-migration catalog backup {}",
+                backup_path.display()
+            )
+        })?;
+    let backup = Connection::open_with_flags(
+        &backup_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    validate_migration_backup(connection, &backup, source_version).with_context(|| {
+        format!(
+            "pre-migration catalog backup is not recoverable: {}",
+            backup_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn validate_migration_backup(
+    source: &Connection,
+    backup: &Connection,
+    source_version: i64,
+) -> Result<()> {
+    validate_owned_catalog(backup)?;
+    let integrity: String = backup.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        bail!("SQLite integrity check failed: {integrity}");
+    }
+    let backup_version: i64 = backup.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let metadata_version: i64 = backup.query_row(
+        "SELECT schema_version FROM catalog_meta WHERE id=1",
+        [],
+        |row| row.get(0),
+    )?;
+    if backup_version != source_version || metadata_version != source_version {
+        bail!(
+            "backup schema markers disagree: expected {source_version}, got {backup_version}/{metadata_version}"
+        );
+    }
+    for table in [
+        "people",
+        "faces",
+        "face_assignments",
+        "face_decision_journal",
+    ] {
+        let present: bool = source.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+            [table],
+            |row| row.get(0),
+        )?;
+        if present {
+            let source_count: i64 =
+                source.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })?;
+            let backup_count: i64 =
+                backup.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })?;
+            if source_count != backup_count {
+                bail!("backup did not preserve {table} rows");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn asset_inventory_schema() -> &'static str {
+    "CREATE TABLE IF NOT EXISTS analysis_asset_inventory(
+         asset_id INTEGER PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
+         source_size INTEGER NOT NULL,
+         source_modified_ns INTEGER NOT NULL,
+         source_fingerprint BLOB NOT NULL DEFAULT X'',
+         decoder_model_id TEXT NOT NULL DEFAULT 'renderer-6',
+         discovered_at TEXT NOT NULL
+     );"
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SourceContentIdentity {
+    pub size: i64,
+    pub modified_ns: i64,
+    pub fingerprint: [u8; 32],
+}
+
+#[cfg(test)]
+thread_local! {
+    static CONTENT_IDENTITY_CHUNK_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn install_content_identity_chunk_hook(hook: impl Fn() + 'static) {
+    CONTENT_IDENTITY_CHUNK_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+fn modified_ns(metadata: &fs::Metadata) -> i64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |value| value.as_nanos().min(i64::MAX as u128) as i64)
+}
+
+/// Reads size, mtime, and full-content SHA-256 from one handle. Metadata is
+/// sampled around hashing; an unstable source is retried twice, then rejected.
+pub(crate) fn stable_content_identity(path: &Path) -> Result<SourceContentIdentity> {
+    use sha2::Digest;
+    use std::io::Read;
+
+    for attempt in 0..3 {
+        let mut file = fs::File::open(path)
+            .with_context(|| format!("open source for content identity: {}", path.display()))?;
+        let before = file.metadata()?;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"rekesz-content-identity-v1");
+        let mut buffer = [0_u8; CONTENT_IDENTITY_BUFFER_BYTES];
+        let mut first = true;
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+            if first {
+                first = false;
+                #[cfg(test)]
+                CONTENT_IDENTITY_CHUNK_HOOK.with(|slot| {
+                    if let Some(hook) = slot.borrow().as_ref() {
+                        hook();
+                    }
+                });
+            }
+        }
+        let after = file.metadata()?;
+        let before_identity = (before.len(), modified_ns(&before));
+        let after_identity = (after.len(), modified_ns(&after));
+        if before_identity == after_identity {
+            return Ok(SourceContentIdentity {
+                size: before.len().min(i64::MAX as u64) as i64,
+                modified_ns: before_identity.1,
+                fingerprint: hasher.finalize().into(),
+            });
+        }
+        if attempt == 2 {
+            bail!("source changed repeatedly while computing content identity");
+        }
+    }
+    unreachable!()
+}
+
+fn ensure_analysis_decoder_columns(connection: &Connection) -> Result<()> {
+    for table in ["analysis_asset_inventory", "face_analysis_state"] {
+        let present: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name='decoder_model_id')",
+            [table],
+            |row| row.get(0),
+        )?;
+        if !present {
+            connection.execute(
+                &format!("ALTER TABLE {table} ADD COLUMN decoder_model_id TEXT NOT NULL DEFAULT 'renderer-6'"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AssetInventorySync {
+    pub present: usize,
+    pub added: usize,
+    pub invalidated: usize,
+    pub removed: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InventoryIdentityMode {
+    MetadataFirst,
+    VerifyContents,
+}
+
+/// Reconciles a complete, already-filtered discovery snapshot with the catalog.
+/// Callers own supported-format, hidden-subtree, and RAW/JPEG-pair policy; this
+/// boundary owns portable paths, stable asset ids, source identity, and removal.
+pub(crate) fn sync_asset_inventory(
+    root: &Path,
+    eligible_paths: &[PathBuf],
+    detector_model_id: &str,
+    recognizer_model_id: &str,
+) -> Result<AssetInventorySync> {
+    sync_asset_inventory_with_progress(
+        root,
+        eligible_paths,
+        detector_model_id,
+        recognizer_model_id,
+        InventoryIdentityMode::VerifyContents,
+        |_, _, _| {},
+        || true,
+    )
+}
+
+pub(crate) fn sync_asset_inventory_with_progress(
+    root: &Path,
+    eligible_paths: &[PathBuf],
+    detector_model_id: &str,
+    recognizer_model_id: &str,
+    identity_mode: InventoryIdentityMode,
+    mut progress: impl FnMut(usize, usize, &Path),
+    mut checkpoint: impl FnMut() -> bool,
+) -> Result<AssetInventorySync> {
+    fs::create_dir_all(root.join(CATALOG_DIR))?;
+    let mut connection = Connection::open(catalog_path(root))?;
+    initialize_schema(&mut connection)?;
+    let mut stored = HashMap::<Vec<u8>, (i64, i64, [u8; 32])>::new();
+    if identity_mode == InventoryIdentityMode::MetadataFirst {
+        let mut query = connection.prepare(
+            "SELECT asset.relative_path, inventory.source_size,
+                    inventory.source_modified_ns, inventory.source_fingerprint
+             FROM analysis_asset_inventory inventory
+             JOIN assets asset ON asset.id=inventory.asset_id",
+        )?;
+        let rows = query.query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (path, size, modified, fingerprint) = row?;
+            if let Ok(fingerprint) = fingerprint.try_into() {
+                stored.insert(path, (size, modified, fingerprint));
+            }
+        }
+    }
+    let mut staged = Vec::with_capacity(eligible_paths.len());
+    for (index, path) in eligible_paths.iter().enumerate() {
+        if !checkpoint() {
+            bail!("inventory synchronization cancelled");
+        }
+        progress(index, eligible_paths.len(), path);
+        let relative = path
+            .strip_prefix(root)
+            .with_context(|| format!("inventory path is outside library: {}", path.display()))?;
+        if relative.as_os_str().is_empty()
+            || relative
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            bail!(
+                "inventory path is not a portable relative asset: {}",
+                path.display()
+            );
+        }
+        let metadata = fs::metadata(path)
+            .with_context(|| format!("read inventory identity for {}", path.display()))?;
+        if metadata.is_file() {
+            let size = metadata.len().min(i64::MAX as u64) as i64;
+            let modified = modified_ns(&metadata);
+            let encoded = encode_relative_path(relative)?;
+            let identity = stored
+                .get(&encoded)
+                .filter(|(stored_size, stored_modified, _)| {
+                    *stored_size == size && *stored_modified == modified
+                })
+                .map(|(_, _, fingerprint)| SourceContentIdentity {
+                    size,
+                    modified_ns: modified,
+                    fingerprint: *fingerprint,
+                })
+                .map_or_else(|| stable_content_identity(path), Ok)?;
+            staged.push((
+                relative.to_path_buf(),
+                identity.size,
+                identity.modified_ns,
+                identity.fingerprint,
+            ));
+        }
+    }
+    if let Some(last) = eligible_paths.last() {
+        progress(eligible_paths.len(), eligible_paths.len(), last);
+    }
+    connection.execute_batch(
+        "CREATE TEMP TABLE inventory_seen(asset_id INTEGER PRIMARY KEY) WITHOUT ROWID;",
+    )?;
+    let mut result = AssetInventorySync::default();
+    let decoder_model_id = crate::rendering::DECODER_MODEL_ID;
+    let staged_total = staged.len();
+    // Keep maintenance write ownership short so interactive People edits can
+    // acquire SQLite between batches.
+    for chunk in staged.chunks(32) {
+        if !checkpoint() {
+            bail!("inventory synchronization cancelled");
+        }
+        let transaction = connection.transaction()?;
+        begin_people_summary_bulk(&transaction)?;
+        for (relative, source_size, source_modified_ns, source_fingerprint) in chunk {
+            progress(result.present, staged_total, relative);
+            let encoded = encode_relative_path(relative)?;
+            let existed: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM assets WHERE relative_path=?1)",
+                [&encoded],
+                |row| row.get(0),
+            )?;
+            transaction.execute(
+                "INSERT INTO assets(relative_path, scope_key) VALUES(?1, ?2)
+             ON CONFLICT(relative_path) DO UPDATE SET scope_key=excluded.scope_key
+             WHERE assets.scope_key<>excluded.scope_key",
+                params![encoded, scope_key(relative)?],
+            )?;
+            let asset_id: i64 = transaction.query_row(
+                "SELECT id FROM assets WHERE relative_path=?1",
+                [&encoded],
+                |row| row.get(0),
+            )?;
+            let changed: bool = transaction.query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM analysis_asset_inventory inventory
+               JOIN face_analysis_state state ON state.asset_id=inventory.asset_id
+               WHERE inventory.asset_id=?1 AND inventory.source_size=?2
+                 AND inventory.source_modified_ns=?3 AND state.detector_model_id=?4
+                 AND state.recognizer_model_id=?5 AND state.decoder_model_id=?6
+                 AND inventory.source_fingerprint=?7 AND state.source_fingerprint=?7
+                 AND NOT(state.status='error' AND coalesce(state.error, '')
+                         LIKE 'filesystem identity differs from inventory%'))",
+                params![
+                    asset_id,
+                    source_size,
+                    source_modified_ns,
+                    detector_model_id,
+                    recognizer_model_id,
+                    decoder_model_id,
+                    source_fingerprint.as_slice()
+                ],
+                |row| row.get(0),
+            )?;
+            transaction.execute(
+                "INSERT INTO analysis_asset_inventory(asset_id, source_size, source_modified_ns,
+                source_fingerprint, decoder_model_id, discovered_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, datetime('now')) ON CONFLICT(asset_id) DO UPDATE SET
+             source_size=excluded.source_size, source_modified_ns=excluded.source_modified_ns,
+             source_fingerprint=excluded.source_fingerprint,
+             decoder_model_id=excluded.decoder_model_id, discovered_at=excluded.discovered_at",
+                params![
+                    asset_id,
+                    source_size,
+                    source_modified_ns,
+                    source_fingerprint.as_slice(),
+                    decoder_model_id
+                ],
+            )?;
+            if changed {
+                let face_ids = {
+                    let mut statement = transaction.prepare(
+                        "SELECT id FROM faces WHERE asset_id=?1 AND provenance='rekesz'",
+                    )?;
+                    statement
+                        .query_map([asset_id], |row| row.get::<_, i64>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                if !face_ids.is_empty() {
+                    let mut models = Vec::new();
+                    let mut people = Vec::new();
+                    for face_id in &face_ids {
+                        let mut statement = transaction
+                            .prepare("SELECT model_id FROM face_embeddings WHERE face_id=?1")?;
+                        models.extend(
+                            statement
+                                .query_map([face_id], |row| row.get::<_, String>(0))?
+                                .collect::<rusqlite::Result<Vec<_>>>()?,
+                        );
+                        let mut statement = transaction.prepare(
+                            "SELECT person_id FROM effective_confirmations WHERE face_id=?1",
+                        )?;
+                        people.extend(
+                            statement
+                                .query_map([face_id], |row| row.get::<_, i64>(0))?
+                                .collect::<rusqlite::Result<Vec<_>>>()?,
+                        );
+                    }
+                    models.sort();
+                    models.dedup();
+                    people.sort_unstable();
+                    people.dedup();
+                    recognition::enqueue_refresh_for_models_in_connection(
+                        &transaction,
+                        &models,
+                        &people,
+                        &face_ids,
+                    )?;
+                    transaction.execute(
+                        "DELETE FROM recognition_suggestions WHERE face_id IN
+                       (SELECT id FROM faces WHERE asset_id=?1 AND provenance='rekesz')",
+                        [asset_id],
+                    )?;
+                    transaction.execute(
+                        "DELETE FROM face_embeddings WHERE face_id IN
+                       (SELECT id FROM faces WHERE asset_id=?1 AND provenance='rekesz')",
+                        [asset_id],
+                    )?;
+                }
+                transaction.execute(
+                "INSERT INTO face_analysis_state(asset_id, detector_model_id, recognizer_model_id,
+                    source_size, source_modified_ns, source_fingerprint, decoder_model_id,
+                    status, attempts, failure_class, updated_at)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', 0, NULL, datetime('now'))
+                 ON CONFLICT(asset_id) DO UPDATE SET detector_model_id=excluded.detector_model_id,
+                    recognizer_model_id=excluded.recognizer_model_id,
+                    decoder_model_id=excluded.decoder_model_id,
+                    source_size=excluded.source_size, source_modified_ns=excluded.source_modified_ns,
+                    source_fingerprint=excluded.source_fingerprint,
+                    status='pending', attempts=0, worker_id=NULL, lease_expires_at=NULL,
+                    retry_after=NULL, error=NULL, failure_class=NULL, updated_at=excluded.updated_at",
+                params![asset_id, detector_model_id, recognizer_model_id, source_size,
+                    source_modified_ns, source_fingerprint.as_slice(), decoder_model_id],
+            )?;
+                result.invalidated += usize::from(existed);
+            }
+            result.added += usize::from(!existed);
+            result.present += 1;
+            transaction.execute(
+                "INSERT OR IGNORE INTO inventory_seen VALUES(?1)",
+                [asset_id],
+            )?;
+        }
+        finish_people_summary_bulk(&transaction)?;
+        transaction.commit()?;
+        if let Some((relative, ..)) = chunk.last() {
+            progress(result.present, staged_total, relative);
+        }
+    }
+    let transaction = connection.transaction()?;
+    begin_people_summary_bulk(&transaction)?;
+    result.removed = transaction.execute(
+        "DELETE FROM analysis_asset_inventory WHERE asset_id NOT IN (SELECT asset_id FROM inventory_seen)",
+        [],
+    )?;
+    transaction.execute(
+        "DELETE FROM face_analysis_state WHERE asset_id NOT IN
+           (SELECT asset_id FROM analysis_asset_inventory)",
+        [],
+    )?;
+    transaction.execute(
+        "DELETE FROM assets WHERE id NOT IN (SELECT asset_id FROM analysis_asset_inventory)
+          AND id NOT IN (SELECT asset_id FROM develop_recipes)
+          AND id NOT IN (SELECT asset_id FROM faces)",
+        [],
+    )?;
+    finish_people_summary_bulk(&transaction)?;
+    transaction.commit()?;
+    if let Some(last) = eligible_paths.last() {
+        progress(staged_total, staged_total, last);
+    }
+    Ok(result)
+}
+
+fn people_schema() -> &'static str {
+    "CREATE TABLE IF NOT EXISTS people(
+         id INTEGER PRIMARY KEY,
+         display_name TEXT NOT NULL,
+         locally_renamed INTEGER NOT NULL DEFAULT 0 CHECK(locally_renamed IN (0,1)),
+         representative_face_id INTEGER REFERENCES faces(id) ON DELETE SET NULL,
+         representative_is_manual INTEGER NOT NULL DEFAULT 0 CHECK(representative_is_manual IN (0,1)),
+         created_at TEXT NOT NULL,
+         updated_at TEXT NOT NULL
+     );
+     CREATE TABLE IF NOT EXISTS external_people(
+         person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+         provenance TEXT NOT NULL,
+         external_key BLOB NOT NULL,
+         PRIMARY KEY(provenance, external_key)
+     );
+     CREATE TABLE IF NOT EXISTS faces(
+         id INTEGER PRIMARY KEY,
+         asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+         provenance TEXT NOT NULL,
+         source_key TEXT NOT NULL,
+         left REAL NOT NULL, top REAL NOT NULL, right REAL NOT NULL, bottom REAL NOT NULL,
+         origin TEXT NOT NULL,
+         ignored INTEGER NOT NULL DEFAULT 0 CHECK(ignored IN (0,1)),
+         locally_ignored INTEGER NOT NULL DEFAULT 0 CHECK(locally_ignored IN (0,1)),
+         retired INTEGER NOT NULL DEFAULT 0 CHECK(retired IN (0,1)),
+         detector_model_id TEXT,
+         detection_confidence REAL,
+         updated_at TEXT NOT NULL,
+         UNIQUE(provenance, source_key),
+         CHECK(left >= 0 AND top >= 0 AND right <= 1 AND bottom <= 1),
+         CHECK(left < right AND top < bottom)
+     );
+     CREATE INDEX IF NOT EXISTS faces_asset ON faces(asset_id);
+     CREATE TABLE IF NOT EXISTS face_assignments(
+         face_id INTEGER NOT NULL REFERENCES faces(id) ON DELETE CASCADE,
+         person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+         kind TEXT NOT NULL CHECK(kind IN ('confirmed','suggested','rejected')),
+         provenance TEXT NOT NULL,
+         confidence REAL,
+         updated_at TEXT NOT NULL,
+         PRIMARY KEY(face_id, person_id, kind, provenance)
+     );
+     CREATE INDEX IF NOT EXISTS face_assignments_person ON face_assignments(person_id, kind);
+     CREATE UNIQUE INDEX IF NOT EXISTS one_local_confirmation_per_face
+         ON face_assignments(face_id) WHERE kind='confirmed' AND provenance='rekesz';
+     CREATE VIEW IF NOT EXISTS effective_face_assignments AS
+         SELECT assignment.face_id, assignment.person_id, assignment.kind,
+                assignment.provenance, assignment.confidence, assignment.updated_at
+         FROM face_assignments assignment
+         WHERE assignment.kind='confirmed' AND assignment.provenance='rekesz'
+           AND EXISTS (SELECT 1 FROM faces face WHERE face.id=assignment.face_id AND face.retired=0)
+         UNION ALL
+         SELECT assignment.face_id, assignment.person_id, assignment.kind,
+                assignment.provenance, assignment.confidence, assignment.updated_at
+         FROM face_assignments assignment
+         WHERE assignment.kind='confirmed' AND assignment.provenance!='rekesz'
+           AND EXISTS (SELECT 1 FROM faces face WHERE face.id=assignment.face_id AND face.retired=0)
+           AND NOT EXISTS (
+               SELECT 1 FROM face_assignments local
+               WHERE local.face_id=assignment.face_id AND local.provenance='rekesz'
+                 AND (local.kind='confirmed' OR
+                      (local.kind='rejected' AND local.person_id=assignment.person_id)))
+         UNION ALL
+         SELECT assignment.face_id, assignment.person_id, assignment.kind,
+                assignment.provenance, assignment.confidence, assignment.updated_at
+         FROM face_assignments assignment
+         WHERE assignment.kind='suggested'
+           AND (assignment.provenance!='rekesz' OR NOT EXISTS (
+               SELECT 1 FROM recognition_suggestions suggestion
+               WHERE suggestion.face_id=assignment.face_id
+                 AND suggestion.person_id=assignment.person_id)
+             OR EXISTS (
+               SELECT 1 FROM recognition_suggestions suggestion
+               JOIN recognition_index_state state
+                 ON state.model_id=suggestion.recognizer_model_id
+                AND state.index_version=suggestion.ann_index_version
+                AND state.generation=suggestion.scored_index_generation
+               WHERE suggestion.face_id=assignment.face_id
+                 AND suggestion.person_id=assignment.person_id))
+           AND EXISTS (SELECT 1 FROM faces face WHERE face.id=assignment.face_id AND face.retired=0)
+           AND NOT EXISTS (
+               SELECT 1 FROM face_assignments confirmation
+               WHERE confirmation.face_id=assignment.face_id
+                 AND confirmation.kind='confirmed' AND confirmation.provenance='rekesz')
+           AND NOT EXISTS (
+               SELECT 1 FROM face_assignments confirmation
+               WHERE confirmation.face_id=assignment.face_id
+                 AND confirmation.kind='confirmed' AND confirmation.provenance!='rekesz'
+                 AND NOT EXISTS (
+                     SELECT 1 FROM face_assignments local
+                     WHERE local.face_id=confirmation.face_id AND local.provenance='rekesz'
+                       AND (local.kind='confirmed' OR
+                            (local.kind='rejected' AND local.person_id=confirmation.person_id))))
+           AND NOT EXISTS (
+               SELECT 1 FROM face_assignments rejection
+               WHERE rejection.face_id=assignment.face_id
+                 AND rejection.person_id=assignment.person_id
+                 AND rejection.kind='rejected' AND rejection.provenance='rekesz')
+           AND (assignment.provenance='lightroom' OR NOT EXISTS (
+               SELECT 1 FROM face_assignments preferred
+               WHERE preferred.face_id=assignment.face_id
+                 AND preferred.person_id=assignment.person_id
+                 AND preferred.kind='suggested' AND preferred.provenance='lightroom'));
+     CREATE VIEW IF NOT EXISTS effective_confirmations AS
+         SELECT assignment.face_id, assignment.person_id, assignment.provenance
+         FROM face_assignments assignment
+         WHERE assignment.kind='confirmed' AND assignment.provenance='rekesz'
+           AND EXISTS (SELECT 1 FROM faces face WHERE face.id=assignment.face_id AND face.retired=0)
+         UNION ALL
+         SELECT assignment.face_id, assignment.person_id, assignment.provenance
+         FROM face_assignments assignment
+         WHERE assignment.kind='confirmed' AND assignment.provenance!='rekesz'
+           AND EXISTS (SELECT 1 FROM faces face WHERE face.id=assignment.face_id AND face.retired=0)
+           AND NOT EXISTS (
+               SELECT 1 FROM face_assignments local
+               WHERE local.face_id=assignment.face_id AND local.provenance='rekesz'
+                 AND (local.kind='confirmed' OR
+                      (local.kind='rejected' AND local.person_id=assignment.person_id)));
+     CREATE TABLE IF NOT EXISTS face_cluster_memberships(
+         face_id INTEGER NOT NULL REFERENCES faces(id) ON DELETE CASCADE,
+         provenance TEXT NOT NULL,
+         cluster_key TEXT NOT NULL,
+         PRIMARY KEY(face_id, provenance)
+     );
+     CREATE INDEX IF NOT EXISTS face_clusters_lookup
+         ON face_cluster_memberships(provenance, cluster_key);
+     CREATE TABLE IF NOT EXISTS face_embeddings(
+         face_id INTEGER NOT NULL REFERENCES faces(id) ON DELETE CASCADE,
+         model_id TEXT NOT NULL,
+         dimensions INTEGER NOT NULL,
+         vector BLOB NOT NULL,
+         landmarks BLOB,
+         source_size INTEGER,
+         source_modified_ns INTEGER,
+         source_fingerprint BLOB,
+         created_at TEXT NOT NULL,
+         PRIMARY KEY(face_id, model_id)
+     );
+     CREATE TABLE IF NOT EXISTS face_analysis_state(
+         asset_id INTEGER PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
+         detector_model_id TEXT NOT NULL,
+         recognizer_model_id TEXT NOT NULL DEFAULT 'sface-2021dec',
+         decoder_model_id TEXT NOT NULL DEFAULT 'renderer-6',
+         source_size INTEGER NOT NULL,
+         source_modified_ns INTEGER NOT NULL,
+         source_fingerprint BLOB NOT NULL DEFAULT X'',
+         status TEXT NOT NULL CHECK(status IN ('pending','running','complete','error')),
+         attempts INTEGER NOT NULL DEFAULT 0,
+         worker_id TEXT,
+         lease_expires_at TEXT,
+         retry_after TEXT,
+         error TEXT,
+         failure_class TEXT CHECK(failure_class IS NULL OR failure_class IN
+             ('transient','deterministic','exhausted','manual')),
+         updated_at TEXT NOT NULL
+     );
+     CREATE INDEX IF NOT EXISTS face_analysis_eligibility
+         ON face_analysis_state(status, retry_after, lease_expires_at);
+     CREATE TABLE IF NOT EXISTS face_reconciliation_conflicts(
+         asset_id INTEGER PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
+         detector_model_id TEXT NOT NULL,
+         conflict_count INTEGER NOT NULL CHECK(conflict_count>0),
+         updated_at TEXT NOT NULL
+     );
+     CREATE TABLE IF NOT EXISTS person_prototypes(
+         person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+         model_id TEXT NOT NULL,
+         dimensions INTEGER NOT NULL,
+         vector BLOB NOT NULL,
+         exemplar_count INTEGER NOT NULL,
+         algorithm_version INTEGER NOT NULL DEFAULT 1,
+         generation INTEGER NOT NULL,
+         updated_at TEXT NOT NULL,
+         PRIMARY KEY(person_id, model_id)
+     );
+     CREATE TABLE IF NOT EXISTS recognition_suggestions(
+         face_id INTEGER NOT NULL REFERENCES faces(id) ON DELETE CASCADE,
+         person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+         recognizer_model_id TEXT NOT NULL,
+         prototype_generation INTEGER NOT NULL,
+         prototype_algorithm_version INTEGER NOT NULL,
+         ann_index_version INTEGER NOT NULL DEFAULT 1,
+         scored_index_generation INTEGER NOT NULL DEFAULT 0,
+         policy_version INTEGER NOT NULL,
+         score REAL NOT NULL,
+         nearest_exemplar_score REAL NOT NULL,
+         second_best_margin REAL NOT NULL,
+         created_at TEXT NOT NULL,
+         PRIMARY KEY(face_id, person_id, recognizer_model_id)
+     );
+     CREATE INDEX IF NOT EXISTS recognition_suggestions_person
+         ON recognition_suggestions(person_id, recognizer_model_id);
+     CREATE TABLE IF NOT EXISTS recognition_index_state(
+         model_id TEXT PRIMARY KEY,
+         generation INTEGER NOT NULL,
+         index_version INTEGER NOT NULL,
+         updated_at TEXT NOT NULL);
+     CREATE TABLE IF NOT EXISTS recognition_refresh_queue(
+         id INTEGER PRIMARY KEY,
+         entity_kind TEXT NOT NULL CHECK(entity_kind IN ('person','face')),
+         entity_id INTEGER NOT NULL,
+         model_id TEXT NOT NULL,
+         status TEXT NOT NULL CHECK(status IN ('pending','running','error')),
+         attempts INTEGER NOT NULL DEFAULT 0,
+         worker_id TEXT,
+         lease_expires_at TEXT,
+         retry_after TEXT,
+         error TEXT,
+         updated_at TEXT NOT NULL,
+         UNIQUE(entity_kind, entity_id, model_id)
+     );
+     CREATE INDEX IF NOT EXISTS recognition_refresh_eligibility
+         ON recognition_refresh_queue(status, retry_after, lease_expires_at);
+     CREATE TABLE IF NOT EXISTS recognition_rescore_state(
+         model_id TEXT PRIMARY KEY,
+         after_face_id INTEGER NOT NULL,
+         updated_at TEXT NOT NULL
+     );
+     CREATE TABLE IF NOT EXISTS recognition_policy_artifacts(
+         model_id TEXT PRIMARY KEY,
+         policy_version INTEGER NOT NULL,
+         prototype_algorithm_version INTEGER NOT NULL,
+         absolute_threshold REAL NOT NULL,
+         nearest_exemplar_threshold REAL NOT NULL,
+         second_best_margin REAL NOT NULL,
+         calibration_digest BLOB NOT NULL,
+         enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
+         installed_at TEXT NOT NULL
+     );
+     CREATE TABLE IF NOT EXISTS face_decision_journal(
+         id INTEGER PRIMARY KEY,
+         batch_id TEXT NOT NULL,
+         face_id INTEGER NOT NULL REFERENCES faces(id) ON DELETE CASCADE,
+         person_id INTEGER REFERENCES people(id) ON DELETE CASCADE,
+         previous_state TEXT,
+         next_state TEXT NOT NULL,
+         created_at TEXT NOT NULL
+     );
+     CREATE INDEX IF NOT EXISTS face_decision_journal_batch
+         ON face_decision_journal(batch_id, id);"
+}
+
+fn people_summary_schema() -> String {
+    let mut schema = "CREATE TABLE IF NOT EXISTS people_summary_epoch(
+       id INTEGER PRIMARY KEY CHECK(id=1), source_epoch INTEGER NOT NULL CHECK(source_epoch>=0),
+       published_epoch INTEGER NOT NULL CHECK(published_epoch>=0));
+     INSERT OR IGNORE INTO people_summary_epoch VALUES(1,1,0);
+     CREATE TABLE IF NOT EXISTS people_summary_bulk_state(
+       id INTEGER PRIMARY KEY CHECK(id=1), depth INTEGER NOT NULL DEFAULT 0,
+       dirty INTEGER NOT NULL DEFAULT 0 CHECK(dirty IN (0,1)));
+     INSERT OR IGNORE INTO people_summary_bulk_state(id) VALUES(1);
+     CREATE TABLE IF NOT EXISTS people_summary_rebuild_queue(
+       id INTEGER PRIMARY KEY CHECK(id=1), status TEXT NOT NULL CHECK(status IN ('pending','running','error')),
+       requested_epoch INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, worker_id TEXT,
+       claimed_epoch INTEGER, lease_expires_at TEXT, retry_after TEXT, error TEXT,
+       updated_at TEXT NOT NULL);
+     INSERT OR IGNORE INTO people_summary_rebuild_queue(id,status,requested_epoch,updated_at)
+       VALUES(1,'pending',1,datetime('now'));
+     CREATE TABLE IF NOT EXISTS asset_scope_ancestors(
+       build_epoch INTEGER NOT NULL, asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+       scope_key BLOB NOT NULL, PRIMARY KEY(build_epoch,asset_id,scope_key));
+     CREATE INDEX IF NOT EXISTS asset_scope_ancestors_scope
+       ON asset_scope_ancestors(build_epoch,scope_key,asset_id);
+     CREATE TABLE IF NOT EXISTS people_scope_summary(
+       build_epoch INTEGER NOT NULL, scope_key BLOB NOT NULL, person_id INTEGER NOT NULL,
+       display_name TEXT NOT NULL, sort_key TEXT NOT NULL, updated_at TEXT NOT NULL, confirmed_faces INTEGER NOT NULL,
+       suggested_faces INTEGER NOT NULL, PRIMARY KEY(build_epoch,scope_key,person_id));
+     CREATE INDEX IF NOT EXISTS people_scope_summary_name ON people_scope_summary
+       (build_epoch,scope_key,sort_key,person_id);
+     CREATE INDEX IF NOT EXISTS people_scope_summary_confirmed ON people_scope_summary
+       (build_epoch,scope_key,confirmed_faces DESC,sort_key,person_id);
+     CREATE INDEX IF NOT EXISTS people_scope_summary_review ON people_scope_summary
+       (build_epoch,scope_key,suggested_faces DESC,sort_key,person_id);
+     CREATE INDEX IF NOT EXISTS people_scope_summary_recent ON people_scope_summary
+       (build_epoch,scope_key,updated_at DESC,person_id);
+     CREATE TABLE IF NOT EXISTS people_scope_totals(
+       build_epoch INTEGER NOT NULL, scope_key BLOB NOT NULL, active_faces INTEGER NOT NULL,
+       confirmed_faces INTEGER NOT NULL, suggested_rows INTEGER NOT NULL,
+       analysis_pending INTEGER NOT NULL, analysis_errors INTEGER NOT NULL,
+       PRIMARY KEY(build_epoch,scope_key));
+     CREATE TABLE IF NOT EXISTS people_scope_representatives(
+       build_epoch INTEGER NOT NULL, scope_key BLOB NOT NULL, person_id INTEGER NOT NULL,
+       rank INTEGER NOT NULL, face_id INTEGER NOT NULL, asset_id INTEGER NOT NULL,
+       relative_path BLOB NOT NULL,
+       left REAL NOT NULL, top REAL NOT NULL, right REAL NOT NULL, bottom REAL NOT NULL,
+       PRIMARY KEY(build_epoch,scope_key,person_id,rank));
+     CREATE TABLE IF NOT EXISTS people_scope_faces(
+       build_epoch INTEGER NOT NULL, scope_key BLOB NOT NULL, queue_kind TEXT NOT NULL,
+       face_id INTEGER NOT NULL, person_id INTEGER NOT NULL, person_name TEXT,
+       assignment_kind TEXT NOT NULL, provenance TEXT NOT NULL, confidence REAL,
+       relative_path BLOB NOT NULL, left REAL NOT NULL, top REAL NOT NULL, right REAL NOT NULL,
+       bottom REAL NOT NULL, origin TEXT NOT NULL,
+       PRIMARY KEY(build_epoch,scope_key,queue_kind,face_id,person_id));
+     CREATE INDEX IF NOT EXISTS people_scope_faces_page ON people_scope_faces
+       (build_epoch,scope_key,queue_kind,face_id,person_id);".to_owned();
+    for table in [
+        "face_assignments",
+        "faces",
+        "people",
+        "assets",
+        "recognition_suggestions",
+        "recognition_index_state",
+        "face_analysis_state",
+        "face_embeddings",
+    ] {
+        for event in ["INSERT", "UPDATE", "DELETE"] {
+            schema.push_str(&format!(
+                "CREATE TRIGGER IF NOT EXISTS people_summary_dirty_{table}_{event} AFTER {event} ON {table} BEGIN
+                 SELECT CASE WHEN (SELECT source_epoch FROM people_summary_epoch WHERE id=1)>=9223372036854775806
+                   THEN RAISE(ABORT,'People summary epoch exhausted') END;
+                 UPDATE people_summary_bulk_state SET dirty=1 WHERE id=1;
+                 UPDATE people_summary_epoch SET source_epoch=source_epoch+1 WHERE id=1
+                   AND (SELECT depth FROM people_summary_bulk_state WHERE id=1)=0;
+                 INSERT INTO people_summary_rebuild_queue(id,status,requested_epoch,attempts,worker_id,
+                   lease_expires_at,retry_after,error,updated_at)
+                 SELECT 1,'pending',source_epoch,0,NULL,NULL,NULL,NULL,datetime('now') FROM people_summary_epoch WHERE id=1
+                   AND (SELECT depth FROM people_summary_bulk_state WHERE id=1)=0
+                 ON CONFLICT(id) DO UPDATE SET
+                   status=CASE WHEN people_summary_rebuild_queue.status='running'
+                                    AND people_summary_rebuild_queue.lease_expires_at>=datetime('now')
+                               THEN 'running' ELSE 'pending' END,
+                   requested_epoch=excluded.requested_epoch,
+                   worker_id=CASE WHEN people_summary_rebuild_queue.status='running'
+                                       AND people_summary_rebuild_queue.lease_expires_at>=datetime('now')
+                                  THEN people_summary_rebuild_queue.worker_id ELSE NULL END,
+                   claimed_epoch=CASE WHEN people_summary_rebuild_queue.status='running'
+                                           AND people_summary_rebuild_queue.lease_expires_at>=datetime('now')
+                                      THEN people_summary_rebuild_queue.claimed_epoch ELSE NULL END,
+                   lease_expires_at=CASE WHEN people_summary_rebuild_queue.status='running'
+                                              AND people_summary_rebuild_queue.lease_expires_at>=datetime('now')
+                                         THEN people_summary_rebuild_queue.lease_expires_at ELSE NULL END,
+                   retry_after=NULL,error=NULL,updated_at=excluded.updated_at; END;"
+            ));
+        }
+    }
+    schema
+}
+
+fn migrate_v4_to_v5(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(&people_summary_schema())?;
+    let updated = transaction.execute(
+        "UPDATE catalog_meta SET schema_version=5 WHERE id=1 AND schema_version=4",
+        [],
+    )?;
+    if updated != 1 {
+        bail!("Rekesz catalog metadata changed during v5 migration");
+    }
+    transaction.pragma_update(None, "user_version", 5)?;
+    ensure_foreign_keys_valid(&transaction)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v5_to_v6(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(asset_inventory_schema())?;
+    for (table, definition) in [
+        ("analysis_asset_inventory", "source_fingerprint BLOB"),
+        ("face_analysis_state", "source_fingerprint BLOB"),
+        ("face_analysis_state", "failure_class TEXT"),
+        ("face_embeddings", "source_fingerprint BLOB"),
+    ] {
+        let column = definition.split_whitespace().next().unwrap_or_default();
+        let present: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
+            params![table, column],
+            |row| row.get(0),
+        )?;
+        if !present {
+            transaction.execute(&format!("ALTER TABLE {table} ADD COLUMN {definition}"), [])?;
+        }
+    }
+    transaction.execute_batch(
+        "UPDATE face_analysis_state SET status='pending', attempts=0, worker_id=NULL,
+             lease_expires_at=NULL, retry_after=NULL, error=NULL, failure_class=NULL,
+             source_fingerprint=X'', updated_at=datetime('now');
+         DELETE FROM recognition_suggestions;
+         DELETE FROM person_prototypes;
+         DELETE FROM face_embeddings WHERE face_id IN
+             (SELECT id FROM faces WHERE provenance='rekesz');
+         UPDATE face_embeddings SET source_fingerprint=NULL;",
+    )?;
+    // v6 representative ranking consumes persisted five-point landmarks, so
+    // embedding changes must invalidate the durable People summary too.
+    transaction.execute_batch(&people_summary_schema())?;
+    let updated = transaction.execute(
+        "UPDATE catalog_meta SET schema_version=6 WHERE id=1 AND schema_version=5",
+        [],
+    )?;
+    if updated != 1 {
+        bail!("Rekesz catalog metadata changed during v6 migration");
+    }
+    transaction.pragma_update(None, "user_version", 6)?;
+    ensure_foreign_keys_valid(&transaction)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn validate_owned_catalog(connection: &Connection) -> Result<()> {
     let application_id: i64 =
         connection.query_row("PRAGMA application_id", [], |row| row.get(0))?;
     if application_id != SQLITE_APPLICATION_ID {
         bail!("database is not a Rekesz catalog");
     }
+    let rows: i64 =
+        connection.query_row("SELECT count(*) FROM catalog_meta", [], |row| row.get(0))?;
+    if rows != 1 {
+        bail!("Rekesz catalog metadata is inconsistent with its schema");
+    }
+    Ok(())
+}
+
+fn migrate_v1_to_v3(connection: &mut Connection) -> Result<()> {
+    let metadata_version: i64 = connection.query_row(
+        "SELECT schema_version FROM catalog_meta WHERE id=1",
+        [],
+        |row| row.get(0),
+    )?;
+    if metadata_version != 1 {
+        bail!(
+            "Rekesz catalog version markers disagree: PRAGMA is 1 but metadata is {metadata_version}"
+        );
+    }
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(people_schema())?;
+    transaction.execute_batch(&people_summary_schema())?;
+    transaction.execute("ALTER TABLE assets ADD COLUMN scope_key BLOB", [])?;
+    transaction.execute("CREATE INDEX assets_scope_key ON assets(scope_key)", [])?;
+    populate_path_keys(&transaction)?;
+    install_scope_key_guards(&transaction)?;
+    let updated = transaction.execute(
+        "UPDATE catalog_meta SET schema_version=?1 WHERE id=1 AND schema_version=1",
+        [3],
+    )?;
+    if updated != 1 {
+        bail!("Rekesz catalog metadata changed during migration");
+    }
+    transaction.pragma_update(None, "user_version", 3)?;
+    let migrated_version: i64 = transaction.query_row(
+        "SELECT schema_version FROM catalog_meta WHERE id=1",
+        [],
+        |row| row.get(0),
+    )?;
+    if migrated_version != 3 {
+        bail!("Rekesz catalog migration did not update its metadata");
+    }
+    ensure_foreign_keys_valid(&transaction)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v2_to_v3(connection: &mut Connection) -> Result<()> {
+    let metadata_version: i64 = connection.query_row(
+        "SELECT schema_version FROM catalog_meta WHERE id=1",
+        [],
+        |row| row.get(0),
+    )?;
+    if metadata_version != 2 {
+        bail!(
+            "Rekesz catalog version markers disagree: PRAGMA is 2 but metadata is {metadata_version}"
+        );
+    }
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(
+        "ALTER TABLE assets ADD COLUMN scope_key BLOB;
+         CREATE INDEX assets_scope_key ON assets(scope_key);
+         ALTER TABLE people ADD COLUMN representative_face_id INTEGER REFERENCES faces(id) ON DELETE SET NULL;
+         ALTER TABLE people ADD COLUMN representative_is_manual INTEGER NOT NULL DEFAULT 0 CHECK(representative_is_manual IN (0,1));
+         ALTER TABLE faces ADD COLUMN locally_ignored INTEGER NOT NULL DEFAULT 0 CHECK(locally_ignored IN (0,1));
+         ALTER TABLE faces ADD COLUMN retired INTEGER NOT NULL DEFAULT 0 CHECK(retired IN (0,1));
+         ALTER TABLE faces ADD COLUMN detector_model_id TEXT;
+         ALTER TABLE faces ADD COLUMN detection_confidence REAL;
+         ALTER TABLE face_embeddings ADD COLUMN source_size INTEGER;
+         ALTER TABLE face_embeddings ADD COLUMN source_modified_ns INTEGER;
+         ALTER TABLE face_analysis_state ADD COLUMN recognizer_model_id TEXT NOT NULL DEFAULT 'sface-2021dec';
+         ALTER TABLE face_analysis_state ADD COLUMN worker_id TEXT;
+         ALTER TABLE face_analysis_state ADD COLUMN lease_expires_at TEXT;
+         ALTER TABLE face_analysis_state ADD COLUMN retry_after TEXT;
+         CREATE INDEX face_analysis_eligibility
+             ON face_analysis_state(status, retry_after, lease_expires_at);
+         CREATE TABLE person_prototypes(
+             person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+             model_id TEXT NOT NULL,
+             dimensions INTEGER NOT NULL,
+             vector BLOB NOT NULL,
+             exemplar_count INTEGER NOT NULL,
+             algorithm_version INTEGER NOT NULL DEFAULT 1,
+             generation INTEGER NOT NULL,
+             updated_at TEXT NOT NULL,
+             PRIMARY KEY(person_id, model_id));
+         CREATE TABLE face_decision_journal(
+             id INTEGER PRIMARY KEY,
+             batch_id TEXT NOT NULL,
+             face_id INTEGER NOT NULL REFERENCES faces(id) ON DELETE CASCADE,
+             person_id INTEGER REFERENCES people(id) ON DELETE CASCADE,
+             previous_state TEXT,
+             next_state TEXT NOT NULL,
+             created_at TEXT NOT NULL);
+         CREATE INDEX face_decision_journal_batch ON face_decision_journal(batch_id, id);
+         DROP VIEW IF EXISTS effective_face_assignments;
+         DROP VIEW IF EXISTS effective_confirmations;",
+    )?;
+    transaction.execute_batch(people_schema())?;
+    populate_path_keys(&transaction)?;
+    install_scope_key_guards(&transaction)?;
+    let updated = transaction.execute(
+        "UPDATE catalog_meta SET schema_version=3 WHERE id=1 AND schema_version=2",
+        [],
+    )?;
+    if updated != 1 {
+        bail!("Rekesz catalog metadata changed during v3 migration");
+    }
+    transaction.pragma_update(None, "user_version", 3)?;
+    ensure_foreign_keys_valid(&transaction)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v3_to_v4(connection: &mut Connection) -> Result<()> {
+    let metadata_version: i64 = connection.query_row(
+        "SELECT schema_version FROM catalog_meta WHERE id=1",
+        [],
+        |row| row.get(0),
+    )?;
+    if metadata_version != 3 {
+        bail!(
+            "Rekesz catalog version markers disagree: PRAGMA is 3 but metadata is {metadata_version}"
+        );
+    }
+    let transaction = connection.transaction()?;
+    let has_ann_version: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('recognition_suggestions')
+                       WHERE name='ann_index_version')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_ann_version {
+        transaction.execute(
+            "ALTER TABLE recognition_suggestions
+             ADD COLUMN ann_index_version INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    let has_generation: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('recognition_suggestions')
+                       WHERE name='scored_index_generation')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_generation {
+        transaction.execute(
+            "ALTER TABLE recognition_suggestions
+             ADD COLUMN scored_index_generation INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS recognition_index_state(
+             model_id TEXT PRIMARY KEY,
+             generation INTEGER NOT NULL,
+             index_version INTEGER NOT NULL,
+             updated_at TEXT NOT NULL);",
+    )?;
+    transaction.execute_batch(
+        "DROP VIEW IF EXISTS effective_face_assignments;
+         DROP VIEW IF EXISTS effective_confirmations;",
+    )?;
+    transaction.execute_batch(people_schema())?;
+    let updated = transaction.execute(
+        "UPDATE catalog_meta SET schema_version=4 WHERE id=1 AND schema_version=3",
+        [],
+    )?;
+    if updated != 1 {
+        bail!("Rekesz catalog metadata changed during v4 migration");
+    }
+    transaction.pragma_update(None, "user_version", 4)?;
+    ensure_foreign_keys_valid(&transaction)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn populate_path_keys(transaction: &Transaction<'_>) -> Result<()> {
+    let paths = {
+        let mut query = transaction.prepare("SELECT id, relative_path FROM assets")?;
+        query
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (asset_id, encoded) in paths {
+        let relative = decode_relative_path(&encoded)?;
+        transaction.execute(
+            "UPDATE assets SET scope_key=?1 WHERE id=?2",
+            params![scope_key(&relative)?, asset_id],
+        )?;
+    }
+    Ok(())
+}
+
+fn install_scope_key_guards(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        "CREATE TRIGGER assets_scope_key_insert_guard
+         BEFORE INSERT ON assets WHEN NEW.scope_key IS NULL
+         BEGIN SELECT RAISE(ABORT, 'assets.scope_key is required'); END;
+         CREATE TRIGGER assets_scope_key_update_guard
+         BEFORE UPDATE OF scope_key ON assets WHEN NEW.scope_key IS NULL
+         BEGIN SELECT RAISE(ABORT, 'assets.scope_key is required'); END;",
+    )?;
+    Ok(())
+}
+
+fn ensure_foreign_keys_valid(transaction: &Transaction<'_>) -> Result<()> {
+    let mut statement = transaction.prepare("PRAGMA foreign_key_check")?;
+    if statement.query([])?.next()?.is_some() {
+        bail!("Rekesz catalog contains a foreign-key violation");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn initialize_test_catalog(root: &Path) -> Result<()> {
+    let directory = root.join(CATALOG_DIR);
+    fs::create_dir_all(&directory)?;
+    let mut connection = Connection::open(directory.join(CATALOG_FILE))?;
+    initialize_schema(&mut connection)
+}
+
+fn validate_schema(connection: &Connection) -> Result<()> {
+    validate_owned_catalog(connection)?;
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version != SCHEMA_VERSION {
         bail!("unsupported Rekesz catalog schema {version}; expected {SCHEMA_VERSION}");
@@ -694,7 +2047,8 @@ fn validate_schema(connection: &Connection) -> Result<()> {
 }
 
 fn open_lightroom_immutable(path: &Path) -> Result<Connection> {
-    let escaped = path
+    let database_path = lightroom_database_path(path)?;
+    let escaped = database_path
         .to_string_lossy()
         .replace('%', "%25")
         .replace('?', "%3F")
@@ -707,6 +2061,49 @@ fn open_lightroom_immutable(path: &Path) -> Result<Connection> {
     )?;
     connection.execute_batch("PRAGMA query_only=ON")?;
     Ok(connection)
+}
+
+fn lightroom_database_path(selected: &Path) -> Result<PathBuf> {
+    let candidate = if selected
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("lrcat-data"))
+    {
+        let name = selected
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix("-data"))
+            .context("selected Lightroom .lrcat-data file has an invalid name")?;
+        let sibling = selected.with_file_name(name);
+        if !sibling.is_file() {
+            bail!(
+                "selected {} is Lightroom auxiliary data; select its missing sibling {} instead",
+                selected.display(),
+                sibling.display()
+            );
+        }
+        sibling
+    } else {
+        selected.to_path_buf()
+    };
+    let mut file = fs::File::open(&candidate)
+        .with_context(|| format!("cannot open Lightroom catalog {}", candidate.display()))?;
+    let mut header = [0_u8; 16];
+    let read = file
+        .read(&mut header)
+        .with_context(|| format!("cannot read Lightroom catalog {}", candidate.display()))?;
+    if read >= 4 && header[..4] == *b"PK\x03\x04" {
+        bail!(
+            "{} is a compressed Lightroom backup; extract it and select the .lrcat file inside",
+            candidate.display()
+        );
+    }
+    if read != header.len() || header != *b"SQLite format 3\0" {
+        bail!(
+            "{} is not a Lightroom .lrcat SQLite database; select the main .lrcat file, not .lrcat-data, Previews.lrdata, or a backup archive",
+            candidate.display()
+        );
+    }
+    Ok(candidate)
 }
 
 fn resolve_relative_source(
@@ -740,7 +2137,7 @@ fn resolve_relative_source(
 }
 
 #[cfg(unix)]
-fn encode_relative_path(path: &Path) -> Result<Vec<u8>> {
+pub(crate) fn encode_relative_path(path: &Path) -> Result<Vec<u8>> {
     use std::os::unix::ffi::OsStrExt as _;
     if let Some(encoded) = encode_portable_path(path)? {
         return Ok(encoded);
@@ -751,7 +2148,7 @@ fn encode_relative_path(path: &Path) -> Result<Vec<u8>> {
 }
 
 #[cfg(unix)]
-fn decode_relative_path(encoded: &[u8]) -> Result<PathBuf> {
+pub(crate) fn decode_relative_path(encoded: &[u8]) -> Result<PathBuf> {
     use std::os::unix::ffi::OsStrExt as _;
     if encoded.first() == Some(&b'p') {
         return decode_portable_path(encoded);
@@ -763,7 +2160,7 @@ fn decode_relative_path(encoded: &[u8]) -> Result<PathBuf> {
 }
 
 #[cfg(windows)]
-fn encode_relative_path(path: &Path) -> Result<Vec<u8>> {
+pub(crate) fn encode_relative_path(path: &Path) -> Result<Vec<u8>> {
     use std::os::windows::ffi::OsStrExt as _;
     if let Some(encoded) = encode_portable_path(path)? {
         return Ok(encoded);
@@ -776,7 +2173,7 @@ fn encode_relative_path(path: &Path) -> Result<Vec<u8>> {
 }
 
 #[cfg(windows)]
-fn decode_relative_path(encoded: &[u8]) -> Result<PathBuf> {
+pub(crate) fn decode_relative_path(encoded: &[u8]) -> Result<PathBuf> {
     use std::os::windows::ffi::OsStringExt as _;
     if encoded.first() == Some(&b'p') {
         return decode_portable_path(encoded);

@@ -21,6 +21,7 @@ fn stores_and_loads_an_image_with_its_render_metadata() {
             output_dimensions: (2, 1),
             variant: request.variant,
             orientation_applied: None,
+            face_transform: None,
             develop: None,
         },
     };
@@ -111,6 +112,7 @@ fn phase_d_recipe_and_action_metadata_round_trip() {
             output_dimensions: (2, 1),
             variant: request.variant,
             orientation_applied: None,
+            face_transform: None,
             develop: Some(crate::rendering::DevelopRenderMetadata {
                 identity,
                 recipe,
@@ -225,6 +227,7 @@ fn cleanup_removes_the_least_recently_accessed_entry() {
             output_dimensions: (8, 8),
             variant: crate::rendering::RenderVariant::Thumbnail { width: 300 },
             orientation_applied: None,
+            face_transform: None,
             develop: None,
         },
     };

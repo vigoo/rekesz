@@ -25,6 +25,12 @@ use crate::{
     rendering::{RenderIdentity, RenderVariant},
 };
 
+mod maintenance;
+pub use maintenance::{
+    MaintenanceAdmission, MaintenanceJobStatus, MaintenanceScheduler, MaintenanceStats,
+    MaintenanceYield,
+};
+
 #[derive(Clone, Debug)]
 pub struct JobKey {
     pub path: PathBuf,
@@ -158,6 +164,7 @@ type Executor =
 pub struct RenderScheduler {
     shared: Arc<Shared>,
     workers: Vec<JoinHandle<()>>,
+    maintenance_admission: MaintenanceAdmission,
 }
 
 struct Shared {
@@ -165,6 +172,7 @@ struct Shared {
     wake: Condvar,
     executor: Arc<Executor>,
     aging_interval: Duration,
+    maintenance_admission: MaintenanceAdmission,
 }
 
 struct State {
@@ -220,6 +228,7 @@ impl RenderScheduler {
         executor: Arc<Executor>,
     ) -> Self {
         assert!(parallelism > 0, "render parallelism must be positive");
+        let maintenance_admission = MaintenanceAdmission::new();
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 queue: PriorityQueue::new(),
@@ -236,6 +245,7 @@ impl RenderScheduler {
             wake: Condvar::new(),
             executor,
             aging_interval,
+            maintenance_admission: maintenance_admission.clone(),
         });
         let workers = (0..parallelism)
             .map(|index| {
@@ -251,7 +261,11 @@ impl RenderScheduler {
                     .expect("failed to start render worker")
             })
             .collect();
-        Self { shared, workers }
+        Self {
+            shared,
+            workers,
+            maintenance_admission,
+        }
     }
 
     /// Atomically replaces all demand belonging to `scope` and returns
@@ -332,6 +346,7 @@ impl RenderScheduler {
             preempt_one_lower_priority(&mut state, priority);
         }
         drop(state);
+        self.refresh_maintenance_admission();
         for sender in cancelled_senders {
             let _ = sender.send(JobCompletion::Cancelled);
         }
@@ -341,6 +356,25 @@ impl RenderScheduler {
 
     pub fn clear_scope(&self, scope: DemandScopeId) {
         self.replace_scope(scope, Vec::new());
+    }
+
+    pub fn maintenance_admission(&self) -> MaintenanceAdmission {
+        self.maintenance_admission.clone()
+    }
+
+    fn refresh_maintenance_admission(&self) {
+        let blocked = {
+            let state = self.shared.state.lock().unwrap();
+            state
+                .jobs
+                .values()
+                .chain(state.pending.values())
+                .any(|job| {
+                    effective_priority(job)
+                        .is_some_and(|priority| priority.class >= PriorityClass::Visible)
+                })
+        };
+        self.maintenance_admission.set_foreground_blocked(blocked);
     }
 
     pub fn stats(&self) -> SchedulerStats {
@@ -734,6 +768,17 @@ fn worker_loop(shared: Arc<Shared>, foreground_only: bool) {
                 state.jobs.insert(key.clone(), successor);
                 refresh_queue_priority(&mut state, &key);
             }
+            let foreground_blocked = state
+                .jobs
+                .values()
+                .chain(state.pending.values())
+                .any(|job| {
+                    effective_priority(job)
+                        .is_some_and(|priority| priority.class >= PriorityClass::Visible)
+                });
+            shared
+                .maintenance_admission
+                .set_foreground_blocked(foreground_blocked);
             (job.subscribers, if cancelled { None } else { Some(result) })
         };
         for subscriber in subscribers {

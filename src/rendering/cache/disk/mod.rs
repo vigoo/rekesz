@@ -139,6 +139,30 @@ impl DiskRenderCache {
         Ok(usage)
     }
 
+    pub(crate) fn clear(&self) -> Result<(), String> {
+        let _guard = self
+            .lock
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entries = match fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.to_string()),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| error.to_string())?;
+            if entry
+                .file_type()
+                .map_err(|error| error.to_string())?
+                .is_file()
+            {
+                fs::remove_file(entry.path()).map_err(|error| error.to_string())?;
+            }
+        }
+        self.stores_since_cleanup.store(0, Ordering::Release);
+        Ok(())
+    }
+
     pub(in crate::rendering) fn store(
         &self,
         request: &RenderRequest,
@@ -264,14 +288,20 @@ impl DiskRenderCache {
 fn cache_extension(variant: RenderVariant) -> &'static str {
     match variant {
         RenderVariant::Preview { .. } => "qoi",
-        RenderVariant::Thumbnail { .. } | RenderVariant::Full => "png",
+        RenderVariant::Thumbnail { .. }
+        | RenderVariant::FaceCrop { .. }
+        | RenderVariant::FaceContext { .. }
+        | RenderVariant::Full => "png",
     }
 }
 
 fn cache_format(variant: RenderVariant) -> ImageFormat {
     match variant {
         RenderVariant::Preview { .. } => ImageFormat::Qoi,
-        RenderVariant::Thumbnail { .. } | RenderVariant::Full => ImageFormat::Png,
+        RenderVariant::Thumbnail { .. }
+        | RenderVariant::FaceCrop { .. }
+        | RenderVariant::FaceContext { .. }
+        | RenderVariant::Full => ImageFormat::Png,
     }
 }
 
