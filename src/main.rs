@@ -271,6 +271,15 @@ fn owns_inventory_progress(current_generation: u64, completed_generation: u64) -
     current_generation == completed_generation
 }
 
+fn claim_inventory_run(active: &mut bool) -> bool {
+    if *active {
+        false
+    } else {
+        *active = true;
+        true
+    }
+}
+
 struct ProductionMaintenanceDriver;
 
 impl MaintenanceDriver for ProductionMaintenanceDriver {
@@ -898,6 +907,7 @@ struct PictureBrowser {
     face_inventory_progress: Arc<FaceInventoryProgress>,
     face_inventory_cancelled: Arc<AtomicBool>,
     face_inventory_generation: u64,
+    face_inventory_active: bool,
     face_analysis_paused: bool,
     face_crop_disk_cache_enabled: Arc<AtomicBool>,
     face_analysis_refill_scheduled: bool,
@@ -1664,6 +1674,7 @@ impl PictureBrowser {
             face_inventory_progress: Arc::new(FaceInventoryProgress::default()),
             face_inventory_cancelled: Arc::new(AtomicBool::new(false)),
             face_inventory_generation: 0,
+            face_inventory_active: false,
             face_analysis_paused: !settings.automatic_face_analysis || face_workers == 0,
             face_crop_disk_cache_enabled,
             face_analysis_refill_scheduled: false,
@@ -3261,6 +3272,9 @@ impl PictureBrowser {
     }
 
     fn refresh_face_inventory(&mut self, cx: &mut Context<Self>) {
+        if !claim_inventory_run(&mut self.face_inventory_active) {
+            return;
+        }
         let root = self.settings.root.clone();
         let hidden = self.hidden_subtrees.clone();
         let pair_preference = self.pair_preference;
@@ -3310,6 +3324,7 @@ impl PictureBrowser {
                     cx.notify();
                     return;
                 }
+                this.face_inventory_active = false;
                 progress.stage.store(0, Ordering::Release);
                 match result {
                     Ok(jobs) if !this.face_analysis_paused => {

@@ -8,6 +8,16 @@ fn stale_inventory_completion_cannot_own_replacement_progress() {
     assert!(!owns_inventory_progress(8, 7));
 }
 
+#[test]
+fn repeated_inventory_refresh_coalesces_into_active_run() {
+    let mut active = false;
+    assert!(claim_inventory_run(&mut active));
+    assert!(!claim_inventory_run(&mut active));
+    assert!(!claim_inventory_run(&mut active));
+    active = false;
+    assert!(claim_inventory_run(&mut active));
+}
+
 impl MaintenanceDriver for FailingPeopleRetryInventory {
     fn inventory(
         &self,
