@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::OnceLock};
 
-use geojson::{FeatureCollection, GeoJson, Value};
+use geojson::{FeatureCollection, GeoJson, GeometryValue};
 use rayon::prelude::*;
 use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Stroke, Transform};
 
@@ -180,11 +180,11 @@ fn style_color(value: &str) -> Result<[u8; 4], String> {
     ])
 }
 
-fn add_line(path: &mut PathBuilder, line: &[Vec<f64>], projection: &Projection) {
+fn add_line(path: &mut PathBuilder, line: &[geojson::Position], projection: &Projection) {
     let mut started = false;
     let mut previous_x = 0.0_f32;
     for coordinate in line {
-        let Some((mut x, y)) = projection.point(coordinate) else {
+        let Some((mut x, y)) = projection.point(coordinate.as_slice()) else {
             continue;
         };
         if started {
@@ -393,8 +393,8 @@ fn draw_polygons(
             continue;
         };
         let polygons = match &geometry.value {
-            Value::Polygon(value) => std::slice::from_ref(value),
-            Value::MultiPolygon(value) => value.as_slice(),
+            GeometryValue::Polygon { coordinates } => std::slice::from_ref(coordinates),
+            GeometryValue::MultiPolygon { coordinates } => coordinates.as_slice(),
             _ => continue,
         };
         let mut builder = PathBuilder::new();
@@ -434,8 +434,10 @@ fn draw_lines(
         };
         let mut builder = PathBuilder::new();
         match &geometry.value {
-            Value::LineString(line) => add_line(&mut builder, line, projection),
-            Value::MultiLineString(lines) => {
+            GeometryValue::LineString { coordinates } => {
+                add_line(&mut builder, coordinates, projection)
+            }
+            GeometryValue::MultiLineString { coordinates: lines } => {
                 for line in lines {
                     add_line(&mut builder, line, projection)
                 }
@@ -464,11 +466,13 @@ fn draw_places(
         {
             continue;
         }
-        let Some(Value::Point(coordinate)) = feature.geometry.as_ref().map(|value| &value.value)
+        let Some(GeometryValue::Point {
+            coordinates: coordinate,
+        }) = feature.geometry.as_ref().map(|value| &value.value)
         else {
             continue;
         };
-        if let Some((x, y)) = projection.point(coordinate) {
+        if let Some((x, y)) = projection.point(coordinate.as_slice()) {
             let circle = PathBuilder::from_circle(x, y, style.radius)
                 .ok_or_else(|| "invalid place radius in bundled style".to_owned())?;
             pixmap.fill_path(

@@ -14,35 +14,41 @@ blake3 = "1"
 kamadak-exif = "0.6.1"
 gpui = "0.2.2"
 hnsw_rs = "0.3.4"
+hex = "0.4"
 futures = "0.3"
 fast-mvt = { version = "0.6.2", default-features = false, features = ["reader"] }
-geojson = "0.24"
-tiny-skia = "0.11"
+geojson = "1.0"
+# Supercluster 3 exposes GeoJSON 0.24 types in its public API.
+geojson_legacy = { package = "geojson", version = "=0.24.2" }
+tiny-skia = "0.12"
 libheif-rs = { version = "3", features = ["embedded-libheif"] }
 libheif-sys = "5.3.1"
 image = { version = "0.25", features = ["avif", "bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp"] }
-libc = "0.2"
+# xattr 0.2.3, pulled in by gpui's zed-async-tar, uses libc::ENOATTR on Linux.
+# libc 0.2.190 removed that alias, so keep the last compatible release for now.
+libc = "=0.2.189"
 jpeg-decoder = "0.3.2"
-moxcms = "0.8.1"
+moxcms = "0.9.1"
 ort = { version = "2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "download-binaries", "copy-dylibs", "tls-rustls"] }
 rawler = { git = "https://github.com/vigoo/dnglab.git", rev = "e7a2ad7fb627a99a1e846d02bca8993371fd90fa" }
 priority-queue = "2"
 rayon = "1"
-reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "rustls", "json", "gzip"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "rustls", "json", "gzip"] }
 rusqlite = { version = "0.40.2", features = ["bundled", "hooks", "functions"] }
 smallvec = "1"
 supercluster = { version = "3.0.8", features = ["cluster_metadata"] }
-sysinfo = { version = "0.31.4", default-features = false, features = ["system"] }
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 tempfile = "3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-accesskit_unix = "0.23"
+accesskit_unix = "0.24"
 
 [build-dependencies]
-sha2 = "0.10"
+hex = "0.4"
+sha2 = "0.11"
 
 [[bin]]
 name = "rekesz"
@@ -74,4 +80,4 @@ test = false
 
 [dev-dependencies]
 gpui = { version = "0.2.2", features = ["test-support"] }
-test-r = { version = "3.0.10", default-features = false }
+test-r = { version = "3.0.12", default-features = false }

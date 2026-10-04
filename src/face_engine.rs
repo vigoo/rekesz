@@ -1149,7 +1149,7 @@ pub fn validate_packaged_face_assets() -> Result<()> {
         ("YuNet", YUNET, YUNET_SHA256),
         ("SFace", SFACE, SFACE_SHA256),
     ] {
-        let actual = format!("{:x}", Sha256::digest(bytes));
+        let actual = hex::encode(Sha256::digest(bytes));
         if actual != expected {
             bail!(
                 "packaged {name} face model failed SHA-256 validation (expected {expected}, got {actual}); reinstall Rekesz"
@@ -1160,7 +1160,7 @@ pub fn validate_packaged_face_assets() -> Result<()> {
         ("YuNet license", YUNET_LICENSE, YUNET_LICENSE_SHA256),
         ("SFace license", SFACE_LICENSE, SFACE_LICENSE_SHA256),
     ] {
-        let actual = format!("{:x}", Sha256::digest(bytes));
+        let actual = hex::encode(Sha256::digest(bytes));
         if actual != expected {
             bail!(
                 "packaged {name} failed SHA-256 validation (expected {expected}, got {actual}); reinstall Rekesz"

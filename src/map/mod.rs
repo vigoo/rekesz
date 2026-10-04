@@ -301,7 +301,8 @@ impl PhotoClusters {
             features
                 .into_iter()
                 .filter_map(|feature| {
-                    let geojson::Value::Point(point) = &feature.geometry.as_ref()?.value else {
+                    let geojson_legacy::Value::Point(point) = &feature.geometry.as_ref()?.value
+                    else {
                         return None;
                     };
                     let coordinate = GeoCoordinate::new(*point.get(1)?, *point.first()?)?;
@@ -313,8 +314,8 @@ impl PhotoClusters {
                         Vec::new()
                     } else {
                         match feature.id.clone()? {
-                            geojson::feature::Id::String(id) => vec![id.parse().ok()?],
-                            geojson::feature::Id::Number(id) => vec![id.as_u64()? as usize],
+                            geojson_legacy::feature::Id::String(id) => vec![id.parse().ok()?],
+                            geojson_legacy::feature::Id::Number(id) => vec![id.as_u64()? as usize],
                         }
                     };
                     let count = feature
@@ -379,8 +380,8 @@ impl PhotoClusters {
             .get_leaves(cluster_id, limit, offset)
             .into_iter()
             .filter_map(|leaf| match leaf.id? {
-                geojson::feature::Id::String(id) => id.parse().ok(),
-                geojson::feature::Id::Number(id) => id.as_u64().map(|id| id as usize),
+                geojson_legacy::feature::Id::String(id) => id.parse().ok(),
+                geojson_legacy::feature::Id::Number(id) => id.as_u64().map(|id| id as usize),
             })
             .collect()
     }

@@ -28,7 +28,7 @@ pub const PROTOTYPE_ALGORITHM_VERSION: i64 = 1;
 pub const ANN_INDEX_VERSION: i64 = 1;
 pub const PRODUCTION_SFACE_MODEL_ID: &str = "sface-2021dec";
 pub const PRODUCTION_SFACE_POLICY_DIGEST: &str =
-    "3e25dc9fae42b31dffa542b9471b4be314f10ad412c66d445f337e75584682de";
+    "7feab1985699a5aa957c16e7326ac80b8ad5436c2e3a303fd0570583a9239a09";
 const PRODUCTION_SFACE_MODEL_DIGEST: &str =
     "0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79";
 const PRODUCTION_SFACE_POLICY: &[u8] =
@@ -171,7 +171,7 @@ fn decode_hex_digest(value: &str) -> Result<[u8; 32]> {
 }
 
 fn bundled_production_policy() -> Result<(RecognitionPolicy, [u8; 32])> {
-    let actual = format!("{:x}", Sha256::digest(PRODUCTION_SFACE_POLICY));
+    let actual = hex::encode(Sha256::digest(PRODUCTION_SFACE_POLICY));
     if actual != PRODUCTION_SFACE_POLICY_DIGEST {
         bail!("bundled SFace calibration policy failed integrity validation");
     }
@@ -210,15 +210,15 @@ fn validate_calibration_report(report: &CalibrationReport, license: &PolicyLicen
         || data.extractor_source_sha256
             != "3989cc579043bd226f5b1cf5fbd562bb2138966528d79719102d6f34581553f7"
         || data.production_inference_source_sha256
-            != "e706122c5f0b5ab0f1ecafd35ec312377a244100ca9d99ab873fb2c3cc10a58f"
+            != "1bb397eb237675762174628cf1a733ebeabc00e2552a7977789bf1ff562c0b52"
         || data.production_policy_source_sha256
             != "3d2e0693777abdf37fe0085feb7badf66a7fb3859c448e23676eb36ceb4a8bda"
         || data.corpus_provenance_sha256
             != "119d83ca04a64beab77799daa79396474a34d5a2a2dbb19a188e1e818b1926da"
         || data.dependency_lock_sha256
-            != "ed8bc45092173bc6cdf5787246eda531f7b3f5def5592d0836c6117687d86d8c"
+            != "e26014349565ecb14206828c17f4f7c95eaba8cb8599a41731e09b4b87ff6dae"
         || data.generator_spec_sha256
-            != "55c247be64c019ce6f797b55d488c7628921e799e5b816ceeaddc87448a9b54e"
+            != "df7dbebefc2128fb1bed2363a15394857f3d5d96ef5bb08b8905c12249414fee"
         || data.identity_count != 20
         || data.calibration_queries != 28
         || data.query_count != 16
@@ -277,7 +277,7 @@ fn validate_calibration_report(report: &CalibrationReport, license: &PolicyLicen
             "dependency lock",
         ),
     ] {
-        if format!("{:x}", Sha256::digest(bytes)) != reported {
+        if hex::encode(Sha256::digest(bytes)) != reported {
             bail!("bundled SFace calibration {name} binding is stale");
         }
     }

@@ -30,7 +30,7 @@ fn main() {
         let bytes = fs::read(Path::new(path)).unwrap_or_else(|error| {
             panic!("required packaged face asset {path} is missing: {error}")
         });
-        let actual = format!("{:x}", Sha256::digest(&bytes));
+        let actual = hex::encode(Sha256::digest(&bytes));
         assert_eq!(
             actual, expected,
             "packaged face asset {path} failed pinned SHA-256 validation"
