@@ -214,7 +214,16 @@ impl Drop for CacheWriter {
     }
 }
 
+/// How long a background (non-interactive) waiter waits before it is
+/// admitted on freed capacity even with interactive waiters present.
+/// Interactive demand still wins every fresh admission and keeps its
+/// reserve; the grace only guarantees that long-running background work —
+/// face analysis, preflight decodes — cannot starve indefinitely under
+/// sustained interactive traffic.
+const BACKGROUND_PERMIT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 struct PermitPool {
+    name: &'static str,
     state: Mutex<PermitState>,
     wake: Condvar,
     capacity: usize,
@@ -232,8 +241,9 @@ struct Permit<'a> {
 }
 
 impl PermitPool {
-    fn new(capacity: usize, interactive_reserve: usize) -> Self {
+    fn new(name: &'static str, capacity: usize, interactive_reserve: usize) -> Self {
         Self {
+            name,
             state: Mutex::new(PermitState {
                 available: capacity,
                 waiting_interactive: 0,
@@ -255,18 +265,31 @@ impl PermitPool {
         if interactive {
             state.waiting_interactive += 1;
         }
+        let enqueued = std::time::Instant::now();
         loop {
+            let grace_elapsed = !interactive && enqueued.elapsed() >= BACKGROUND_PERMIT_GRACE;
             let admissible = if interactive {
                 state.available >= units
             } else {
-                state.waiting_interactive == 0
-                    && state.available >= units.saturating_add(self.interactive_reserve)
+                (state.waiting_interactive == 0
+                    && state.available >= units.saturating_add(self.interactive_reserve))
+                    || (grace_elapsed && state.available >= units)
             };
             if admissible {
                 if interactive {
                     state.waiting_interactive -= 1;
                 }
                 state.available -= units;
+                let waited = enqueued.elapsed();
+                if !interactive && waited >= std::time::Duration::from_secs(5) {
+                    crate::trace::slow_event(&format!(
+                        "permit pool {}: background admitted after {} (available {} · interactive waiters {})",
+                        self.name,
+                        crate::trace::secs(waited),
+                        state.available,
+                        state.waiting_interactive,
+                    ));
+                }
                 return Some(Permit { pool: self, units });
             }
             if cancelled.load(Ordering::Acquire) {
@@ -276,11 +299,28 @@ impl PermitPool {
                 }
                 return None;
             }
-            state = self
-                .wake
-                .wait_timeout(state, std::time::Duration::from_millis(20))
-                .unwrap()
-                .0;
+            // An aged background waiter must not lose freed capacity to
+            // fresher demand racing it on the condvar: once the grace is
+            // spent, poll fast enough to claim the next free unit.
+            let poll = if !interactive && grace_elapsed {
+                std::time::Duration::from_millis(1)
+            } else {
+                std::time::Duration::from_millis(20)
+            };
+            state = self.wake.wait_timeout(state, poll).unwrap().0;
+            let waited = enqueued.elapsed();
+            if !interactive
+                && waited >= std::time::Duration::from_secs(10)
+                && waited - std::time::Duration::from_secs(waited.as_secs() / 10 * 10) < poll
+            {
+                crate::trace::slow_event(&format!(
+                    "permit pool {}: background STILL waiting after {} (available {} · interactive waiters {})",
+                    self.name,
+                    crate::trace::secs(waited),
+                    state.available,
+                    state.waiting_interactive,
+                ));
+            }
         }
     }
 }
@@ -344,14 +384,17 @@ impl RenderPipeline {
             backend,
             decoded_sources: Arc::new(DecodedSourceCache::new(source_cache_capacity)),
             cache_reads: Arc::new(PermitPool::new(
+                "cache-reads",
                 parallelism.clamp(1, 4) + usize::from(parallelism > 1),
                 usize::from(parallelism > 1),
             )),
             cpu: Arc::new(PermitPool::new(
+                "cpu",
                 parallelism.max(1),
                 usize::from(parallelism > 1),
             )),
             raw_cpu: Arc::new(PermitPool::new(
+                "raw-cpu",
                 raw_parallelism,
                 usize::from(raw_parallelism > 1),
             )),

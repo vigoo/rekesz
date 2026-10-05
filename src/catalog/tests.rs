@@ -5890,6 +5890,7 @@ fn setup_failure_resets_exhausted_budget_for_each_changed_engine_or_source_ident
             crate::face_engine::FaceAnalyzeJob {
                 root: root.path().to_path_buf(),
                 asset_id: 1,
+                label: None,
             },
             0
         ));
@@ -5978,6 +5979,7 @@ fn repeated_service_setup_failures_exhaust_unchanged_identity_after_five_attempt
             crate::face_engine::FaceAnalyzeJob {
                 root: root.path().to_path_buf(),
                 asset_id: 1,
+                label: None,
             },
             0,
         ));
@@ -6075,6 +6077,7 @@ fn losing_service_setup_failure_cannot_clobber_an_active_analysis_claim() {
     let job = crate::face_engine::FaceAnalyzeJob {
         root: root.path().to_path_buf(),
         asset_id: 1,
+        label: None,
     };
     assert!(service_a.enqueue(job.clone(), 0));
     assert!(

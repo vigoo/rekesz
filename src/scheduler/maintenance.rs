@@ -11,6 +11,18 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Point-in-time view of the exclusive maintenance permit, for diagnostic
+/// surfaces: whether foreground work is gating maintenance, whether the
+/// permit is held (and at what rank), and how much is waiting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdmissionSnapshot {
+    pub foreground_blocked: bool,
+    pub foreground_activities: usize,
+    pub active_rank: Option<i32>,
+    pub waiters: usize,
+    pub advertised: usize,
+}
+
 #[derive(Clone)]
 pub struct MaintenanceAdmission {
     shared: Arc<AdmissionShared>,
@@ -65,8 +77,14 @@ impl MaintenanceAdmission {
     }
 
     pub fn begin_foreground_activity(&self) -> ForegroundActivity {
-        self.shared.state.lock().unwrap().foreground_activities += 1;
+        let mut state = self.shared.state.lock().unwrap();
+        state.foreground_activities += 1;
+        let activities = state.foreground_activities;
+        drop(state);
         self.shared.wake.notify_all();
+        crate::trace::slow_event(&format!(
+            "foreground activity started · background maintenance gated ({activities} active)"
+        ));
         ForegroundActivity {
             admission: self.clone(),
         }
@@ -89,6 +107,18 @@ impl MaintenanceAdmission {
 
     pub(crate) fn is_foreground_blocked(&self) -> bool {
         Self::foreground_blocked(&self.shared.state.lock().unwrap())
+    }
+
+    /// Point-in-time admission state for diagnostics surfaces.
+    pub fn snapshot(&self) -> AdmissionSnapshot {
+        let state = self.shared.state.lock().unwrap();
+        AdmissionSnapshot {
+            foreground_blocked: Self::foreground_blocked(&state),
+            foreground_activities: state.foreground_activities,
+            active_rank: state.active.map(|(_, _, rank)| rank),
+            waiters: state.waiters.len(),
+            advertised: state.advertised.len(),
+        }
     }
 
     fn acquire(
@@ -128,6 +158,18 @@ impl MaintenanceAdmission {
                 state.waiters.remove(&ticket);
                 let owner = thread::current().id();
                 state.active = Some((owner, scheduler_id, rank));
+                let waited = queued_at.elapsed();
+                if waited >= Duration::from_secs(5) {
+                    crate::trace::slow_event(&format!(
+                        "admission: rank {rank} acquired after {} (waiters {} · advertised {} · foreground activities {})",
+                        crate::trace::secs(waited),
+                        state.waiters.len(),
+                        state.advertised.len(),
+                        state.foreground_activities,
+                    ));
+                } else {
+                    crate::trace::event(&format!("admission: rank {rank} acquired"));
+                }
                 return Some(MaintenancePermit {
                     admission: self.clone(),
                     owner,
@@ -140,6 +182,19 @@ impl MaintenanceAdmission {
                 .wait_timeout(state, Duration::from_millis(20))
                 .unwrap();
             state = next;
+            let waited = queued_at.elapsed();
+            if waited >= Duration::from_secs(10)
+                && waited - Duration::from_secs(waited.as_secs() / 10 * 10)
+                    < Duration::from_millis(20)
+            {
+                crate::trace::slow_event(&format!(
+                    "admission: rank {rank} STILL waiting after {} (waiters {} · advertised {} · foreground activities {})",
+                    crate::trace::secs(waited),
+                    state.waiters.len(),
+                    state.advertised.len(),
+                    state.foreground_activities,
+                ));
+            }
         }
     }
 
@@ -184,7 +239,16 @@ impl MaintenanceAdmission {
         let Some((_, scheduler_id, rank)) = state.active.filter(|(active, _, _)| *active == owner)
         else {
             drop(state);
-            return self.wait(cancelled);
+            let wait_started = Instant::now();
+            let resumed = self.wait(cancelled);
+            let waited = wait_started.elapsed();
+            if resumed && waited >= Duration::from_secs(5) {
+                crate::trace::slow_event(&format!(
+                    "admission: checkpoint blocked by foreground gating for {}",
+                    crate::trace::secs(waited),
+                ));
+            }
+            return resumed;
         };
         let higher_waiting = state
             .waiters
@@ -200,6 +264,8 @@ impl MaintenanceAdmission {
         // A cooperative stage boundary temporarily returns the global resource
         // permit. Foreground work always wins; otherwise the highest-ranked
         // maintenance waiter runs before this job resumes.
+        let yield_started = Instant::now();
+        crate::trace::event(&format!("admission: rank {rank} yielding at a checkpoint"));
         state.active = None;
         let ticket = state.next_ticket;
         state.next_ticket = state.next_ticket.wrapping_add(1);
@@ -237,6 +303,15 @@ impl MaintenanceAdmission {
             {
                 state.waiters.remove(&ticket);
                 state.active = Some((owner, scheduler_id, rank));
+                let waited = yield_started.elapsed();
+                if waited >= Duration::from_secs(5) {
+                    crate::trace::slow_event(&format!(
+                        "admission: yielded rank {rank} resumed after {} (waiters {} · advertised {})",
+                        crate::trace::secs(waited),
+                        state.waiters.len(),
+                        state.advertised.len(),
+                    ));
+                }
                 return true;
             }
             let (next, _) = self
@@ -270,8 +345,12 @@ impl Drop for ForegroundActivity {
     fn drop(&mut self) {
         let mut state = self.admission.shared.state.lock().unwrap();
         state.foreground_activities = state.foreground_activities.saturating_sub(1);
+        let activities = state.foreground_activities;
         drop(state);
         self.admission.shared.wake.notify_all();
+        crate::trace::slow_event(&format!(
+            "foreground activity finished · background maintenance resumes ({activities} active)"
+        ));
     }
 }
 
@@ -399,16 +478,30 @@ struct Job {
 const MAINTENANCE_AGING_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg(test)]
 const MAINTENANCE_AGING_INTERVAL: Duration = Duration::from_millis(10);
+// Aging must stay bounded: queued work ages from its original enqueue time,
+// so an unbounded backlog's advertisement (rank 200 + hours) would
+// eventually outrank — and permanently wedge — the higher-ranked inventory
+// pass (rank 1000). The cap keeps every analysis rank below the inventory
+// while still reordering work within the analysis backlog.
+#[cfg(not(test))]
+const MAINTENANCE_AGING_CAP: Duration = Duration::from_secs(500);
+#[cfg(test)]
+const MAINTENANCE_AGING_CAP: Duration = Duration::from_millis(500);
+
+fn aged_rank(rank: i32, queued_at: Instant) -> i32 {
+    let age = queued_at.elapsed().min(MAINTENANCE_AGING_CAP);
+    rank.saturating_add(
+        (age.as_millis() / MAINTENANCE_AGING_INTERVAL.as_millis().max(1)).min(i32::MAX as u128)
+            as i32,
+    )
+}
 
 fn admission_effective_rank(waiter: &AdmissionWaiter) -> i32 {
-    let age =
-        waiter.queued_at.elapsed().as_millis() / MAINTENANCE_AGING_INTERVAL.as_millis().max(1);
-    waiter.rank.saturating_add(age.min(i32::MAX as u128) as i32)
+    aged_rank(waiter.rank, waiter.queued_at)
 }
 
 fn effective_rank(job: &Job) -> i32 {
-    let age = job.queued_at.elapsed().as_millis() / MAINTENANCE_AGING_INTERVAL.as_millis().max(1);
-    job.rank.saturating_add(age.min(i32::MAX as u128) as i32)
+    aged_rank(job.rank, job.queued_at)
 }
 
 fn advertise_best<K>(shared: &Shared<K>, state: &mut State<K>)

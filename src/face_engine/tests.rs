@@ -1492,6 +1492,7 @@ fn duplicate_enqueue_never_regresses_an_active_stage_to_queued() {
     let job = FaceAnalyzeJob {
         root: root.path().to_path_buf(),
         asset_id: 7,
+        label: None,
     };
     assert!(service.enqueue(job.clone(), 0));
     set_analysis_stage(&service.stages, &job, FaceAnalysisStage::Detecting);
@@ -1509,6 +1510,7 @@ fn cancelling_running_face_preserves_stage_until_execution_guard_exits() {
     let job = FaceAnalyzeJob {
         root: root.path().to_path_buf(),
         asset_id: 88,
+        label: None,
     };
     let stages = Arc::new(Mutex::new(HashMap::new()));
     let entered = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
@@ -1880,4 +1882,195 @@ fn recognition_service_exposes_and_cancels_individual_catalog_job() {
     assert!(service.snapshot().is_empty());
     assert_eq!(service.stats().cancelled, 1);
     assert_eq!(service.stats().completed, 0);
+}
+
+#[test]
+fn analysis_completes_while_the_shared_pipeline_is_under_render_pressure() {
+    // Reproduction of the field report: face analysis of a small JPEG hangs
+    // in Decoding for minutes while the app browses a library. The service
+    // shares its render pipeline with the render scheduler; this test keeps
+    // that pipeline saturated the way browsing + idle prefetch do (a mix of
+    // interactive and background decodes) and requires the analysis to make
+    // progress anyway.
+    let _ort = lock_ort();
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("small.jpg");
+    RgbImage::new(640, 480).save(&source).unwrap();
+    let decoy = root.path().join("decoy.jpg");
+    RgbImage::new(1024, 768).save(&decoy).unwrap();
+    catalog::initialize_test_catalog(root.path()).unwrap();
+    sync_analysis_inventory(root.path(), std::slice::from_ref(&source)).unwrap();
+    let job = pending_analysis_jobs(root.path(), 1).unwrap().remove(0);
+
+    let admission = MaintenanceAdmission::new();
+    let pipeline = RenderPipeline::with_source_cache_capacity(root.path().join("cache"), 1, 1, 1);
+    let service = FaceAnalysisService::new_with_pipeline_and_recognition(
+        1,
+        JobLimiter::new(4),
+        admission.clone(),
+        pipeline.clone(),
+        crate::face_engine::RecognitionRefreshService::new(1, admission.clone()),
+    );
+    assert!(service.enqueue(job, 0));
+
+    // Contend for the shared pipeline exactly like the app: a foreground
+    // (interactive) hammer and a background hammer, both looping decodes.
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let mut hammers = Vec::new();
+    for (interactive, path) in [
+        (true, decoy.clone()),
+        (false, decoy.clone()),
+        (true, source.clone()),
+    ] {
+        let pipeline = pipeline.clone();
+        let cancelled = Arc::clone(&cancelled);
+        let path = path.clone();
+        hammers.push(std::thread::spawn(move || {
+            while !cancelled.load(Ordering::Acquire) {
+                let _ = pipeline.render_with_recipe(
+                    RenderInvocation {
+                        path: path.clone(),
+                        variant: RenderVariant::Preview {
+                            max_width: 512,
+                            max_height: 512,
+                        },
+                        render_identity: RenderIdentity::default(),
+                        recipe: None,
+                        interactive,
+                        durable_cache_write: false,
+                    },
+                    &cancelled,
+                );
+                std::thread::yield_now();
+            }
+        }));
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while service.stats().completed == 0 && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    cancelled.store(true, Ordering::Release);
+    for hammer in hammers {
+        hammer.join().unwrap();
+    }
+    let failed = service.stats().failed;
+    assert_eq!(
+        service.stats().completed,
+        1,
+        "analysis must complete under pipeline pressure (failed: {failed})"
+    );
+}
+
+#[test]
+fn analysis_completes_under_slow_background_decode_saturation() {
+    // The field stall: the app's idle prefetch saturates the shared
+    // pipeline's background lane with SLOW decodes (RAW files take seconds
+    // each and refill continuously). The face decode must still get its
+    // permit once its grace elapses. JPEG-only contention reproduces
+    // nothing (slots free too fast), so this hammers with a deliberately
+    // slow-to-decode large image in the background lane only.
+    let _ort = lock_ort();
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("small.jpg");
+    RgbImage::new(640, 480).save(&source).unwrap();
+    let heavy = root.path().join("heavy.png");
+    RgbImage::new(2400, 1800).save(&heavy).unwrap();
+    catalog::initialize_test_catalog(root.path()).unwrap();
+    sync_analysis_inventory(root.path(), std::slice::from_ref(&source)).unwrap();
+    let job = pending_analysis_jobs(root.path(), 1).unwrap().remove(0);
+
+    let admission = MaintenanceAdmission::new();
+    let pipeline = RenderPipeline::with_source_cache_capacity(root.path().join("cache"), 1, 1, 1);
+    let service = FaceAnalysisService::new_with_pipeline_and_recognition(
+        1,
+        JobLimiter::new(4),
+        admission.clone(),
+        pipeline.clone(),
+        crate::face_engine::RecognitionRefreshService::new(1, admission.clone()),
+    );
+    assert!(service.enqueue(job, 0));
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let hammers = (0..4)
+        .map(|_| {
+            let pipeline = pipeline.clone();
+            let cancelled = Arc::clone(&cancelled);
+            let heavy = heavy.clone();
+            std::thread::spawn(move || {
+                while !cancelled.load(Ordering::Acquire) {
+                    // Background lane, uncached: each round-trip is a full
+                    // PNG decode plus resize, mimicking RAW prefetch.
+                    let _ = pipeline.render_with_recipe(
+                        RenderInvocation {
+                            path: heavy.clone(),
+                            variant: RenderVariant::Preview {
+                                max_width: 1024,
+                                max_height: 1024,
+                            },
+                            render_identity: RenderIdentity::default(),
+                            recipe: None,
+                            interactive: false,
+                            durable_cache_write: false,
+                        },
+                        &cancelled,
+                    );
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    while service.stats().completed == 0 && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    cancelled.store(true, Ordering::Release);
+    for hammer in hammers {
+        hammer.join().unwrap();
+    }
+    assert_eq!(
+        service.stats().completed,
+        1,
+        "analysis must complete under sustained slow background decodes"
+    );
+}
+
+#[test]
+fn analysis_of_the_field_reported_stuck_file_completes() {
+    // Diagnostic for the field report: the app hung in Decoding on this
+    // exact 800x800 JPEG (two sessions in a row). Runs the full analysis of
+    // that file; skips silently when the library is not mounted.
+    let _ort = lock_ort();
+    let reported = std::path::PathBuf::from(
+        "/mnt/pictures/Pictures/1997/PIC/Cradle_Of_Filth_-_Cruelty_And_The_Beast-inside.jpg",
+    );
+    if !reported.is_file() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("Cradle_Of_Filth-inside.jpg");
+    std::fs::copy(&reported, &source).unwrap();
+    catalog::initialize_test_catalog(root.path()).unwrap();
+    sync_analysis_inventory(root.path(), std::slice::from_ref(&source)).unwrap();
+    let job = pending_analysis_jobs(root.path(), 1).unwrap().remove(0);
+
+    let admission = MaintenanceAdmission::new();
+    let pipeline = RenderPipeline::with_source_cache_capacity(root.path().join("cache"), 1, 1, 1);
+    let service =
+        FaceAnalysisService::new_with_pipeline(1, JobLimiter::new(4), admission, pipeline);
+    assert!(service.enqueue(job, 0));
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+    while service.stats().completed == 0
+        && service.stats().failed == 0
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        service.stats().completed,
+        1,
+        "the field-reported file must analyze (failed: {})",
+        service.stats().failed
+    );
 }

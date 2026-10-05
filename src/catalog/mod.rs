@@ -1034,7 +1034,7 @@ pub(crate) fn install_content_identity_chunk_hook(hook: impl Fn() + 'static) {
     CONTENT_IDENTITY_CHUNK_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
-fn modified_ns(metadata: &fs::Metadata) -> i64 {
+pub(crate) fn modified_ns(metadata: &fs::Metadata) -> i64 {
     metadata
         .modified()
         .ok()

@@ -28,7 +28,7 @@ pub const PROTOTYPE_ALGORITHM_VERSION: i64 = 1;
 pub const ANN_INDEX_VERSION: i64 = 1;
 pub const PRODUCTION_SFACE_MODEL_ID: &str = "sface-2021dec";
 pub const PRODUCTION_SFACE_POLICY_DIGEST: &str =
-    "7feab1985699a5aa957c16e7326ac80b8ad5436c2e3a303fd0570583a9239a09";
+    "b1406798915059ff33fd14a69d2d894cda6e43a05350d87ffe9f178638103262";
 const PRODUCTION_SFACE_MODEL_DIGEST: &str =
     "0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79";
 const PRODUCTION_SFACE_POLICY: &[u8] =
@@ -210,13 +210,13 @@ fn validate_calibration_report(report: &CalibrationReport, license: &PolicyLicen
         || data.extractor_source_sha256
             != "3989cc579043bd226f5b1cf5fbd562bb2138966528d79719102d6f34581553f7"
         || data.production_inference_source_sha256
-            != "1bb397eb237675762174628cf1a733ebeabc00e2552a7977789bf1ff562c0b52"
+            != "ec77c029dcec8e20f59d923dfe6d9c3579931905268fc5bf7cddcc772d30f266"
         || data.production_policy_source_sha256
             != "3d2e0693777abdf37fe0085feb7badf66a7fb3859c448e23676eb36ceb4a8bda"
         || data.corpus_provenance_sha256
             != "119d83ca04a64beab77799daa79396474a34d5a2a2dbb19a188e1e818b1926da"
         || data.dependency_lock_sha256
-            != "e26014349565ecb14206828c17f4f7c95eaba8cb8599a41731e09b4b87ff6dae"
+            != "2b2cdfa9454b3777417b365b4789189650a9781ee185a39bddc6424c4b1a9280"
         || data.generator_spec_sha256
             != "df7dbebefc2128fb1bed2363a15394857f3d5d96ef5bb08b8905c12249414fee"
         || data.identity_count != 20

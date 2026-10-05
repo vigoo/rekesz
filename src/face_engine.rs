@@ -266,6 +266,9 @@ impl Drop for ClaimGuard<'_> {
 pub struct FaceAnalyzeJob {
     pub root: PathBuf,
     pub asset_id: i64,
+    /// Asset's library-relative path, for queue display; not part of the
+    /// job's identity.
+    pub label: Option<Arc<str>>,
 }
 
 impl PartialEq for FaceAnalyzeJob {
@@ -637,6 +640,12 @@ impl FaceAnalysisService {
                         stages: stages.clone(),
                         job: job.clone(),
                     };
+                    let job_started = std::time::Instant::now();
+                    let job_label = job
+                        .label
+                        .clone()
+                        .unwrap_or_else(|| format!("asset {}", job.asset_id).into());
+                    crate::trace::slow_event(&format!("face analysis: {job_label} starting"));
                     if executor_paused.load(Ordering::Acquire) {
                         return Ok(());
                     }
@@ -682,6 +691,21 @@ impl FaceAnalysisService {
                             hooks: analysis_stages.as_ref(),
                         },
                     );
+                    let job_elapsed = job_started.elapsed();
+                    match &result {
+                        Ok(()) => {
+                            crate::trace::slow_event(&format!(
+                                "face analysis: {job_label} completed in {}",
+                                crate::trace::secs(job_elapsed),
+                            ));
+                        }
+                        Err(error) => {
+                            crate::trace::slow_event(&format!(
+                                "face analysis: {job_label} failed after {}: {error}",
+                                crate::trace::secs(job_elapsed),
+                            ));
+                        }
+                    }
                     if result.is_ok()
                         && !cancelled.load(Ordering::Acquire)
                         && let Some(wake) = &recognition_wake
@@ -780,6 +804,12 @@ fn set_analysis_stage(
     job: &FaceAnalyzeJob,
     stage: FaceAnalysisStage,
 ) {
+    let subject = job
+        .label
+        .as_deref()
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("asset {}", job.asset_id));
+    crate::trace::event(&format!("face analysis: {subject} → {stage:?}"));
     stages.lock().unwrap().insert(job.clone(), stage);
 }
 
@@ -884,12 +914,13 @@ pub fn pending_analysis_jobs_prioritized(
                     FaceAnalyzeJob {
                         root: root.to_path_buf(),
                         asset_id: row.get(0)?,
+                        label: row
+                            .get::<_, Vec<u8>>(1)
+                            .ok()
+                            .and_then(|encoded| crate::catalog::decode_relative_path(&encoded).ok())
+                            .map(|path| Arc::from(path.to_string_lossy().into_owned().as_str())),
                     },
-                    {
-                        let path: Vec<u8> = row.get(1)?;
-                        let _ = path;
-                        row.get::<_, i32>(2)?
-                    },
+                    row.get::<_, i32>(2)?,
                 ))
             },
         )?
@@ -1335,9 +1366,60 @@ fn analyze_asset_with_candidate(
     let catalog_path = catalog::catalog_path(root);
     let connection = Connection::open(&catalog_path)?;
     let path = root.join(catalog::decode_relative_path(&relative_path)?);
-    let source_identity = catalog::stable_content_identity(&path)?;
-    let source_size = source_identity.size;
-    let source_modified_ns = source_identity.modified_ns;
+    let metadata = std::fs::metadata(&path)
+        .with_context(|| format!("read source identity for {}", path.display()))?;
+    let source_size = metadata.len().min(i64::MAX as u64) as i64;
+    let source_modified_ns = catalog::modified_ns(&metadata);
+    // The inventory pass verified this file's content fingerprint moments
+    // ago; when its recorded size and mtime still match, reuse that
+    // fingerprint instead of re-reading (and re-hashing) the whole file per
+    // analysis. Any mismatch falls back to the full content hash, and the
+    // existing inventory-currency check defers the asset.
+    let inventory_row: Option<(i64, i64, Vec<u8>)> = connection
+        .query_row(
+            "SELECT source_size, source_modified_ns, source_fingerprint
+             FROM analysis_asset_inventory WHERE asset_id=?1",
+            [asset_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    // A NULL/malformed stored fingerprint degrades to the hashing fallback
+    // instead of failing the asset permanently.
+    let identity_matches_inventory =
+        inventory_row
+            .as_ref()
+            .and_then(|(stored_size, stored_modified, fingerprint)| {
+                let fingerprint: [u8; 32] = fingerprint.as_slice().try_into().ok()?;
+                (*stored_size == source_size && *stored_modified == source_modified_ns)
+                    .then_some(fingerprint)
+            });
+    let (source_identity, inventory_current) = if let Some(fingerprint) = identity_matches_inventory
+    {
+        (
+            catalog::SourceContentIdentity {
+                size: source_size,
+                modified_ns: source_modified_ns,
+                fingerprint,
+            },
+            true,
+        )
+    } else {
+        let identity = catalog::stable_content_identity(&path)?;
+        let inventory_current: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM analysis_asset_inventory WHERE asset_id=?1
+               AND source_size=?2 AND source_modified_ns=?3 AND decoder_model_id=?4
+               AND source_fingerprint=?5)",
+            params![
+                asset_id,
+                identity.size,
+                identity.modified_ns,
+                DECODER_MODEL_ID,
+                identity.fingerprint.as_slice()
+            ],
+            |row| row.get(0),
+        )?;
+        (identity, inventory_current)
+    };
     let source_fingerprint = source_identity.fingerprint;
     if source_size as u64 > ANALYSIS_MAX_SOURCE_BYTES {
         defer_identity_mismatch(
@@ -1350,19 +1432,6 @@ fn analyze_asset_with_candidate(
         )?;
         return Ok(());
     }
-    let inventory_current: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM analysis_asset_inventory WHERE asset_id=?1
-           AND source_size=?2 AND source_modified_ns=?3 AND decoder_model_id=?4
-           AND source_fingerprint=?5)",
-        params![
-            asset_id,
-            source_size,
-            source_modified_ns,
-            DECODER_MODEL_ID,
-            source_fingerprint.as_slice()
-        ],
-        |row| row.get(0),
-    )?;
     if !inventory_current {
         defer_identity_mismatch(
             &connection,

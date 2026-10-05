@@ -87,6 +87,12 @@ pub(crate) struct AppSettings {
     pub face_worker_memory_bytes: u64,
     #[serde(default)]
     pub face_crop_disk_cache: FaceCropDiskCachePolicy,
+    #[serde(default)]
+    pub import_recent_sources: Vec<PathBuf>,
+    #[serde(default)]
+    pub import_destination_preset: crate::import::DestinationPreset,
+    #[serde(default)]
+    pub import_include_duplicates: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -198,6 +204,9 @@ fn defaults(dirs: &directories::ProjectDirs) -> Result<AppSettings> {
         root: std::env::current_dir()?,
         image_cache_size: DEFAULT_IMAGE_CACHE_SIZE,
         pair_preference: PairPreference::Raw,
+        import_recent_sources: Vec::new(),
+        import_destination_preset: Default::default(),
+        import_include_duplicates: false,
         cache_root: dirs.cache_dir().to_path_buf(),
         job_parallelism,
         raw_parallelism: default_raw_parallelism(job_parallelism),

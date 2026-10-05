@@ -162,18 +162,24 @@ fn drained_inventory_detects_add_delete_and_recovers_after_error() {
     // A successful drained scan arms the watcher. The next scan represents a
     // newly added asset, and the following successful scan a deleted asset.
     for _inventory_change in ["drained", "added", "deleted"] {
-        let delay = coordinator.inventory_after(false, false).unwrap();
+        let delay = coordinator
+            .inventory_after(false, false, None, true)
+            .unwrap();
         fake_now += delay;
     }
     assert_eq!(fake_now, Duration::from_millis(180));
 
     // A transient scan error backs off, then a successful recovery returns to
     // the normal watch cadence. Pausing suppresses either rearm.
-    fake_now += coordinator.inventory_after(false, true).unwrap();
-    fake_now += coordinator.inventory_after(false, false).unwrap();
+    fake_now += coordinator
+        .inventory_after(false, true, None, false)
+        .unwrap();
+    fake_now += coordinator
+        .inventory_after(false, false, None, false)
+        .unwrap();
     assert_eq!(fake_now, Duration::from_millis(360));
-    assert_eq!(coordinator.inventory_after(true, false), None);
-    assert_eq!(coordinator.inventory_after(true, true), None);
+    assert_eq!(coordinator.inventory_after(true, false, None, false), None);
+    assert_eq!(coordinator.inventory_after(true, true, None, false), None);
 }
 
 #[test]
@@ -304,6 +310,9 @@ fn gpui_test_config(root: &Path, cache: &Path) -> Config {
             face_workers: 1,
             face_worker_memory_bytes: 512 * 1024 * 1024,
             face_crop_disk_cache: config::FaceCropDiskCachePolicy::default(),
+            import_recent_sources: Vec::new(),
+            import_destination_preset: Default::default(),
+            import_include_duplicates: false,
         },
         settings_path: root.join("settings.json"),
     }
@@ -4164,5 +4173,307 @@ fn benchmark_scheduler_cancellation_and_parallelism() {
         throughput(4),
         cancellation_handoff(&raw_paths[0]),
         cancellation_handoff(&cr3),
+    );
+}
+
+// ---- Import view UI tests ----
+
+/// Builds a source folder card with `folders` subfolders and `photos` photos.
+fn write_import_source(root: &Path, name: &str, folders: usize, photos: usize) -> PathBuf {
+    let card = root.join(name);
+    std::fs::create_dir_all(&card).unwrap();
+    for index in 0..folders {
+        std::fs::create_dir(card.join(format!("folder-{index:02}"))).unwrap();
+    }
+    for index in 0..photos {
+        image::RgbImage::from_pixel(8, 8, image::Rgb([32, 96, 160]))
+            .save(card.join(format!("photo-{index}.jpg")))
+            .unwrap();
+    }
+    card
+}
+
+/// Opens the app directly in the import view with `card` injected as a folder
+/// source, selects it, and waits for the listing to load. `library` is the
+/// (separate) library root the import would copy into.
+fn import_view_with_card<'a>(
+    cx: &'a mut gpui::TestAppContext,
+    library: &Path,
+    card: &Path,
+) -> (
+    gpui::Entity<PictureBrowser>,
+    &'a mut gpui::VisualTestContext,
+) {
+    let cache = library.parent().unwrap().join("cache");
+    let mut config = gpui_test_config(library, &cache);
+    config.settings.automatic_face_analysis = false;
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    view.update(&mut *cx, |view, cx| {
+        view.set_directory_view_mode(DirectoryViewMode::Import, cx);
+        let id = sources::SourceId::new(format!("folder:{}", card.display()));
+        view.import_view.sources.push(sources::SourceEntry {
+            id: id.clone(),
+            label: "Card".to_owned(),
+            kind: sources::SourceKind::Folder,
+            backing: sources::SourceBacking::Path(card.to_path_buf()),
+            capacity: None,
+        });
+        view.select_import_source(id, cx);
+    });
+    cx.run_until_parked();
+    assert!(view.read_with(&*cx, |view, _| view.import_view.listing_loaded()));
+    (view, cx)
+}
+
+#[gpui::test]
+fn import_destination_picker_rows_keep_natural_height(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let library = root.path().join("library");
+    std::fs::create_dir(&library).unwrap();
+    for index in 0..40 {
+        std::fs::create_dir(library.join(format!("folder-{index:02}"))).unwrap();
+    }
+    let card = write_import_source(root.path(), "card", 0, 1);
+    let (_view, cx) = import_view_with_card(cx, &library, &card);
+
+    let toggle = cx
+        .debug_bounds("#import-destination-picker")
+        .expect("picker toggle renders");
+    cx.simulate_click(toggle.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+
+    let panel = cx
+        .debug_bounds("#import-destination-panel")
+        .expect("picker panel renders");
+    let first = cx
+        .debug_bounds("#picker-entry-0")
+        .expect("first folder row renders");
+    let second = cx
+        .debug_bounds("#picker-entry-1")
+        .expect("second row renders");
+    let last = cx
+        .debug_bounds("#picker-entry-39")
+        .expect("last row renders");
+
+    // The panel must not clamp its content: a max-height flex column lets
+    // taffy shrink the rows to fit, and truncated row text then clips itself
+    // down to nothing, rendering the picker as an empty bordered box.
+    assert!(
+        panel.size.height >= first.size.height * 40.0,
+        "panel {:?} must grow with its {} rows instead of clamping",
+        panel.size,
+        40
+    );
+    for row in [first, second, last] {
+        assert!(
+            row.size.height >= px(20.0),
+            "row height {:?} collapsed; flex children were shrunk to fit a max-height",
+            row.size.height
+        );
+    }
+    // Rows keep a uniform, natural cadence. Line heights carry sub-pixel
+    // fractions, so compare the average over the whole run, not exact sums.
+    let spacing = second.origin.y - first.origin.y;
+    let average = (last.origin.y - first.origin.y) / 39.0;
+    assert!(
+        spacing >= px(25.0) && (average - spacing).abs() < px(0.5),
+        "rows compressed or uneven: first gap {spacing}, average {average}"
+    );
+}
+
+#[gpui::test]
+fn import_destination_picker_navigates_and_picks_destination(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let library = root.path().join("library");
+    std::fs::create_dir_all(library.join("2024").join("06")).unwrap();
+    std::fs::create_dir(library.join("2025")).unwrap();
+    let card = write_import_source(root.path(), "card", 0, 0);
+    let (_view, cx) = import_view_with_card(cx, &library, &card);
+
+    let toggle = cx.debug_bounds("#import-destination-picker").unwrap();
+    cx.simulate_click(toggle.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+
+    assert_eq!(
+        _view.read_with(&*cx, |view, _| view
+            .import_view
+            .picker_entries
+            .clone()
+            .expect("entries loaded")),
+        vec!["2024".to_owned(), "2025".to_owned()]
+    );
+
+    // Into 2024: the listing shows the nested month folder and the ".." row.
+    let entry = cx.debug_bounds("#picker-entry-0").unwrap();
+    cx.simulate_click(entry.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        _view.read_with(&*cx, |view, _| (
+            view.import_view.picker_dir.clone(),
+            view.import_view.picker_entries.clone().unwrap()
+        )),
+        (library.join("2024"), vec!["06".to_owned()])
+    );
+    assert!(cx.debug_bounds("#picker-up-0").is_some());
+
+    // Back to the library root via the dedicated row.
+    let root_row = cx.debug_bounds("#picker-root-0").unwrap();
+    cx.simulate_click(root_row.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        _view.read_with(&*cx, |view, _| view.import_view.picker_dir.clone()),
+        library.clone()
+    );
+
+    // "Use this folder" closes the picker and retargets the import base.
+    let use_folder = cx.debug_bounds("#picker-use-folder").unwrap();
+    cx.simulate_click(use_folder.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        _view.read_with(&*cx, |view, _| (
+            view.import_view.destination_picker_open,
+            view.import_view.destination_base.clone()
+        )),
+        (false, Some(library.clone()))
+    );
+}
+
+#[gpui::test]
+fn import_destination_picker_creates_folder(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let library = root.path().join("library");
+    std::fs::create_dir(&library).unwrap();
+    let card = write_import_source(root.path(), "card", 0, 0);
+    let (_view, cx) = import_view_with_card(cx, &library, &card);
+
+    let toggle = cx.debug_bounds("#import-destination-picker").unwrap();
+    cx.simulate_click(toggle.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+
+    let new_folder = cx.debug_bounds("#picker-new-folder-0").unwrap();
+    cx.simulate_click(new_folder.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("#import-new-folder-create").is_some());
+
+    // The app installs its keymap in main(); tests must do the same for
+    // keystroke-driven actions like the input's Enter binding.
+    cx.update(|_, cx| bind_picture_browser_keys(cx));
+
+    cx.simulate_keystrokes("summer 2 0 2 4");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    assert!(
+        library.join("summer2024").is_dir(),
+        "typed folder was not created"
+    );
+    assert_eq!(
+        _view.read_with(&*cx, |view, _| (
+            view.import_view.creating_folder,
+            view.import_view.picker_entries.clone().unwrap()
+        )),
+        (false, vec!["summer2024".to_owned()])
+    );
+}
+
+#[gpui::test]
+fn import_source_listing_navigates_by_tiles_and_breadcrumbs(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let library = root.path().join("library");
+    std::fs::create_dir(&library).unwrap();
+    let card = write_import_source(root.path(), "card", 0, 2);
+    std::fs::create_dir_all(card.join("2024").join("06")).unwrap();
+    image::RgbImage::from_pixel(8, 8, image::Rgb([32, 96, 160]))
+        .save(card.join("2024").join("nested.jpg"))
+        .unwrap();
+    let (_view, cx) = import_view_with_card(cx, &library, &card);
+
+    assert_eq!(
+        _view.read_with(&*cx, |view, _| (
+            view.import_view.photos.len(),
+            view.import_view.selection.len(),
+        )),
+        (2, 2)
+    );
+
+    // The subdirectory tile navigates one level down.
+    let tile = cx
+        .debug_bounds("#import-folder-0")
+        .expect("subdirectory tile renders");
+    cx.simulate_click(tile.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        _view.read_with(&*cx, |view, _| (
+            view.import_view.current_relative(),
+            view.import_view.photos.len()
+        )),
+        (Some("2024".to_owned()), 1)
+    );
+
+    // The breadcrumb root crumb returns to the source root.
+    let crumb = cx.debug_bounds("#import-crumb-0").unwrap();
+    cx.simulate_click(crumb.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        _view.read_with(&*cx, |view, _| view.import_view.current_relative()),
+        Some(String::new())
+    );
+
+    // Select-all / select-none drive the selection from the header toggles.
+    let select_none = cx.debug_bounds("#import-select-none").unwrap();
+    cx.simulate_click(select_none.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        _view.read_with(&*cx, |view, _| view.import_view.selection.len()),
+        0
+    );
+    let select_all = cx.debug_bounds("#import-select-all").unwrap();
+    cx.simulate_click(select_all.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        _view.read_with(&*cx, |view, _| view.import_view.selection.len()),
+        2
+    );
+}
+
+#[gpui::test]
+fn import_layout_combobox_and_duplicates_toggle_persist(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let mut config = gpui_test_config(root.path(), cache.path());
+    config.settings.automatic_face_analysis = false;
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    let settings_path = view.read_with(&*cx, |view, _| view.settings_path.clone());
+
+    let file_button = cx.debug_bounds("#file-menu-button").unwrap();
+    cx.simulate_click(file_button.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let item = cx.debug_bounds("#import-photos-menu-item").unwrap();
+    cx.simulate_click(item.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+
+    let initial_preset = view.read_with(&*cx, |view, _| view.import_view.preset);
+    let button = cx.debug_bounds("#import-layout-button").unwrap();
+    cx.simulate_click(button.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let option = cx.debug_bounds("#import-layout-option-2").unwrap();
+    cx.simulate_click(option.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+
+    let duplicates = cx.debug_bounds("#import-duplicates").unwrap();
+    cx.simulate_click(duplicates.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+
+    let (preset, include_duplicates) = view.read_with(&*cx, |view, _| {
+        (view.import_view.preset, view.import_view.include_duplicates)
+    });
+    assert_ne!(preset, initial_preset, "layout preset did not change");
+    assert!(include_duplicates);
+
+    let saved = std::fs::read_to_string(&settings_path).unwrap();
+    assert!(
+        saved.contains("\"import_include_duplicates\": true"),
+        "duplicates policy not persisted: {saved}"
     );
 }

@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -19,10 +19,10 @@ use anyhow::Result;
 use gpui::{
     AnyElement, App, AppContext as _, Application, Bounds, ClickEvent, ClipboardItem, Context,
     CursorStyle, FocusHandle, KeyBinding, ListSizingBehavior, Menu, MenuItem, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Render, ScrollStrategy,
-    ScrollWheelEvent, SharedString, StatefulInteractiveElement, UniformListScrollHandle, Window,
-    WindowBounds, WindowOptions, actions, canvas, div, img, point, prelude::*, px, relative, rgb,
-    size, uniform_list,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Render, ScrollHandle,
+    ScrollStrategy, ScrollWheelEvent, SharedString, StatefulInteractiveElement,
+    UniformListScrollHandle, Window, WindowBounds, WindowOptions, actions, canvas, div, img, point,
+    prelude::*, px, relative, rgb, size, uniform_list,
 };
 
 mod accessibility;
@@ -31,12 +31,17 @@ mod config;
 mod discovery;
 mod face_engine;
 mod formats;
+mod import;
+#[path = "main/import_view.rs"]
+mod import_view;
 mod jobs;
 mod map;
 mod metadata;
 mod preview;
 mod rendering;
 mod scheduler;
+mod sources;
+mod trace;
 
 static MAP_RENDER_BUSY: AtomicBool = AtomicBool::new(false);
 static MAP_CLUSTER_BUSY: AtomicBool = AtomicBool::new(false);
@@ -90,7 +95,9 @@ actions!(
         ToggleDevelopInspector,
         OpenCacheStatistics,
         OpenSettings,
-        ImportLightroom
+        ImportLightroom,
+        ImportPhotos,
+        ImportNewFolderConfirm
     ]
 );
 
@@ -124,6 +131,7 @@ const FOCUSED_PREFETCH_SCOPE: DemandScopeId = DemandScopeId(5);
 const IMAGE_PREFETCH_SCOPE: DemandScopeId = DemandScopeId(6);
 const MAP_CARD_SCOPE: DemandScopeId = DemandScopeId(7);
 const PEOPLE_SCOPE: DemandScopeId = DemandScopeId(8);
+const IMPORT_SCOPE: DemandScopeId = DemandScopeId(9);
 #[cfg(test)]
 static PEOPLE_QUERY_TEST_DELAY: std::sync::Mutex<Option<(PathBuf, Duration)>> =
     std::sync::Mutex::new(None);
@@ -136,6 +144,15 @@ const DEVELOP_PANEL_WIDTH: f32 = 320.0;
 const SCHEDULER_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 const FULL_IDENTITY_VERIFICATION_INTERVAL: u64 = 1_440;
 const USE_IN_WINDOW_MENU: bool = cfg!(target_os = "linux");
+/// Admission rank of the face-analysis inventory. It must outrank every
+/// analysis rank — base 0, recent-asset boost 100, preferred-subtree boost
+/// 200 — because admission's `is_best`/`beats_advertised` checks require
+/// beating every waiter *and* every queued scheduler candidate: a lower
+/// rank starves behind any refill backlog (e.g. the catch-up analysis of a
+/// library that has never been fully analyzed). The inventory is cheap and
+/// re-prioritizes the analysis queue, so running it first is strictly
+/// better.
+const FACE_INVENTORY_ADMISSION_RANK: i32 = 1_000;
 const IMAGE_WHEEL_THRESHOLD_PX: f32 = 30.0;
 const HIDDEN_NODE: NodeId = NodeId(usize::MAX);
 
@@ -189,6 +206,9 @@ struct FaceInventoryProgress {
     scan_pending: AtomicUsize,
     scan_images: AtomicUsize,
     current_file: Mutex<Option<PathBuf>>,
+    /// Assets added/changed/removed by the last pass; zero means the
+    /// library was unchanged and the next pass can back off.
+    changes: AtomicU64,
 }
 
 impl FaceInventoryProgress {
@@ -214,6 +234,7 @@ impl FaceInventoryProgress {
                     "Scanning library · {directories} folders scanned · {pending} queued · {images} images found · {file}"
                 ))
             }
+            5 => Some("Waiting for a free background slot…".to_owned()),
             2 => Some(format!(
                 "Checking image identity {processed}/{total} · {file}"
             )),
@@ -301,6 +322,8 @@ impl MaintenanceDriver for ProductionMaintenanceDriver {
         // Keep the calibrated inference module's legacy inventory entry point
         // linked without changing that source file's release-bound digest.
         let _calibrated_inventory_entry_point = face_engine::sync_analysis_inventory;
+        let pass_started = std::time::Instant::now();
+        trace::event("face inventory: permit acquired · scanning");
         progress.stage.store(1, Ordering::Release);
         let paths = discovery::scan_library_inventory_with_progress(
             root,
@@ -322,7 +345,12 @@ impl MaintenanceDriver for ProductionMaintenanceDriver {
         progress.discovered.store(paths.len(), Ordering::Release);
         progress.processed.store(0, Ordering::Release);
         progress.stage.store(2, Ordering::Release);
-        catalog::sync_asset_inventory_with_progress(
+        trace::slow_event(&format!(
+            "face inventory: scan finished in {} · {} images · checking identities",
+            trace::secs(pass_started.elapsed()),
+            paths.len(),
+        ));
+        let sync = catalog::sync_asset_inventory_with_progress(
             root,
             &paths,
             "yunet-2023mar+sface-2021dec",
@@ -340,7 +368,18 @@ impl MaintenanceDriver for ProductionMaintenanceDriver {
             },
             || admission.checkpoint(cancelled),
         )?;
+        progress.changes.store(
+            (sync.added + sync.invalidated + sync.removed) as u64,
+            Ordering::Release,
+        );
         progress.stage.store(4, Ordering::Release);
+        trace::slow_event(&format!(
+            "face inventory: identity + sync finished in {} · {} added, {} changed, {} removed",
+            trace::secs(pass_started.elapsed()),
+            sync.added,
+            sync.invalidated,
+            sync.removed,
+        ));
         face_engine::pending_analysis_jobs_prioritized(
             root,
             10_000,
@@ -396,12 +435,33 @@ impl MaintenanceCoordinator {
         }
     }
 
-    fn inventory_after(self, paused: bool, failed: bool) -> Option<Duration> {
-        (!paused).then_some(if failed {
-            self.inventory_error
-        } else {
-            self.inventory_watch
-        })
+    fn inventory_after(
+        self,
+        paused: bool,
+        failed: bool,
+        last_run: Option<Duration>,
+        found_changes: bool,
+    ) -> Option<Duration> {
+        if paused {
+            return None;
+        }
+        if failed {
+            return Some(self.inventory_error);
+        }
+        // A fixed watch delay re-walks the whole library on its own cadence
+        // no matter how long the walk takes; on large libraries that starves
+        // analysis under constant inventory passes. Scale the delay with the
+        // last run, and when a pass found nothing new, back off to the cap:
+        // the walk is pure overhead while the library is stable, and any
+        // change restores the tight cadence on the following pass.
+        match (last_run, found_changes) {
+            (None, _) => Some(self.inventory_watch),
+            (Some(_), false) => Some(Duration::from_secs(30 * 60)),
+            (Some(last), true) => {
+                let scaled = last.saturating_mul(6);
+                Some(scaled.clamp(self.inventory_watch, Duration::from_secs(30 * 60)))
+            }
+        }
     }
 
     fn throughput_after(self, completed_last_minute: usize) -> Option<Duration> {
@@ -481,6 +541,7 @@ enum DirectoryViewMode {
     Grid,
     Map,
     People,
+    Import,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -907,6 +968,8 @@ struct PictureBrowser {
     face_inventory_progress: Arc<FaceInventoryProgress>,
     face_inventory_cancelled: Arc<AtomicBool>,
     face_inventory_generation: u64,
+    last_inventory_duration: Option<Duration>,
+    last_inventory_found_changes: bool,
     face_inventory_active: bool,
     face_analysis_paused: bool,
     face_crop_disk_cache_enabled: Arc<AtomicBool>,
@@ -937,6 +1000,7 @@ struct PictureBrowser {
     settings_path: PathBuf,
     settings_draft: Option<AppSettings>,
     lightroom_import_dialog: Option<LightroomImportDialog>,
+    import_view: import_view::ImportViewState,
     settings_status: Option<String>,
     job_queue_snapshot: SchedulerSnapshot,
     face_job_queue_snapshot: Vec<face_engine::FaceAnalysisJobSnapshot>,
@@ -950,6 +1014,9 @@ struct PictureBrowser {
     metadata_loader: MetadataLoader,
     metadata_load: Option<(NodeId, discovery::RequestId, Arc<AtomicBool>)>,
     scrollbar_drag: Option<ScrollbarDrag>,
+    settings_scroll: ScrollHandle,
+    pending_import_demand: Option<Range<usize>>,
+    import_demand_scheduled: bool,
     recipes: Option<Arc<HashMap<PathBuf, catalog::RecipeEntry>>>,
     people_overview: PeoplePageLoad<catalog::people::PersonPage>,
     people_diagnostics: Option<Result<Arc<catalog::people::PeopleDiagnostics>, Arc<str>>>,
@@ -1093,6 +1160,7 @@ impl MapCard {
 enum ScrollbarTarget {
     Tree,
     Grid,
+    Settings,
 }
 
 #[derive(Clone, Copy)]
@@ -1295,6 +1363,49 @@ fn render_activity_label(
         (RenderVariant::FaceContext { .. }, _) => "face context",
     };
     format!("{action} {stage}: {}…", path_display_name(path))
+}
+
+/// Progress-strip label for the face-analysis queue: what is currently
+/// being analyzed and how much is left. The queue can run for hours (a
+/// first-pass analysis of a large library), so an unlabeled strip here
+/// reads as a hang.
+fn face_queue_progress_label(
+    snapshot: &[face_engine::FaceAnalysisJobSnapshot],
+    progress: Option<(u64, u64)>,
+) -> Option<String> {
+    let queued = snapshot
+        .iter()
+        .filter(|job| !job.cancelled && job.status == scheduler::MaintenanceJobStatus::Queued)
+        .count();
+    if let Some(running) = snapshot
+        .iter()
+        .find(|job| !job.cancelled && job.status == scheduler::MaintenanceJobStatus::Running)
+    {
+        let stage = format!("{:?}", running.stage).to_lowercase();
+        let subject = running
+            .job
+            .label
+            .as_deref()
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("asset {}", running.job.asset_id));
+        let mut label = format!("Analyzing faces · {stage} {subject}");
+        if queued > 0 {
+            label.push_str(&format!(" · {queued} queued"));
+        }
+        if let Some((done, pending)) = progress {
+            label.push_str(&format!(" · {done} done · {pending} pending"));
+        }
+        return Some(label);
+    }
+    // Nothing admitted right now (the exact starvation display case): report
+    // the backlog instead of degrading to the generic fallback.
+    (queued > 0).then(|| {
+        let mut label = format!("Analyzing faces · waiting to admit · {queued} queued");
+        if let Some((done, pending)) = progress {
+            label.push_str(&format!(" · {done} done · {pending} pending"));
+        }
+        label
+    })
 }
 
 fn scheduler_progress_label(snapshot: &SchedulerSnapshot) -> Option<String> {
@@ -1674,6 +1785,8 @@ impl PictureBrowser {
             face_inventory_progress: Arc::new(FaceInventoryProgress::default()),
             face_inventory_cancelled: Arc::new(AtomicBool::new(false)),
             face_inventory_generation: 0,
+            last_inventory_duration: None,
+            last_inventory_found_changes: false,
             face_inventory_active: false,
             face_analysis_paused: !settings.automatic_face_analysis || face_workers == 0,
             face_crop_disk_cache_enabled,
@@ -1707,6 +1820,7 @@ impl PictureBrowser {
             settings_path: config.settings_path.clone(),
             settings_draft: None,
             lightroom_import_dialog: None,
+            import_view: import_view::ImportViewState::new(settings, cx),
             settings_status: (face_workers == 0).then(||
                 "Automatic face analysis is paused: insufficient memory after OS and foreground reserves."
                     .to_owned()),
@@ -1722,6 +1836,9 @@ impl PictureBrowser {
             metadata_loader,
             metadata_load: None,
             scrollbar_drag: None,
+            settings_scroll: ScrollHandle::new(),
+            pending_import_demand: None,
+            import_demand_scheduled: false,
             recipes: None,
             people_overview: PeoplePageLoad::Loading,
             people_diagnostics: None,
@@ -2444,7 +2561,10 @@ impl PictureBrowser {
     }
 
     fn run_idle_prefetch(&mut self, epoch: u64, cx: &mut Context<Self>) {
-        if epoch != self.grid_demand_epoch || !matches!(self.main_view, MainView::Dir(_, _)) {
+        if epoch != self.grid_demand_epoch
+            || !matches!(self.main_view, MainView::Dir(_, _))
+            || self.directory_view_mode == DirectoryViewMode::Import
+        {
             return;
         }
         let stats = self.scheduler.stats();
@@ -2511,7 +2631,9 @@ impl PictureBrowser {
                 if epoch != this.focused_prefetch_epoch {
                     return;
                 }
-                if this.scheduler.has_foreground_work() {
+                if this.scheduler.has_foreground_work()
+                    || this.directory_view_mode == DirectoryViewMode::Import
+                {
                     this.schedule_focused_prefetch_epoch(epoch, cx);
                     return;
                 }
@@ -2826,6 +2948,9 @@ impl PictureBrowser {
     }
 
     fn open_selected_image(&mut self, _: &OpenImage, _: &mut Window, cx: &mut Context<Self>) {
+        if self.directory_view_mode == DirectoryViewMode::Import {
+            return;
+        }
         let index = match &self.main_view {
             MainView::Dir(_, selection) => selection.focused,
             MainView::Image(_) => None,
@@ -2836,6 +2961,9 @@ impl PictureBrowser {
     }
 
     fn move_thumbnail_selection(&mut self, delta: isize, extend: bool, cx: &mut Context<Self>) {
+        if self.directory_view_mode == DirectoryViewMode::Import {
+            return;
+        }
         let image_count = self.selected_images().len();
         if image_count == 0 {
             return;
@@ -3268,6 +3396,25 @@ impl PictureBrowser {
             self.people_query_cancelled.store(true, Ordering::Release);
             self.scheduler.clear_scope(PEOPLE_SCOPE);
         }
+        if mode == DirectoryViewMode::Import {
+            // Free the library grid's scheduling machinery so import
+            // thumbnails own the render workers.
+            self.reset_grid_prediction();
+            self.pending_grid_demand = None;
+            for scope in [
+                GRID_SCOPE,
+                NEAR_GRID_SCOPE,
+                IDLE_PREFETCH_SCOPE,
+                FOCUSED_PREFETCH_SCOPE,
+                IMAGE_PREFETCH_SCOPE,
+            ] {
+                self.scheduler.clear_scope(scope);
+            }
+            self.refresh_import_sources(cx);
+        } else {
+            self.scheduler.clear_scope(IMPORT_SCOPE);
+            self.import_view.report = None;
+        }
         cx.notify();
     }
 
@@ -3293,27 +3440,32 @@ impl PictureBrowser {
             catalog::InventoryIdentityMode::MetadataFirst
         };
         let work_id = self.work.start("Updating face-analysis inventory…");
+        trace::slow_event("face inventory: submitted");
+        let inventory_started = std::time::Instant::now();
         let progress = Arc::new(FaceInventoryProgress::default());
         progress.scan_pending.store(1, Ordering::Release);
-        progress.stage.store(1, Ordering::Release);
+        // Distinct from the driver's stage 1: the run is submitted but has
+        // not acquired the maintenance permit yet.
+        progress.stage.store(5, Ordering::Release);
         self.face_inventory_progress = progress.clone();
         let worker_progress = progress.clone();
         let work = cx.background_executor().spawn(async move {
-            let result = admission.run_maintenance(-100, &cancelled, || {
-                maintenance_driver.inventory(
-                    &root,
-                    &hidden,
-                    pair_preference,
-                    &preferred_subtree,
-                    &recent_assets,
-                    InventoryCoordination {
-                        progress: &worker_progress,
-                        admission: &admission,
-                        cancelled: &cancelled,
-                        identity_mode,
-                    },
-                )
-            });
+            let result =
+                admission.run_maintenance(FACE_INVENTORY_ADMISSION_RANK, &cancelled, || {
+                    maintenance_driver.inventory(
+                        &root,
+                        &hidden,
+                        pair_preference,
+                        &preferred_subtree,
+                        &recent_assets,
+                        InventoryCoordination {
+                            progress: &worker_progress,
+                            admission: &admission,
+                            cancelled: &cancelled,
+                            identity_mode,
+                        },
+                    )
+                });
             result.unwrap_or_else(|| Err(anyhow::anyhow!("face inventory cancelled")))
         });
         cx.spawn(async move |this, cx| {
@@ -3325,6 +3477,36 @@ impl PictureBrowser {
                     return;
                 }
                 this.face_inventory_active = false;
+                let inventory_elapsed = inventory_started.elapsed();
+                this.last_inventory_duration = Some(inventory_elapsed);
+                let found_changes = progress.changes.load(Ordering::Acquire) > 0;
+                this.last_inventory_found_changes = found_changes;
+                match &result {
+                    Ok(jobs) => trace::slow_event(&format!(
+                        "face inventory: pass finished in {} · {} analysis jobs queued · {}next pass in {}",
+                        trace::secs(inventory_elapsed),
+                        jobs.len(),
+                        if found_changes {
+                            "changes found · ".to_owned()
+                        } else {
+                            "no changes · ".to_owned()
+                        },
+                        trace::secs(
+                            MaintenanceCoordinator::PRODUCTION
+                                .inventory_after(
+                                    this.face_analysis_paused,
+                                    false,
+                                    this.last_inventory_duration,
+                                    found_changes,
+                                )
+                                .unwrap_or_default()
+                        ),
+                    )),
+                    Err(error) => trace::slow_event(&format!(
+                        "face inventory: pass failed after {} · {error:#}",
+                        trace::secs(inventory_elapsed),
+                    )),
+                }
                 progress.stage.store(0, Ordering::Release);
                 match result {
                     Ok(jobs) if !this.face_analysis_paused => {
@@ -3347,9 +3529,12 @@ impl PictureBrowser {
                     Err(error) => {
                         this.settings_status =
                             Some(format!("Could not update face inventory: {error:#}"));
-                        if let Some(delay) = MaintenanceCoordinator::PRODUCTION
-                            .inventory_after(this.face_analysis_paused, true)
-                        {
+                        if let Some(delay) = MaintenanceCoordinator::PRODUCTION.inventory_after(
+                            this.face_analysis_paused,
+                            true,
+                            None,
+                            false,
+                        ) {
                             this.schedule_face_inventory_watch_after(delay, cx);
                         }
                     }
@@ -3417,9 +3602,12 @@ impl PictureBrowser {
     }
 
     fn schedule_face_inventory_watch(&mut self, cx: &mut Context<Self>) {
-        if let Some(delay) =
-            MaintenanceCoordinator::PRODUCTION.inventory_after(self.face_analysis_paused, false)
-        {
+        if let Some(delay) = MaintenanceCoordinator::PRODUCTION.inventory_after(
+            self.face_analysis_paused,
+            false,
+            self.last_inventory_duration,
+            self.last_inventory_found_changes,
+        ) {
             self.schedule_face_inventory_watch_after(delay, cx);
         }
     }
@@ -7748,6 +7936,9 @@ impl PictureBrowser {
     }
 
     fn toggle_developed(&mut self, _: &ToggleDeveloped, _: &mut Window, cx: &mut Context<Self>) {
+        if self.directory_view_mode == DirectoryViewMode::Import {
+            return;
+        }
         self.developed = !self.developed;
         if self.map_card.is_some()
             && self.directory_view_mode == DirectoryViewMode::Map
@@ -7934,9 +8125,16 @@ impl PictureBrowser {
                                     .child(
                                         div()
                                             .text_xs()
+                                            .truncate()
                                             .text_color(rgb(0x9da7b6))
                                             .child(format!(
-                                                "RUN · maintenance rank -100{} · {label} · click to cancel",
+                                                "{} · maintenance rank {}{} · {label} · click to cancel",
+                                                if self.face_inventory_progress.stage.load(Ordering::Acquire) == 5 {
+                                                    "WAITING"
+                                                } else {
+                                                    "RUN"
+                                                },
+                                                FACE_INVENTORY_ADMISSION_RANK,
                                                 if cancelled { " · cancelling" } else { "" }
                                             )),
                                     )
@@ -7969,14 +8167,30 @@ impl PictureBrowser {
                                 .border_b_1()
                                 .border_color(rgb(0x30343d))
                                 .cursor_pointer()
-                                .child(format!("Analyze asset {} · {file}", job.job.asset_id))
-                                .child(div().text_xs().text_color(rgb(0x9da7b6)).child(format!(
-                                    "{:?} · {:?} · rank {}{} · click to cancel",
-                                    job.status,
-                                    job.stage,
-                                    job.rank,
-                                    if job.cancelled { " · cancelling" } else { "" }
-                                )))
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .truncate()
+                                        .text_color(rgb(0xe1e5ec))
+                                        .child(format!(
+                                            "Analyze asset {} · {}",
+                                            job.job.asset_id,
+                                            job.job.label.as_deref().unwrap_or(file.as_ref())
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .truncate()
+                                        .text_color(rgb(0x9da7b6))
+                                        .child(format!(
+                                            "{:?} · {:?} · rank {}{} · click to cancel",
+                                            job.status,
+                                            job.stage,
+                                            job.rank,
+                                            if job.cancelled { " · cancelling" } else { "" }
+                                        )),
+                                )
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.face_analysis.cancel(&key);
                                     cx.notify();
@@ -8003,8 +8217,13 @@ impl PictureBrowser {
                                 .border_color(rgb(0x30343d))
                                 .cursor_pointer()
                                 .child("Recognition maintenance")
-                                .child(div().text_xs().text_color(rgb(0x9da7b6)).child(format!(
-                                    "{:?} · rank {}{} · {} complete / {} failed · click to cancel{}",
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .truncate()
+                                        .text_color(rgb(0x9da7b6))
+                                        .child(format!(
+                                            "{:?} · rank {}{} · {} complete / {} failed · click to cancel{}",
                                     job.status,
                                     job.rank,
                                     if job.cancelled { " · cancelling" } else { "" },
@@ -8040,8 +8259,13 @@ impl PictureBrowser {
                             .border_color(rgb(0x30343d))
                             .cursor_pointer()
                             .child("People summary rebuild")
-                            .child(div().text_xs().text_color(rgb(0x9da7b6)).child(format!(
-                                "{:?} · rank {}{} · {} complete / {} failed · click to cancel{}",
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .truncate()
+                                    .text_color(rgb(0x9da7b6))
+                                    .child(format!(
+                                        "{:?} · rank {}{} · {} complete / {} failed · click to cancel{}",
                                 summary_job.status,
                                 summary_job.rank,
                                 if summary_job.cancelled {
@@ -9480,6 +9704,25 @@ impl Render for PictureBrowser {
                     )
                 },
             );
+        let admission = self.maintenance_admission.snapshot();
+        let held = admission
+            .active_rank
+            .map(|rank| format!("held (rank {rank})"))
+            .unwrap_or_else(|| "idle".to_owned());
+        let admission_summary = format!(
+            "background permit: {}{} · waiters {} · advertised {}",
+            held,
+            if admission.foreground_blocked {
+                format!(
+                    " · foreground gating ({} active)",
+                    admission.foreground_activities
+                )
+            } else {
+                String::new()
+            },
+            admission.waiters,
+            admission.advertised,
+        );
         let scheduler_jobs = self
             .job_queue_snapshot
             .jobs
@@ -9505,9 +9748,30 @@ impl Render for PictureBrowser {
         } else {
             0.0
         };
-        let main_width =
-            (f32::from(window.viewport_size().width) - self.sidebar_width - inspector_width - 29.0)
-                .max(self.thumbnail_width as f32);
+        // In Import mode the tree and splitter are hidden and the import
+        // view adds its own rails (sources 270 + options 320), so the grid
+        // width must be computed from the actual center pane.
+        let reserved_left = if self.directory_view_mode == DirectoryViewMode::Import {
+            0.0
+        } else {
+            self.sidebar_width
+        };
+        let reserved_right = if self.directory_view_mode == DirectoryViewMode::Import {
+            590.0
+        } else {
+            0.0
+        };
+        let inspector_width = if self.directory_view_mode == DirectoryViewMode::Import {
+            0.0
+        } else {
+            inspector_width
+        };
+        let main_width = (f32::from(window.viewport_size().width)
+            - reserved_left
+            - reserved_right
+            - inspector_width
+            - 29.0)
+            .max(self.thumbnail_width as f32);
         let menu_height = if USE_IN_WINDOW_MENU { 29.0 } else { 0.0 };
         let map_width = main_width.round().max(1.0) as u32;
         let map_height = (f32::from(window.viewport_size().height) - menu_height - 44.0)
@@ -9782,6 +10046,7 @@ impl Render for PictureBrowser {
                     DirectoryViewMode::Grid => grid_content,
                     DirectoryViewMode::Map => self.render_map_view(cx),
                     DirectoryViewMode::People => self.render_people_view(window, cx),
+                    DirectoryViewMode::Import => self.render_import_view(cx),
                 };
                 let content = div()
                     .size_full()
@@ -9875,250 +10140,252 @@ impl Render for PictureBrowser {
                 )
             }
         };
-        let main_view = div()
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .flex()
-            .flex_col()
-            .relative()
-            .track_focus(&self.main_focus)
-            .key_context("MainView")
-            .on_action(cx.listener(Self::open_selected_image))
-            .on_action(cx.listener(Self::close_image))
-            .on_action(cx.listener(Self::grid_left))
-            .on_action(cx.listener(Self::grid_right))
-            .on_action(cx.listener(Self::grid_up))
-            .on_action(cx.listener(Self::grid_down))
-            .on_action(cx.listener(Self::grid_extend_left))
-            .on_action(cx.listener(Self::grid_extend_right))
-            .on_action(cx.listener(Self::grid_extend_up))
-            .on_action(cx.listener(Self::grid_extend_down))
-            .bg(rgb(0x101217))
-            .child(
-                div()
-                    .h(px(44.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .px_4()
-                    .border_b_1()
-                    .border_color(rgb(0x30343d))
-                    .text_sm()
-                    .text_color(rgb(0xaeb4bf))
-                    .when(show_back, |this| {
-                        this.child(
+        let main_view =
+            div()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .flex()
+                .flex_col()
+                .relative()
+                .track_focus(&self.main_focus)
+                .key_context("MainView")
+                .on_action(cx.listener(Self::open_selected_image))
+                .on_action(cx.listener(Self::close_image))
+                .on_action(cx.listener(Self::grid_left))
+                .on_action(cx.listener(Self::grid_right))
+                .on_action(cx.listener(Self::grid_up))
+                .on_action(cx.listener(Self::grid_down))
+                .on_action(cx.listener(Self::grid_extend_left))
+                .on_action(cx.listener(Self::grid_extend_right))
+                .on_action(cx.listener(Self::grid_extend_up))
+                .on_action(cx.listener(Self::grid_extend_down))
+                .bg(rgb(0x101217))
+                .child(
+                    div()
+                        .h(px(44.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .px_4()
+                        .border_b_1()
+                        .border_color(rgb(0x30343d))
+                        .text_sm()
+                        .text_color(rgb(0xaeb4bf))
+                        .when(show_back, |this| {
+                            this.child(
+                                div()
+                                    .id("back-to-directory")
+                                    .mr_3()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .bg(rgb(0x30343d))
+                                    .hover(|this| this.bg(rgb(0x445066)))
+                                    .child("← Back")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.close_image(&CloseImage, window, cx);
+                                    })),
+                            )
+                        })
+                        .child(title)
+                        .child(div().flex_1())
+                        .when(
+                            !show_back
+                                && self.settings.map_switcher_placement
+                                    == config::MapSwitcherPlacement::Header,
+                            |this| {
+                                this.child(
+                                    div()
+                                        .flex()
+                                        .mr_3()
+                                        .rounded_sm()
+                                        .bg(rgb(0x252932))
+                                        .child(
+                                            div()
+                                                .id("show-grid-view")
+                                                .debug_selector(|| "#show-grid-view".to_owned())
+                                                .tab_index(0)
+                                                .px_3()
+                                                .py_1()
+                                                .rounded_sm()
+                                                .bg(rgb(
+                                                    if self.directory_view_mode
+                                                        == DirectoryViewMode::Grid
+                                                    {
+                                                        0x46658c
+                                                    } else {
+                                                        0x30343d
+                                                    },
+                                                ))
+                                                .child("Grid")
+                                                .on_key_down(cx.listener(
+                                                    |this, event: &gpui::KeyDownEvent, _, cx| {
+                                                        if matches!(
+                                                            event.keystroke.key.as_str(),
+                                                            "enter" | "space"
+                                                        ) {
+                                                            this.set_directory_view_mode(
+                                                                DirectoryViewMode::Grid,
+                                                                cx,
+                                                            );
+                                                            cx.stop_propagation();
+                                                        }
+                                                    },
+                                                ))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.set_directory_view_mode(
+                                                        DirectoryViewMode::Grid,
+                                                        cx,
+                                                    );
+                                                })),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("show-map-view")
+                                                .debug_selector(|| "#show-map-view".to_owned())
+                                                .tab_index(0)
+                                                .px_3()
+                                                .py_1()
+                                                .rounded_sm()
+                                                .bg(rgb(
+                                                    if self.directory_view_mode
+                                                        == DirectoryViewMode::Map
+                                                    {
+                                                        0x46658c
+                                                    } else {
+                                                        0x30343d
+                                                    },
+                                                ))
+                                                .child("Map")
+                                                .on_key_down(cx.listener(
+                                                    |this, event: &gpui::KeyDownEvent, _, cx| {
+                                                        if matches!(
+                                                            event.keystroke.key.as_str(),
+                                                            "enter" | "space"
+                                                        ) {
+                                                            this.set_directory_view_mode(
+                                                                DirectoryViewMode::Map,
+                                                                cx,
+                                                            );
+                                                            cx.stop_propagation();
+                                                        }
+                                                    },
+                                                ))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.set_directory_view_mode(
+                                                        DirectoryViewMode::Map,
+                                                        cx,
+                                                    );
+                                                })),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("show-people-view")
+                                                .debug_selector(|| "#show-people-view".to_owned())
+                                                .tab_index(0)
+                                                .track_focus(&self.people_view_switch_focus)
+                                                .px_3()
+                                                .py_1()
+                                                .rounded_sm()
+                                                .bg(rgb(
+                                                    if self.directory_view_mode
+                                                        == DirectoryViewMode::People
+                                                    {
+                                                        0x46658c
+                                                    } else {
+                                                        0x30343d
+                                                    },
+                                                ))
+                                                .child("People")
+                                                .on_key_down(cx.listener(
+                                                    |this, event: &gpui::KeyDownEvent, _, cx| {
+                                                        if matches!(
+                                                            event.keystroke.key.as_str(),
+                                                            "enter" | "space"
+                                                        ) {
+                                                            this.set_directory_view_mode(
+                                                                DirectoryViewMode::People,
+                                                                cx,
+                                                            );
+                                                            cx.stop_propagation();
+                                                        }
+                                                    },
+                                                ))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.set_directory_view_mode(
+                                                        DirectoryViewMode::People,
+                                                        cx,
+                                                    );
+                                                })),
+                                        ),
+                                )
+                            },
+                        )
+                        .child(
                             div()
-                                .id("back-to-directory")
-                                .mr_3()
+                                .id("toggle-developed")
+                                .debug_selector(|| "#toggle-developed".to_owned())
                                 .px_2()
                                 .py_1()
                                 .rounded_sm()
-                                .bg(rgb(0x30343d))
+                                .bg(rgb(if has_active_recipe {
+                                    0x36547a
+                                } else {
+                                    0x30343d
+                                }))
                                 .hover(|this| this.bg(rgb(0x445066)))
-                                .child("← Back")
+                                .child(if has_active_recipe {
+                                    "Developed"
+                                } else if self.developed {
+                                    "Baseline (no adjustments)"
+                                } else {
+                                    "Baseline"
+                                })
                                 .on_click(cx.listener(|this, _, window, cx| {
-                                    this.close_image(&CloseImage, window, cx);
+                                    this.toggle_developed(&ToggleDeveloped, window, cx);
                                 })),
-                        )
-                    })
-                    .child(title)
-                    .child(div().flex_1())
-                    .when(
-                        !show_back
-                            && self.settings.map_switcher_placement
-                                == config::MapSwitcherPlacement::Header,
-                        |this| {
-                            this.child(
-                                div()
-                                    .flex()
-                                    .mr_3()
-                                    .rounded_sm()
-                                    .bg(rgb(0x252932))
-                                    .child(
-                                        div()
-                                            .id("show-grid-view")
-                                            .debug_selector(|| "#show-grid-view".to_owned())
-                                            .tab_index(0)
-                                            .px_3()
-                                            .py_1()
-                                            .rounded_sm()
-                                            .bg(rgb(
-                                                if self.directory_view_mode
-                                                    == DirectoryViewMode::Grid
-                                                {
-                                                    0x46658c
-                                                } else {
-                                                    0x30343d
-                                                },
-                                            ))
-                                            .child("Grid")
-                                            .on_key_down(cx.listener(
-                                                |this, event: &gpui::KeyDownEvent, _, cx| {
-                                                    if matches!(
-                                                        event.keystroke.key.as_str(),
-                                                        "enter" | "space"
-                                                    ) {
-                                                        this.set_directory_view_mode(
-                                                            DirectoryViewMode::Grid,
-                                                            cx,
-                                                        );
-                                                        cx.stop_propagation();
-                                                    }
-                                                },
-                                            ))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.set_directory_view_mode(
-                                                    DirectoryViewMode::Grid,
-                                                    cx,
-                                                );
-                                            })),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("show-map-view")
-                                            .debug_selector(|| "#show-map-view".to_owned())
-                                            .tab_index(0)
-                                            .px_3()
-                                            .py_1()
-                                            .rounded_sm()
-                                            .bg(rgb(
-                                                if self.directory_view_mode
-                                                    == DirectoryViewMode::Map
-                                                {
-                                                    0x46658c
-                                                } else {
-                                                    0x30343d
-                                                },
-                                            ))
-                                            .child("Map")
-                                            .on_key_down(cx.listener(
-                                                |this, event: &gpui::KeyDownEvent, _, cx| {
-                                                    if matches!(
-                                                        event.keystroke.key.as_str(),
-                                                        "enter" | "space"
-                                                    ) {
-                                                        this.set_directory_view_mode(
-                                                            DirectoryViewMode::Map,
-                                                            cx,
-                                                        );
-                                                        cx.stop_propagation();
-                                                    }
-                                                },
-                                            ))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.set_directory_view_mode(
-                                                    DirectoryViewMode::Map,
-                                                    cx,
-                                                );
-                                            })),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .id("show-people-view")
-                                    .debug_selector(|| "#show-people-view".to_owned())
-                                    .tab_index(0)
-                                    .track_focus(&self.people_view_switch_focus)
-                                    .px_3()
-                                    .py_1()
-                                    .rounded_sm()
-                                    .bg(rgb(
-                                        if self.directory_view_mode == DirectoryViewMode::People {
-                                            0x46658c
-                                        } else {
-                                            0x30343d
-                                        },
-                                    ))
-                                    .child("People")
-                                    .on_key_down(cx.listener(
-                                        |this, event: &gpui::KeyDownEvent, _, cx| {
-                                            if matches!(
-                                                event.keystroke.key.as_str(),
-                                                "enter" | "space"
-                                            ) {
-                                                this.set_directory_view_mode(
-                                                    DirectoryViewMode::People,
-                                                    cx,
-                                                );
-                                                cx.stop_propagation();
-                                            }
-                                        },
-                                    ))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.set_directory_view_mode(DirectoryViewMode::People, cx);
-                                    })),
-                            )
-                        },
-                    )
-                    .child(
-                        div()
-                            .id("toggle-developed")
-                            .debug_selector(|| "#toggle-developed".to_owned())
-                            .px_2()
-                            .py_1()
-                            .rounded_sm()
-                            .bg(rgb(if has_active_recipe {
-                                0x36547a
-                            } else {
-                                0x30343d
-                            }))
-                            .hover(|this| this.bg(rgb(0x445066)))
-                            .child(if has_active_recipe {
-                                "Developed"
-                            } else if self.developed {
-                                "Baseline (no adjustments)"
-                            } else {
-                                "Baseline"
-                            })
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.toggle_developed(&ToggleDeveloped, window, cx);
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .text_color(rgb(0x8d96a5))
-                    .child(main_content),
-            )
-            .when(
-                !show_back
-                    && self.settings.map_switcher_placement
-                        == config::MapSwitcherPlacement::Floating,
-                |this| {
-                    this.child(
-                        div()
-                            .absolute()
-                            .bottom(px(18.0))
-                            .left_1_2()
-                            .flex()
-                            .p_1()
-                            .rounded_md()
-                            .bg(gpui::rgba(0x202630ee))
-                            .child(
-                                map_control("floating-grid-view", "Grid").on_click(cx.listener(
-                                    |this, _, _, cx| {
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .text_color(rgb(0x8d96a5))
+                        .child(main_content),
+                )
+                .when(
+                    !show_back
+                        && self.settings.map_switcher_placement
+                            == config::MapSwitcherPlacement::Floating,
+                    |this| {
+                        this.child(
+                            div()
+                                .absolute()
+                                .bottom(px(18.0))
+                                .left_1_2()
+                                .flex()
+                                .p_1()
+                                .rounded_md()
+                                .bg(gpui::rgba(0x202630ee))
+                                .child(map_control("floating-grid-view", "Grid").on_click(
+                                    cx.listener(|this, _, _, cx| {
                                         this.set_directory_view_mode(DirectoryViewMode::Grid, cx);
-                                    },
-                                )),
-                            )
-                            .child(
-                                map_control("floating-map-view", "Map").on_click(cx.listener(
-                                    |this, _, _, cx| {
+                                    }),
+                                ))
+                                .child(map_control("floating-map-view", "Map").on_click(
+                                    cx.listener(|this, _, _, cx| {
                                         this.set_directory_view_mode(DirectoryViewMode::Map, cx);
-                                    },
+                                    }),
+                                ))
+                                .child(map_control("floating-people-view", "People").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.set_directory_view_mode(DirectoryViewMode::People, cx);
+                                    }),
                                 )),
-                            )
-                            .child(map_control("floating-people-view", "People").on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.set_directory_view_mode(DirectoryViewMode::People, cx);
-                                }),
-                            )),
-                    )
-                },
-            );
+                        )
+                    },
+                );
         let splitter = div()
             .id("sidebar-splitter")
             .debug_selector(|| "#sidebar-splitter".to_owned())
@@ -10155,8 +10422,10 @@ impl Render for PictureBrowser {
                     cx.notify();
                 }),
             )
-            .child(tree)
-            .child(splitter)
+            .when(
+                self.directory_view_mode != DirectoryViewMode::Import,
+                |this| this.child(tree).child(splitter),
+            )
             .child(main_view)
             .when_some(develop_inspector, |this, panel| this.child(panel))
             .when(self.show_job_queue, |this| {
@@ -10186,6 +10455,12 @@ impl Render for PictureBrowser {
                                         .text_xs()
                                         .text_color(rgb(0x778292))
                                         .child(durable_face_summary.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0x778292))
+                                        .child(admission_summary.clone()),
                                 )
                                 .child(div().text_xs().text_color(rgb(0x9da7b6)).child(format!(
                                     "{} running · {} queued",
@@ -10258,7 +10533,10 @@ impl Render for PictureBrowser {
                         ),
                 )
             });
-        let progress_active = self.work.active > 0 || scheduler_jobs > 0 || self.map_job.is_some();
+        // Import mode renders its own footer; the global strip's per-file
+        // render labels would only cover it up.
+        let progress_active = self.directory_view_mode != DirectoryViewMode::Import
+            && (self.work.active > 0 || scheduler_jobs > 0 || self.map_job.is_some());
         let progress = if let Some(inventory) = self.face_inventory_progress.fraction() {
             inventory.clamp(0.005, 1.0)
         } else if self.work.active > 0 {
@@ -10266,14 +10544,27 @@ impl Render for PictureBrowser {
         } else {
             0.35
         };
+        let inventory_label = self.face_inventory_progress.label();
+        // A merely-waiting inventory (stage 5) must not mask what renders are
+        // doing; once it actually runs (stages 1-4) it wins the strip.
+        let inventory_running = self.face_inventory_progress.stage.load(Ordering::Acquire) != 5;
         let progress_label = self
             .map_job
             .as_ref()
             .map(map_job_progress_label)
-            .or_else(|| self.face_inventory_progress.label())
+            .or_else(|| inventory_running.then(|| inventory_label.clone()).flatten())
             .or_else(|| scheduler_progress_label(&self.job_queue_snapshot))
+            .or_else(|| (!inventory_running).then_some(inventory_label).flatten())
+            .or_else(|| {
+                let diagnostics = self.people_diagnostics.as_ref().and_then(|result| {
+                    result.as_ref().ok().map(|diagnostics| {
+                        (diagnostics.indexed_assets, diagnostics.analysis_pending)
+                    })
+                });
+                face_queue_progress_label(&self.face_job_queue_snapshot, diagnostics)
+            })
             .or_else(|| self.work.current_activity().map(str::to_owned))
-            .unwrap_or_else(|| "Finishing background work…".to_owned());
+            .unwrap_or_else(|| "Running background tasks…".to_owned());
         let menu_bar = div()
             .h(px(30.0))
             .w_full()
@@ -10391,7 +10682,7 @@ impl Render for PictureBrowser {
         let settings_dialog = self
             .settings_draft
             .clone()
-            .map(|draft| render_settings_dialog(draft, self.settings_status.clone(), cx));
+            .map(|draft| self.render_settings_dialog(draft, self.settings_status.clone(), cx));
         let cache_statistics_dialog = self.show_cache_statistics.then(|| {
             render_cache_statistics_dialog(
                 self.render_pipeline.stats(),
@@ -10423,6 +10714,7 @@ impl Render for PictureBrowser {
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::open_cache_statistics))
             .on_action(cx.listener(Self::import_lightroom))
+            .on_action(cx.listener(Self::import_photos))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
@@ -10454,6 +10746,22 @@ impl Render for PictureBrowser {
                         .text_color(rgb(0xd8dde7))
                         .border_1()
                         .border_color(rgb(0x30343d))
+                        .child(
+                            div()
+                                .id("import-photos-menu-item")
+                                .debug_selector(|| "#import-photos-menu-item".to_owned())
+                                .h(px(28.0))
+                                .px_2()
+                                .flex()
+                                .items_center()
+                                .rounded_sm()
+                                .text_sm()
+                                .hover(|this| this.bg(rgb(0x3b4658)))
+                                .child("Import Photos…")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.import_photos(&ImportPhotos, window, cx);
+                                })),
+                        )
                         .child(
                             div()
                                 .id("import-lightroom-menu-item")
@@ -10812,410 +11120,541 @@ fn map_control(id: &'static str, label: &'static str) -> gpui::Stateful<gpui::Di
         .child(label)
 }
 
-fn render_settings_dialog(
-    draft: AppSettings,
-    status: Option<String>,
-    cx: &mut Context<PictureBrowser>,
-) -> gpui::Div {
-    let preference = draft.pair_preference;
-    div()
+impl PictureBrowser {
+    fn render_settings_dialog(
+        &self,
+        draft: AppSettings,
+        status: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let preference = draft.pair_preference;
+        div()
         .absolute()
         .inset_0()
         .occlude()
         .bg(gpui::rgba(0x00000099))
         .flex()
-        .items_center()
-        .justify_center()
+        .flex_col()
+        .p_4()
         .child(
             div()
-                .id("settings-dialog-panel")
-                .w(px(620.0))
-                .max_h(px(860.0))
-                .p_5()
-                .rounded_md()
-                .bg(rgb(0x252932))
-                .text_color(rgb(0xd8dde7))
-                .border_1()
-                .border_color(rgb(0x4a5260))
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
                 .child(
                     div()
+                        .id("settings-dialog-panel")
+                        .w(px(620.0))
+                        .max_h(px(860.0))
+                        .min_h_0()
                         .flex()
-                        .items_center()
-                        .mb_2()
-                        .child(div().text_xl().child("Settings"))
-                        .child(div().flex_1())
+                        .flex_col()
+                        .p_5()
+                        .rounded_md()
+                        .bg(rgb(0x252932))
+                        .text_color(rgb(0xd8dde7))
+                        .border_1()
+                        .border_color(rgb(0x4a5260))
                         .child(
                             div()
-                                .id("settings-cancel")
-                                .debug_selector(|| "#settings-cancel".to_owned())
-                                .px_3()
-                                .py_1()
-                                .rounded_sm()
-                                .bg(rgb(0x343943))
-                                .child("Cancel")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.settings_draft = None;
-                                    this.settings_status = None;
-                                    cx.notify();
-                                })),
+                                .flex()
+                                .items_center()
+                                .mb_2()
+                                .child(div().text_xl().child("Settings")),
                         )
                         .child(
                             div()
-                                .id("settings-save")
-                                .debug_selector(|| "#settings-save".to_owned())
-                                .ml_2()
-                                .px_3()
-                                .py_1()
-                                .rounded_sm()
-                                .bg(rgb(0x315b8f))
-                                .child("Save")
-                                .on_click(cx.listener(|this, _, _, cx| this.save_settings(cx))),
-                        ),
-                )
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(rgb(0x9da7b6))
-                        .mb_3()
-                        .child(
-                            "Image cache size applies immediately. Worker, cache directory, and library changes require a restart.",
-                        ),
-                )
-                .child(
-                    div()
-                        .py_2()
-                        .border_b_1()
-                        .border_color(rgb(0x30343d))
-                        .child("Picture library")
+                                .text_sm()
+                                .text_color(rgb(0x9da7b6))
+                                .mb_2()
+                                .child(
+                                    "Image cache size applies immediately. Worker, cache directory, and library changes require a restart.",
+                                ),
+                        )
                         .child(
                             div()
-                                .mt_1()
-                                .flex()
-                                .items_center()
-                                .justify_between()
+                                .flex_1()
+                                .min_h_0()
+                                .relative()
                                 .child(
                                     div()
-                                        .max_w(px(470.0))
-                                        .truncate()
-                                        .text_sm()
-                                        .text_color(rgb(0xb7bfcc))
-                                        .child(draft.root.to_string_lossy().into_owned()),
+                                        .id("settings-rows")
+                                        .size_full()
+                                        .flex()
+                                        .flex_col()
+                                        .overflow_y_scroll()
+                                        .track_scroll(&self.settings_scroll)
+                                .child(
+                                    div()
+                                        .py_2()
+                                        .border_b_1()
+                                        .border_color(rgb(0x30343d))
+                                        .child("Picture library")
+                                        .child(
+                                            div()
+                                                .mt_1()
+                                                .flex()
+                                                .items_center()
+                                                .justify_between()
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .min_w_0()
+                                                        .mr_2()
+                                                        .truncate()
+                                                        .text_sm()
+                                                        .text_color(rgb(0xb7bfcc))
+                                                        .child(
+                                                            draft.root.to_string_lossy().into_owned(),
+                                                        ),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .id("settings-browse-root")
+                                                        .debug_selector(|| {
+                                                            "#settings-browse-root".to_owned()
+                                                        })
+                                                        .px_3()
+                                                        .py_1()
+                                                        .rounded_sm()
+                                                        .bg(rgb(0x343943))
+                                                        .hover(|this| this.bg(rgb(0x465064)))
+                                                        .child("Browse…")
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.choose_settings_directory(true, cx);
+                                                        })),
+                                                ),
+                                        ),
+                                )
+                                .child(settings_number_row(
+                                    "Image cache entries",
+                                    draft.image_cache_size,
+                                    SettingsNumber::ImageCacheSize,
+                                    cx,
+                                ))
+                                .child(settings_number_row(
+                                    "Worker threads",
+                                    draft.job_parallelism,
+                                    SettingsNumber::JobParallelism,
+                                    cx,
+                                ))
+                                .child(settings_number_row(
+                                    "RAW worker threads",
+                                    draft.raw_parallelism,
+                                    SettingsNumber::RawParallelism,
+                                    cx,
+                                ))
+                                .child(settings_number_row(
+                                    "Face-analysis workers",
+                                    draft.face_workers,
+                                    SettingsNumber::FaceWorkers,
+                                    cx,
+                                ))
+                                .child(settings_number_row(
+                                    "Face worker memory allowance (MiB)",
+                                    draft.face_worker_memory_bytes.div_ceil(1024 * 1024) as usize,
+                                    SettingsNumber::FaceMemoryMiB,
+                                    cx,
+                                ))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .py_2()
+                                        .border_b_1()
+                                        .border_color(rgb(0x30343d))
+                                        .child("Automatic face analysis")
+                                        .child(
+                                            div()
+                                                .id("settings-automatic-face-analysis")
+                                                .px_3()
+                                                .py_1()
+                                                .rounded_sm()
+                                                .bg(rgb(0x343943))
+                                                .cursor_pointer()
+                                                .child(if draft.automatic_face_analysis {
+                                                    "Enabled"
+                                                } else {
+                                                    "Disabled"
+                                                })
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    if let Some(draft) = &mut this.settings_draft {
+                                                        draft.automatic_face_analysis =
+                                                            !draft.automatic_face_analysis;
+                                                    }
+                                                    cx.notify();
+                                                })),
+                                        ),
                                 )
                                 .child(
                                     div()
-                                        .id("settings-browse-root")
-                                        .debug_selector(|| "#settings-browse-root".to_owned())
-                                        .px_3()
-                                        .py_1()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .py_2()
+                                        .border_b_1()
+                                        .border_color(rgb(0x30343d))
+                                        .child("Face-crop disk cache")
+                                        .child(
+                                            div()
+                                                .id("settings-face-crop-disk-cache")
+                                                .px_3()
+                                                .py_1()
+                                                .rounded_sm()
+                                                .bg(rgb(0x343943))
+                                                .cursor_pointer()
+                                                .child(match draft.face_crop_disk_cache {
+                                                    config::FaceCropDiskCachePolicy::MemoryOnly => {
+                                                        "Memory only"
+                                                    }
+                                                    config::FaceCropDiskCachePolicy::Disk => {
+                                                        "Local disk"
+                                                    }
+                                                })
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    if let Some(draft) = &mut this.settings_draft {
+                                                        draft.face_crop_disk_cache =
+                                                            match draft.face_crop_disk_cache {
+                                                                config::FaceCropDiskCachePolicy::MemoryOnly => config::FaceCropDiskCachePolicy::Disk,
+                                                                config::FaceCropDiskCachePolicy::Disk => config::FaceCropDiskCachePolicy::MemoryOnly,
+                                                            };
+                                                    }
+                                                    cx.notify();
+                                                })),
+                                        ),
+                                )
+                                .child(settings_number_row(
+                                    "Downloaded map cache (GiB)",
+                                    draft.map_cache_bytes.div_ceil(1024_u64.pow(3)) as usize,
+                                    SettingsNumber::MapCacheGiB,
+                                    cx,
+                                ))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .py_2()
+                                        .border_b_1()
+                                        .border_color(rgb(0x30343d))
+                                        .child(
+                                            div()
+                                                .max_w(px(430.0))
+                                                .child("Online map detail")
+                                                .child(
+                                                    div()
+                                                        .mt_1()
+                                                        .text_xs()
+                                                        .text_color(rgb(0x9da7b6))
+                                                        .child("When enabled, only visible tile coordinates are sent to OpenFreeMap. Photos and metadata never leave Rekesz."),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("settings-online-map")
+                                                .debug_selector(|| "#settings-online-map".to_owned())
+                                                .px_3()
+                                                .py_1()
+                                                .rounded_sm()
+                                                .bg(rgb(0x343943))
+                                                .hover(|this| this.bg(rgb(0x465064)))
+                                                .child(match draft.online_map_permission {
+                                                    config::OnlineMapPermission::Enabled => "Enabled",
+                                                    config::OnlineMapPermission::Unknown
+                                                    | config::OnlineMapPermission::Disabled => {
+                                                        "Keep offline"
+                                                    }
+                                                })
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    let permission =
+                                                        if this.settings.online_map_permission
+                                                            == config::OnlineMapPermission::Enabled
+                                                        {
+                                                            config::OnlineMapPermission::Disabled
+                                                        } else {
+                                                            config::OnlineMapPermission::Enabled
+                                                        };
+                                                    this.set_online_map_permission(permission, cx);
+                                                })),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .py_2()
+                                        .border_b_1()
+                                        .border_color(rgb(0x30343d))
+                                        .child("Grid/Map switcher")
+                                        .child(
+                                            div()
+                                                .id("settings-map-switcher-placement")
+                                                .debug_selector(|| {
+                                                    "#settings-map-switcher-placement".to_owned()
+                                                })
+                                                .px_3()
+                                                .py_1()
+                                                .rounded_sm()
+                                                .bg(rgb(0x343943))
+                                                .hover(|this| this.bg(rgb(0x465064)))
+                                                .child(match draft.map_switcher_placement {
+                                                    config::MapSwitcherPlacement::Header => {
+                                                        "Top header"
+                                                    }
+                                                    config::MapSwitcherPlacement::Floating => {
+                                                        "Bottom floating"
+                                                    }
+                                                })
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    let placement =
+                                                        match this.settings.map_switcher_placement {
+                                                            config::MapSwitcherPlacement::Header => config::MapSwitcherPlacement::Floating,
+                                                            config::MapSwitcherPlacement::Floating => config::MapSwitcherPlacement::Header,
+                                                        };
+                                                    let mut settings = this.settings.clone();
+                                                    settings.map_switcher_placement = placement;
+                                                    if let Err(error) =
+                                                        config::save(&this.settings_path, &settings)
+                                                    {
+                                                        this.settings_status = Some(format!(
+                                                            "Could not save switcher placement: {error:#}"
+                                                        ));
+                                                    } else {
+                                                        this.settings = settings;
+                                                        if let Some(draft) =
+                                                            &mut this.settings_draft
+                                                        {
+                                                            draft.map_switcher_placement = placement;
+                                                        }
+                                                    }
+                                                    cx.notify();
+                                                })),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .py_2()
+                                        .border_b_1()
+                                        .border_color(rgb(0x30343d))
+                                        .child("RAW/JPEG pair preference")
+                                        .child(
+                                            div()
+                                                .id("settings-pair-preference")
+                                                .debug_selector(|| {
+                                                    "#settings-pair-preference".to_owned()
+                                                })
+                                                .px_3()
+                                                .py_1()
+                                                .rounded_sm()
+                                                .bg(rgb(0x343943))
+                                                .hover(|this| this.bg(rgb(0x465064)))
+                                                .child(match preference {
+                                                    config::PairPreference::Raw => "RAW",
+                                                    config::PairPreference::Jpeg => "JPEG",
+                                                })
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    if let Some(draft) = &mut this.settings_draft {
+                                                        draft.pair_preference =
+                                                            match draft.pair_preference {
+                                                                config::PairPreference::Raw => {
+                                                                    config::PairPreference::Jpeg
+                                                                }
+                                                                config::PairPreference::Jpeg => {
+                                                                    config::PairPreference::Raw
+                                                                }
+                                                            };
+                                                    }
+                                                    cx.notify();
+                                                })),
+                                        ),
+                                )
+                                .child(
+                                    div().py_2().child("Cache directory").child(
+                                        div()
+                                            .mt_1()
+                                            .flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .mr_2()
+                                                    .truncate()
+                                                    .text_sm()
+                                                    .text_color(rgb(0xb7bfcc))
+                                                    .child(
+                                                        draft.cache_root.to_string_lossy().into_owned(),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("settings-browse-cache")
+                                                    .debug_selector(|| {
+                                                        "#settings-browse-cache".to_owned()
+                                                    })
+                                                    .px_3()
+                                                    .py_1()
+                                                    .rounded_sm()
+                                                    .bg(rgb(0x343943))
+                                                    .hover(|this| this.bg(rgb(0x465064)))
+                                                    .child("Browse…")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.choose_settings_directory(false, cx);
+                                                    })),
+                                            ),
+                                    ),
+                                ),
+                                ),
+                            )
+                            .child(self.render_settings_scrollbar(cx)),
+                        )
+                        .when_some(status, |this, status| {
+                            this.child(
+                                div()
+                                    .mt_2()
+                                    .text_sm()
+                                    .text_color(rgb(0xf2b8b5))
+                                    .child(status),
+                            )
+                        })
+                        .child(
+                            div()
+                                .mt_4()
+                                .flex()
+                                .items_center()
+                                .justify_end()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .id("settings-cancel")
+                                        .flex_shrink_0()
+                                        .whitespace_nowrap()
+                                        .debug_selector(|| "#settings-cancel".to_owned())
+                                        .px_4()
+                                        .py_2()
                                         .rounded_sm()
                                         .bg(rgb(0x343943))
                                         .hover(|this| this.bg(rgb(0x465064)))
-                                        .child("Browse…")
+                                        .child("Cancel")
                                         .on_click(cx.listener(|this, _, _, cx| {
-                                            this.choose_settings_directory(true, cx);
+                                            this.settings_draft = None;
+                                            this.settings_status = None;
+                                            cx.notify();
                                         })),
-                                ),
-                        ),
-                )
-                .child(settings_number_row(
-                    "Image cache entries",
-                    draft.image_cache_size,
-                    SettingsNumber::ImageCacheSize,
-                    cx,
-                ))
-                .child(settings_number_row(
-                    "Worker threads",
-                    draft.job_parallelism,
-                    SettingsNumber::JobParallelism,
-                    cx,
-                ))
-                .child(settings_number_row(
-                    "RAW worker threads",
-                    draft.raw_parallelism,
-                    SettingsNumber::RawParallelism,
-                    cx,
-                ))
-                .child(settings_number_row(
-                    "Face-analysis workers",
-                    draft.face_workers,
-                    SettingsNumber::FaceWorkers,
-                    cx,
-                ))
-                .child(settings_number_row(
-                    "Face worker memory allowance (MiB)",
-                    draft.face_worker_memory_bytes.div_ceil(1024 * 1024) as usize,
-                    SettingsNumber::FaceMemoryMiB,
-                    cx,
-                ))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .py_2()
-                        .border_b_1()
-                        .border_color(rgb(0x30343d))
-                        .child("Automatic face analysis")
-                        .child(
-                            div()
-                                .id("settings-automatic-face-analysis")
-                                .px_3()
-                                .py_1()
-                                .rounded_sm()
-                                .bg(rgb(0x343943))
-                                .cursor_pointer()
-                                .child(if draft.automatic_face_analysis {
-                                    "Enabled"
-                                } else {
-                                    "Disabled"
-                                })
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if let Some(draft) = &mut this.settings_draft {
-                                        draft.automatic_face_analysis =
-                                            !draft.automatic_face_analysis;
-                                    }
-                                    cx.notify();
-                                })),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .py_2()
-                        .border_b_1()
-                        .border_color(rgb(0x30343d))
-                        .child("Face-crop disk cache")
-                        .child(
-                            div()
-                                .id("settings-face-crop-disk-cache")
-                                .px_3()
-                                .py_1()
-                                .rounded_sm()
-                                .bg(rgb(0x343943))
-                                .cursor_pointer()
-                                .child(match draft.face_crop_disk_cache {
-                                    config::FaceCropDiskCachePolicy::MemoryOnly => "Memory only",
-                                    config::FaceCropDiskCachePolicy::Disk => "Local disk",
-                                })
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if let Some(draft) = &mut this.settings_draft {
-                                        draft.face_crop_disk_cache = match draft.face_crop_disk_cache {
-                                            config::FaceCropDiskCachePolicy::MemoryOnly => config::FaceCropDiskCachePolicy::Disk,
-                                            config::FaceCropDiskCachePolicy::Disk => config::FaceCropDiskCachePolicy::MemoryOnly,
-                                        };
-                                    }
-                                    cx.notify();
-                                })),
-                        ),
-                )
-                .child(settings_number_row(
-                    "Downloaded map cache (GiB)",
-                    draft.map_cache_bytes.div_ceil(1024_u64.pow(3)) as usize,
-                    SettingsNumber::MapCacheGiB,
-                    cx,
-                ))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .py_2()
-                        .border_b_1()
-                        .border_color(rgb(0x30343d))
-                        .child(
-                            div()
-                                .max_w(px(430.0))
-                                .child("Online map detail")
+                                )
                                 .child(
                                     div()
-                                        .mt_1()
-                                        .text_xs()
-                                        .text_color(rgb(0x9da7b6))
-                                        .child("When enabled, only visible tile coordinates are sent to OpenFreeMap. Photos and metadata never leave Rekesz."),
+                                        .id("settings-save")
+                                        .debug_selector(|| "#settings-save".to_owned())
+                                        .flex_shrink_0()
+                                        .whitespace_nowrap()
+                                        .px_4()
+                                        .py_2()
+                                        .rounded_sm()
+                                        .bg(rgb(0x315b8f))
+                                        .hover(|this| this.bg(rgb(0x3d6fa9)))
+                                        .child("Save")
+                                        .on_click(cx.listener(|this, _, _, cx| this.save_settings(cx))),
                                 ),
-                        )
-                        .child(
-                            div()
-                                .id("settings-online-map")
-                                .debug_selector(|| "#settings-online-map".to_owned())
-                                .px_3()
-                                .py_1()
-                                .rounded_sm()
-                                .bg(rgb(0x343943))
-                                .hover(|this| this.bg(rgb(0x465064)))
-                                .child(match draft.online_map_permission {
-                                    config::OnlineMapPermission::Enabled => "Enabled",
-                                    config::OnlineMapPermission::Unknown
-                                    | config::OnlineMapPermission::Disabled => "Keep offline",
-                                })
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    let permission = if this.settings.online_map_permission
-                                        == config::OnlineMapPermission::Enabled
-                                    {
-                                        config::OnlineMapPermission::Disabled
-                                    } else {
-                                        config::OnlineMapPermission::Enabled
-                                    };
-                                    this.set_online_map_permission(permission, cx);
-                                })),
                         ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .py_2()
-                        .border_b_1()
-                        .border_color(rgb(0x30343d))
-                        .child("Grid/Map switcher")
-                        .child(
-                            div()
-                                .id("settings-map-switcher-placement")
-                                .debug_selector(|| {
-                                    "#settings-map-switcher-placement".to_owned()
-                                })
-                                .px_3()
-                                .py_1()
-                                .rounded_sm()
-                                .bg(rgb(0x343943))
-                                .hover(|this| this.bg(rgb(0x465064)))
-                                .child(match draft.map_switcher_placement {
-                                    config::MapSwitcherPlacement::Header => "Top header",
-                                    config::MapSwitcherPlacement::Floating => "Bottom floating",
-                                })
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    let placement = match this.settings.map_switcher_placement {
-                                        config::MapSwitcherPlacement::Header => config::MapSwitcherPlacement::Floating,
-                                        config::MapSwitcherPlacement::Floating => config::MapSwitcherPlacement::Header,
-                                    };
-                                    let mut settings = this.settings.clone();
-                                    settings.map_switcher_placement = placement;
-                                    if let Err(error) = config::save(&this.settings_path, &settings) {
-                                        this.settings_status = Some(format!("Could not save switcher placement: {error:#}"));
-                                    } else {
-                                        this.settings = settings;
-                                        if let Some(draft) = &mut this.settings_draft {
-                                            draft.map_switcher_placement = placement;
-                                        }
-                                    }
-                                    cx.notify();
-                                })),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .py_2()
-                        .border_b_1()
-                        .border_color(rgb(0x30343d))
-                        .child("RAW/JPEG pair preference")
-                        .child(
-                            div()
-                                .id("settings-pair-preference")
-                                .debug_selector(|| "#settings-pair-preference".to_owned())
-                                .px_3()
-                                .py_1()
-                                .rounded_sm()
-                                .bg(rgb(0x343943))
-                                .hover(|this| this.bg(rgb(0x465064)))
-                                .child(match preference {
-                                    config::PairPreference::Raw => "RAW",
-                                    config::PairPreference::Jpeg => "JPEG",
-                                })
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if let Some(draft) = &mut this.settings_draft {
-                                        draft.pair_preference = match draft.pair_preference {
-                                            config::PairPreference::Raw => {
-                                                config::PairPreference::Jpeg
-                                            }
-                                            config::PairPreference::Jpeg => {
-                                                config::PairPreference::Raw
-                                            }
-                                        };
-                                    }
-                                    cx.notify();
-                                })),
-                        ),
-                )
-                .child(
-                    div().py_2().child("Cache directory").child(
-                        div()
-                            .mt_1()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .max_w(px(470.0))
-                                    .truncate()
-                                    .text_sm()
-                                    .text_color(rgb(0xb7bfcc))
-                                    .child(draft.cache_root.to_string_lossy().into_owned()),
-                            )
-                            .child(
-                                div()
-                                    .id("settings-browse-cache")
-                                    .debug_selector(|| "#settings-browse-cache".to_owned())
-                                    .px_3()
-                                    .py_1()
-                                    .rounded_sm()
-                                    .bg(rgb(0x343943))
-                                    .hover(|this| this.bg(rgb(0x465064)))
-                                    .child("Browse…")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.choose_settings_directory(false, cx);
-                                    })),
-                            ),
-                    ),
-                )
-                .when_some(status, |this, status| {
-                    this.child(
-                        div()
-                            .mt_2()
-                            .text_sm()
-                            .text_color(rgb(0xf2b8b5))
-                            .child(status),
-                    )
-                })
-                .child(
-                    div()
-                        .mt_4()
-                        .flex()
-                        .justify_end()
-                        .gap_2()
-                        .child(
-                            div()
-                                .id("settings-cancel-bottom")
-                                .px_4()
-                                .py_2()
-                                .rounded_sm()
-                                .bg(rgb(0x343943))
-                                .hover(|this| this.bg(rgb(0x465064)))
-                                .child("Cancel")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.settings_draft = None;
-                                    this.settings_status = None;
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            div()
-                                .id("settings-save-bottom")
-                                .px_4()
-                                .py_2()
-                                .rounded_sm()
-                                .bg(rgb(0x315b8f))
-                                .hover(|this| this.bg(rgb(0x3d6fa9)))
-                                .child("Save")
-                                .on_click(cx.listener(|this, _, _, cx| this.save_settings(cx))),
-                        ),
-                ),
         )
+    }
+
+    /// Thin scrollbar thumb for the settings dialog's row area. Position
+    /// reflects the handle's offset; dragging it scrolls the rows.
+    fn render_settings_scrollbar(&self, cx: &mut Context<Self>) -> AnyElement {
+        const MIN_THUMB_HEIGHT: f32 = 28.0;
+        let handle = self.settings_scroll.clone();
+        let viewport = handle.bounds();
+        let viewport_height = viewport.size.height;
+        let max_offset = handle.max_offset().height;
+        if viewport_height <= px(0.0) || max_offset <= px(0.0) {
+            return div().into_any_element();
+        }
+        let content_height = viewport_height + max_offset;
+        let thumb_height = (viewport_height * (viewport_height / content_height))
+            .clamp(px(MIN_THUMB_HEIGHT), viewport_height);
+        let travel = (viewport_height - thumb_height).max(px(0.0));
+        let scroll_offset = (-handle.offset().y).clamp(px(0.0), max_offset);
+        let thumb_top = travel * (scroll_offset / max_offset);
+        let entity = cx.entity();
+        div()
+            .id("settings-scrollbar")
+            .absolute()
+            .top(thumb_top)
+            .right_1()
+            .w(px(8.0))
+            .h(thumb_height)
+            .rounded_lg()
+            .bg(rgb(0x596273))
+            .hover(|this| this.bg(rgb(0x788397)))
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    move |thumb_bounds, _, window, _| {
+                        window.on_mouse_event({
+                            let entity = entity.clone();
+                            move |event: &MouseDownEvent, _, _, cx| {
+                                if !thumb_bounds.contains(&event.position) {
+                                    return;
+                                }
+                                entity.update(cx, |this, _| {
+                                    this.scrollbar_drag = Some(ScrollbarDrag {
+                                        target: ScrollbarTarget::Settings,
+                                        pointer_offset: event.position.y - thumb_bounds.origin.y,
+                                    });
+                                });
+                            }
+                        });
+                        window.on_mouse_event({
+                            let entity = entity.clone();
+                            move |_: &MouseUpEvent, _, _, cx| {
+                                entity.update(cx, |this, _| {
+                                    if this.scrollbar_drag.is_some_and(|drag| {
+                                        drag.target == ScrollbarTarget::Settings
+                                    }) {
+                                        this.scrollbar_drag = None;
+                                    }
+                                });
+                            }
+                        });
+                        window.on_mouse_event(move |event: &MouseMoveEvent, _, _, cx| {
+                            if !event.dragging() {
+                                return;
+                            }
+                            let Some(drag) = entity
+                                .read(cx)
+                                .scrollbar_drag
+                                .filter(|drag| drag.target == ScrollbarTarget::Settings)
+                            else {
+                                return;
+                            };
+                            let thumb_top =
+                                (event.position.y - viewport.origin.y - drag.pointer_offset)
+                                    .clamp(px(0.0), travel);
+                            let offset = if travel > px(0.0) {
+                                max_offset * (thumb_top / travel)
+                            } else {
+                                px(0.0)
+                            };
+                            handle.set_offset(point(px(0.0), -offset));
+                            cx.notify(entity.entity_id());
+                        });
+                    },
+                )
+                .size_full(),
+            )
+            .into_any_element()
+    }
 }
 
 fn render_cache_statistics_dialog(
@@ -11524,6 +11963,14 @@ fn bgra_to_rgba(pixels: &mut [u8]) {
 #[cfg(not(test))]
 fn main() -> Result<()> {
     let config = config::from_env()?;
+    trace::init(&config.settings.cache_root);
+    trace::slow_event(&format!(
+        "startup: library {} · render workers {} · raw workers {} · face workers {}",
+        config.settings.root.display(),
+        config.settings.job_parallelism,
+        config.settings.raw_parallelism,
+        config.settings.face_workers,
+    ));
     rendering::assert_hevc_decoder_available()?;
     Application::new().run(move |cx: &mut App| {
         bind_picture_browser_keys(cx);
@@ -11531,6 +11978,7 @@ fn main() -> Result<()> {
             Menu {
                 name: "File".into(),
                 items: vec![
+                    MenuItem::action("Import Photos…", ImportPhotos),
                     MenuItem::action("Import Lightroom Catalog…", ImportLightroom),
                     MenuItem::action("Cache Statistics…", OpenCacheStatistics),
                     MenuItem::action("Settings…", OpenSettings),
@@ -11578,6 +12026,7 @@ fn bind_picture_browser_keys(cx: &mut App) {
         KeyBinding::new("shift-down", GridExtendDown, Some("MainView")),
         KeyBinding::new("ctrl-shift-j", ToggleJobQueue, None),
         KeyBinding::new("d", ToggleDeveloped, Some("MainView")),
+        KeyBinding::new("enter", ImportNewFolderConfirm, Some("ImportNewFolder")),
     ]);
 }
 

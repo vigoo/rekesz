@@ -604,7 +604,7 @@ fn has_extension(path: &Path, expected: &[&str]) -> bool {
     })
 }
 
-fn is_supported_image(path: &Path) -> bool {
+pub(crate) fn is_supported_image(path: &Path) -> bool {
     image::ImageFormat::from_path(path).is_ok()
         || crate::formats::is_raw(path)
         || crate::formats::is_heif(path)

@@ -577,3 +577,33 @@ fn one_worker_checkpoint_does_not_yield_to_its_own_queued_job() {
         "a sole worker must finish its active job before it can run its own queued priority job"
     );
 }
+
+#[test]
+fn rank_1000_waiter_acquires_despite_long_aged_backlog_advertisement() {
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    let admission = MaintenanceAdmission::new();
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // A scheduler advertising a queued job whose enqueue time predates the
+    // aging cap: its aged rank saturates below the rank-1000 inventory, so
+    // the inventory must acquire instead of wedging against the
+    // advertisement.
+    admission.advertise(7, Some((200, Instant::now() - Duration::from_secs(1200))));
+    let (sender, receiver) = std::sync::mpsc::channel();
+    {
+        let admission = admission.clone();
+        let cancelled = Arc::clone(&cancelled);
+        std::thread::spawn(move || {
+            let outcome = admission.run_maintenance(1000, &cancelled, || 42);
+            let _ = sender.send(outcome);
+        });
+    }
+    // A regression (unbounded aging) wedges the acquire forever; fail the
+    // test instead of hanging the suite.
+    let outcome = receiver
+        .recv_timeout(Duration::from_secs(10))
+        .expect("rank-1000 acquire must not wedge against an aged backlog");
+    assert_eq!(outcome, Some(42));
+    assert!(!cancelled.load(std::sync::atomic::Ordering::Acquire));
+}

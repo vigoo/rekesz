@@ -395,6 +395,16 @@ fn embedded_capture_time(path: &Path) -> Option<SystemTime> {
     }
 }
 
+/// Best-effort capture time for an arbitrary file: an adjacent XMP sidecar's
+/// `exif:DateTimeOriginal`, else the embedded EXIF/RAW capture time. Used by
+/// the import engine for files that are not in the library yet.
+pub fn file_capture_time(path: &Path) -> Option<SystemTime> {
+    adjacent_xmp(path)
+        .as_deref()
+        .and_then(xmp_capture_time)
+        .or_else(|| embedded_capture_time(path))
+}
+
 fn embedded_coordinate(path: &Path) -> Option<GeoCoordinate> {
     if crate::formats::is_raw(path) {
         raw_coordinate(path).or_else(|| exif_coordinate(path))

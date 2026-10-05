@@ -15,7 +15,7 @@ use crate::rendering::{RenderMetadata, SourcePipeline};
 
 #[test]
 fn interactive_permits_bypass_background_reserve() {
-    let pool = Arc::new(PermitPool::new(4, 2));
+    let pool = Arc::new(PermitPool::new("test", 4, 2));
     let cancellation = AtomicBool::new(false);
     let background = pool.acquire(2, false, &cancellation).unwrap();
     let (sender, receiver) = mpsc::channel();
@@ -41,7 +41,7 @@ fn interactive_permits_bypass_background_reserve() {
 
 #[test]
 fn permit_wait_is_cooperatively_cancellable() {
-    let pool = Arc::new(PermitPool::new(1, 0));
+    let pool = Arc::new(PermitPool::new("test", 1, 0));
     let cancellation = Arc::new(AtomicBool::new(false));
     let held = pool.acquire(1, false, &cancellation).unwrap();
     let waiter = {
@@ -287,4 +287,59 @@ fn face_crop_disk_to_memory_only_transition_bypasses_and_purges_shared_cache() {
     assert_eq!(memory_only.stats().cache_hits, hits_before);
     memory_only.clear_disk_cache().unwrap();
     assert_eq!(memory_only.disk_cache_usage().unwrap().entries, 0);
+}
+
+#[test]
+fn aged_background_waiter_admits_on_freed_capacity() {
+    use super::PermitPool;
+    use std::sync::atomic::AtomicUsize;
+    let pool = Arc::new(PermitPool::new("test", 2, 1));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    // Hold both units: the interactive waiter started below stays WAITING,
+    // so the background gate (waiting_interactive == 0) stays closed.
+    let held_a = pool.acquire(1, true, &cancelled).unwrap();
+    let held_b = pool.acquire(1, true, &cancelled).unwrap();
+    let interactive_waiting = Arc::new(AtomicUsize::new(0));
+    let interactive = {
+        let pool = Arc::clone(&pool);
+        let cancelled = Arc::clone(&cancelled);
+        let interactive_waiting = Arc::clone(&interactive_waiting);
+        std::thread::spawn(move || {
+            interactive_waiting.store(1, Ordering::Release);
+            let _permit = pool.acquire(1, true, &cancelled);
+            interactive_waiting.store(2, Ordering::Release);
+        })
+    };
+    while interactive_waiting.load(Ordering::Acquire) == 0 {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(
+        interactive_waiting.load(Ordering::Acquire),
+        1,
+        "interactive waiter must still be waiting while all units are held"
+    );
+    let background = {
+        let pool = Arc::clone(&pool);
+        let cancelled = Arc::clone(&cancelled);
+        std::thread::spawn(move || pool.acquire(1, false, &cancelled).is_some())
+    };
+    // Within the grace window the background waiter must NOT be admitted
+    // even as a unit frees: the interactive waiter keeps the gate closed.
+    std::thread::sleep(Duration::from_millis(300));
+    drop(held_a);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        !background.is_finished(),
+        "fresh background waiter must not admit while an interactive waiter waits"
+    );
+    // After the grace elapses (2s from spawn), freeing the last unit must
+    // admit the aged background waiter despite the waiting interactive one.
+    std::thread::sleep(Duration::from_millis(1600));
+    drop(held_b);
+    assert!(
+        background.join().unwrap(),
+        "aged background waiter must be admitted on freed capacity"
+    );
+    interactive.join().unwrap();
 }
