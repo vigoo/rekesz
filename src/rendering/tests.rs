@@ -240,3 +240,18 @@ fn face_transform_composes_clean_aperture_before_rotation() {
         assert!((actual - expected).abs() < 1e-6, "{actual} != {expected}");
     }
 }
+
+/// A renderer-version bump must invalidate baseline caches too: the
+/// default identity (grid thumbnails, previews) has to embed the current
+/// `RENDERER_MODEL_VERSION`. Regression for stale raw thumbnails/previews
+/// after the lens-correction bumps.
+#[test]
+fn default_render_identity_carries_the_renderer_model_version() {
+    let identity = RenderIdentity::default();
+    assert_eq!(
+        identity.renderer_model,
+        crate::catalog::RENDERER_MODEL_VERSION
+    );
+    assert_eq!(identity.mode, RenderMode::Baseline);
+    assert_eq!(identity.recipe_digest, [0; 32]);
+}

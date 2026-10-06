@@ -18,6 +18,9 @@ pub(super) struct DecodedSource {
 pub(super) struct DecodedRaw {
     pub(super) raw: rawler::RawImage,
     pub(super) orientation: Option<image::metadata::Orientation>,
+    /// EXIF focal length in millimeters; selects the lens-correction
+    /// profile entry.
+    pub(super) focal_length: Option<f32>,
 }
 
 impl DecodedRaw {

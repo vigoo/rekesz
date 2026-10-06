@@ -499,6 +499,9 @@ impl RenderPipeline {
         if let Some(budget) = analysis_memory_budget {
             plan.set_analysis_memory_budget(budget);
         }
+        plan.set_lens_correction(
+            analysis_memory_budget.is_none() && !matches!(variant, RenderVariant::FaceCrop { .. }),
+        );
         let request = plan.request().clone();
         if cancelled.load(Ordering::Acquire) {
             return Err("render cancelled".into());

@@ -4,8 +4,8 @@ use image::DynamicImage;
 
 use super::{
     AppliedPhotographicTransform, OutputEncoding, PhotographicSettings,
-    colour::render_linear_rgb_with_exposure, rawler_stage, scene_linear::apply_recipe_scene_linear,
-    white_balance,
+    colour::render_linear_rgb_with_exposure, lens, rawler_stage,
+    scene_linear::apply_recipe_scene_linear, white_balance,
 };
 use crate::{catalog::DevelopRecipe, rendering::decoded::DecodedRaw};
 
@@ -15,6 +15,7 @@ pub(in crate::rendering) fn render_raw(
     decoded: &DecodedRaw,
     settings: &PhotographicSettings,
     recipe: Option<&DevelopRecipe>,
+    lens_correction: bool,
     cancelled: &Arc<AtomicBool>,
 ) -> Result<(DynamicImage, AppliedPhotographicTransform), String> {
     let mut overridden;
@@ -27,7 +28,23 @@ pub(in crate::rendering) fn render_raw(
     } else {
         &decoded.raw
     };
-    let linear = rawler_stage::develop_linear(raw, cancelled)?;
+    let mut linear = rawler_stage::develop_linear(raw, cancelled)?;
+    // Lens correction runs first, in sensor space: before any metering and
+    // before derivative downscaling. Geometry first — the vignette LUT
+    // radii were calibrated on the corrected frame, so the gain must index
+    // the warped geometry.
+    if lens_correction
+        && let Some(entry) =
+            super::embedded_lens_entry(raw.clean_model.as_str(), decoded.focal_length)
+    {
+        lens::apply_geometry(&mut linear.pixels, linear.width, linear.height, &entry);
+        lens::apply_vignette(
+            &mut linear.pixels,
+            linear.width,
+            linear.height,
+            &entry.vignette,
+        );
+    }
     render_linear(linear, decoded.orientation, settings, recipe, cancelled)
 }
 

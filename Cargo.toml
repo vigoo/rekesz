@@ -103,6 +103,12 @@ harness = false
 test = false
 
 [[bin]]
+name = "lens-profile-calibrate"
+path = "src/bin/lens_profile_calibrate.rs"
+harness = false
+test = false
+
+[[bin]]
 name = "sface-calibration-embeddings"
 path = "src/bin/sface_calibration_embeddings.rs"
 harness = false

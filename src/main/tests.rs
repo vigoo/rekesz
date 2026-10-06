@@ -4520,3 +4520,162 @@ fn import_footer_progress_counts_each_file_once(cx: &mut gpui::TestAppContext) {
         rendered = again_rendered;
     }
 }
+
+fn scanned_device_file(device_id: &str, name: &str) -> import::ScannedFile {
+    import::ScannedFile {
+        backing: crate::sources::SourceBacking::Ptp(crate::sources::ptp::PtpObjectRef {
+            device_id: Arc::from(device_id),
+            folder: Arc::from("/DCIM"),
+            name: Arc::from(name),
+        }),
+        name: name.to_owned(),
+        size: 10,
+        modified: None,
+    }
+}
+
+#[test]
+fn paired_photos_thumbnail_from_the_jpeg_companion() {
+    use import_view::import_thumbnail_path;
+    use std::path::PathBuf;
+
+    let staged = |path: &str| {
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            crate::sources::SourceBacking::Ptp(crate::sources::ptp::PtpObjectRef {
+                device_id: Arc::from("gphoto:usb:001,002"),
+                folder: Arc::from("/DCIM"),
+                name: Arc::from("IMG_0001"),
+            }),
+            PathBuf::from(path),
+        );
+        map
+    };
+
+    let raw_primary = import::ScannedPhoto {
+        directory: String::new(),
+        primary: import::ScannedFile {
+            backing: crate::sources::SourceBacking::Path(PathBuf::from("/card/IMG_0001.CR3")),
+            name: "IMG_0001.CR3".to_owned(),
+            size: 10,
+            modified: None,
+        },
+        companion: Some(import::ScannedFile {
+            backing: crate::sources::SourceBacking::Path(PathBuf::from("/card/IMG_0001.JPG")),
+            name: "IMG_0001.JPG".to_owned(),
+            size: 4,
+            modified: None,
+        }),
+    };
+    let device_pair = import::ScannedPhoto {
+        directory: String::new(),
+        primary: scanned_device_file("gphoto:usb:001,002", "IMG_0001.CR3"),
+        companion: Some(scanned_device_file("gphoto:usb:001,002", "IMG_0001.JPG")),
+    };
+    let mut device_staged = staged("/cache/import-staging/IMG_0001.CR3");
+    device_staged.insert(
+        crate::sources::SourceBacking::Ptp(crate::sources::ptp::PtpObjectRef {
+            device_id: Arc::from("gphoto:usb:001,002"),
+            folder: Arc::from("/DCIM"),
+            name: Arc::from("IMG_0001.JPG"),
+        }),
+        PathBuf::from("/cache/import-staging/IMG_0001.JPG"),
+    );
+
+    // Raw-primary pair: the JPEG companion displays.
+    assert_eq!(
+        import_thumbnail_path(&raw_primary, &std::collections::HashMap::new()),
+        Some(PathBuf::from("/card/IMG_0001.JPG"))
+    );
+    // Device pair: the staged companion displays.
+    assert_eq!(
+        import_thumbnail_path(&device_pair, &device_staged),
+        Some(PathBuf::from("/cache/import-staging/IMG_0001.JPG"))
+    );
+    // Companion not staged yet: nothing renders (no raw stand-in).
+    assert_eq!(
+        import_thumbnail_path(&device_pair, &staged("/cache/other")),
+        None
+    );
+    // JPEG-primary pairing (raw companion) keeps displaying the primary.
+    let jpeg_primary = import::ScannedPhoto {
+        directory: String::new(),
+        primary: import::ScannedFile {
+            backing: crate::sources::SourceBacking::Path(PathBuf::from("/card/IMG_0002.JPG")),
+            name: "IMG_0002.JPG".to_owned(),
+            size: 4,
+            modified: None,
+        },
+        companion: Some(import::ScannedFile {
+            backing: crate::sources::SourceBacking::Path(PathBuf::from("/card/IMG_0002.CR3")),
+            name: "IMG_0002.CR3".to_owned(),
+            size: 10,
+            modified: None,
+        }),
+    };
+    assert_eq!(
+        import_thumbnail_path(&jpeg_primary, &std::collections::HashMap::new()),
+        Some(PathBuf::from("/card/IMG_0002.JPG"))
+    );
+    // Unpaired files display themselves.
+    let unpaired = import::ScannedPhoto {
+        directory: String::new(),
+        primary: import::ScannedFile {
+            backing: crate::sources::SourceBacking::Path(PathBuf::from("/card/IMG_0003.CR3")),
+            name: "IMG_0003.CR3".to_owned(),
+            size: 10,
+            modified: None,
+        },
+        companion: None,
+    };
+    assert_eq!(
+        import_thumbnail_path(&unpaired, &std::collections::HashMap::new()),
+        Some(PathBuf::from("/card/IMG_0003.CR3"))
+    );
+}
+
+#[gpui::test]
+fn import_footer_completes_for_paired_photos(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let library = root.path().join("library");
+    std::fs::create_dir(&library).unwrap();
+    let card = write_import_source(root.path(), "card", 0, 1);
+    // A CR3+JPG pair whose raw fails to decode: the pair's thumbnail must
+    // come from the JPEG (the raw is never requested, so its decode error
+    // must not keep the footer from completing).
+    std::fs::write(card.join("pair-1.CR3"), b"not a raw").unwrap();
+    image::RgbImage::from_pixel(8, 8, image::Rgb([32, 96, 160]))
+        .save(card.join("pair-1.jpg"))
+        .unwrap();
+    let (_view, cx) = import_view_with_card(cx, &library, &card);
+
+    // Poll to completion: under a fully loaded test runner the decodes and
+    // the batched pass need an unbounded number of pump cycles.
+    let mut progress = (0, 0);
+    for _ in 0..40 {
+        cx.executor().advance_clock(Duration::from_millis(300));
+        let _ = cx.refresh();
+        cx.run_until_parked();
+        progress = _view.read_with(&*cx, |view, _| view.import_thumbnail_progress_uncached());
+        if progress.0 >= progress.1 {
+            break;
+        }
+    }
+    let (rendered, total) = progress;
+    assert_eq!(total, 2, "target counts photos, not files");
+    assert_eq!(rendered, 2, "footer must complete via the JPEG companions");
+}
+
+#[test]
+fn packaged_lens_profile_loads_and_selects() {
+    let profile = rendering::embedded_lens_profile_for_tests().expect("packaged profile");
+    assert_eq!(profile.model, "PowerShot V1");
+    // The wide end's black-circle recovery is the headline number from the
+    // calibration against the real card.
+    let wide = profile.select("PowerShot V1", Some(8.2)).unwrap();
+    assert!(*wide.vignette.last().unwrap() > 10.0, "corner gain");
+    assert!(wide.k1 > 0.05, "wide-end distortion correction");
+    // Tele end: nearly flat.
+    let tele = profile.select("PowerShot V1", Some(25.6)).unwrap();
+    assert!(*tele.vignette.last().unwrap() < 3.0);
+}

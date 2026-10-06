@@ -57,7 +57,7 @@ pub(crate) struct ImportViewState {
     /// thumbnail state; a set (not a counter) so repeated progress scans
     /// cannot compound, and monotonic so LRU eviction cannot move the bar
     /// back.
-    pub(crate) directory_pass_done: std::cell::RefCell<std::collections::HashSet<SourceBacking>>,
+    pub(crate) directory_pass_done: std::cell::RefCell<HashSet<PathBuf>>,
     pub(crate) staging_generation: u64,
     pub(crate) staging_cancel: Arc<AtomicBool>,
     /// Non-fatal scan findings (unreadable folders, truncation).
@@ -134,7 +134,7 @@ impl ImportViewState {
             thumbnail_progress: std::cell::Cell::new(None),
             directory_pass_generation: 0,
             directory_pass_cursor: 0,
-            directory_pass_done: std::cell::RefCell::new(std::collections::HashSet::new()),
+            directory_pass_done: std::cell::RefCell::new(HashSet::new()),
             staging_generation: 0,
             staging_cancel: Arc::new(AtomicBool::new(false)),
             duplicates: HashSet::new(),
@@ -1437,7 +1437,7 @@ impl PictureBrowser {
             .map(|photo| {
                 (
                     photo.key(),
-                    photo.primary.backing.clone(),
+                    import_thumbnail_path(photo, &self.import_view.staged),
                     photo.primary.name.clone(),
                     photo.primary.size,
                     photo.companion.as_ref().map(|file| file.name.clone()),
@@ -1460,7 +1460,7 @@ impl PictureBrowser {
                     .gap(px(THUMBNAIL_GAP))
                     .px_3()
                     .pt_3();
-                for (offset, (key, backing, name, size, companion)) in visible
+                for (offset, (key, thumbnail_path, name, size, companion)) in visible
                     .iter()
                     .enumerate()
                     .skip_while(|(offset, _)| first + offset < row * columns)
@@ -1469,8 +1469,8 @@ impl PictureBrowser {
                     let _ = offset;
                     let selected = self.import_view.selection.contains(key);
                     let duplicate = self.import_view.duplicates.contains(key);
-                    let image_content = match backing {
-                        SourceBacking::Path(path) => {
+                    let image_content = match thumbnail_path {
+                        Some(path) => {
                             let identity = self.render_identity_for(path);
                             match self.thumbnails.state_for(path, identity) {
                                 PreviewState::Loaded(preview) => img(preview.image.clone())
@@ -1483,25 +1483,7 @@ impl PictureBrowser {
                                 _ => div().text_xs().child("Loading…").into_any_element(),
                             }
                         }
-                        SourceBacking::Mtp(_) | SourceBacking::Ptp(_) => {
-                            match self.import_view.staged.get(backing) {
-                                Some(path) => {
-                                    let identity = self.render_identity_for(path);
-                                    match self.thumbnails.state_for(path, identity) {
-                                        PreviewState::Loaded(preview) => img(preview.image.clone())
-                                            .max_w_full()
-                                            .max_h_full()
-                                            .into_any_element(),
-                                        PreviewState::Error(_) => div()
-                                            .text_xs()
-                                            .child("Cannot decode")
-                                            .into_any_element(),
-                                        _ => div().text_xs().child("Loading…").into_any_element(),
-                                    }
-                                }
-                                None => div().text_xs().child("Device file").into_any_element(),
-                            }
-                        }
+                        None => div().text_xs().child("Device file").into_any_element(),
                     };
                     let toggle_key = key.clone();
                     row_element = row_element.child(
@@ -2147,6 +2129,16 @@ impl PictureBrowser {
         {
             return (rendered, total);
         }
+        let (rendered, total) = self.import_thumbnail_progress_uncached();
+        self.import_view
+            .thumbnail_progress
+            .set(Some((std::time::Instant::now(), rendered, total)));
+        (rendered, total)
+    }
+
+    /// Recompute the whole-directory thumbnail progress without the footer's
+    /// 250 ms result cache.
+    pub(crate) fn import_thumbnail_progress_uncached(&self) -> (usize, usize) {
         let staged = &self.import_view.staged;
         // Monotonic per-pass accounting: a file that has EVER been rendered
         // (or terminally failed) stays counted as done even if the LRU cache
@@ -2160,29 +2152,20 @@ impl PictureBrowser {
         let mut ever_rendered = self.import_view.directory_pass_done.borrow_mut();
         let mut total = 0;
         for photo in &self.import_view.photos {
-            for file in std::iter::once(&photo.primary).chain(photo.companion.as_ref()) {
-                let display_path = match &file.backing {
-                    SourceBacking::Path(path) => Some(path.clone()),
-                    other => staged.get(other).cloned(),
-                };
-                let Some(path) = display_path else {
-                    continue;
-                };
-                total += 1;
-                let identity = self.render_identity_for(&path);
-                if matches!(
-                    self.thumbnails.state_for(&path, identity),
-                    PreviewState::Loaded(_) | PreviewState::Error(_)
-                ) {
-                    ever_rendered.insert(file.backing.clone());
-                }
+            total += 1;
+            let Some(path) = import_thumbnail_path(photo, staged) else {
+                continue;
+            };
+            let identity = self.render_identity_for(&path);
+            if matches!(
+                self.thumbnails.state_for(&path, identity),
+                PreviewState::Loaded(_) | PreviewState::Error(_)
+            ) {
+                ever_rendered.insert(path);
             }
         }
         let rendered = ever_rendered.len().min(total);
         drop(ever_rendered);
-        self.import_view
-            .thumbnail_progress
-            .set(Some((std::time::Instant::now(), rendered, total)));
         (rendered, total)
     }
 
@@ -2231,11 +2214,7 @@ impl PictureBrowser {
         let mut requests = Vec::new();
         for index in near_first..near_last {
             let photo = &self.import_view.photos[index];
-            let path = match &photo.primary.backing {
-                SourceBacking::Path(path) => Some(path.clone()),
-                other => self.import_view.staged.get(other).cloned(),
-            };
-            let Some(path) = path else {
+            let Some(path) = import_thumbnail_path(photo, &self.import_view.staged) else {
                 continue;
             };
             let on_screen = (first..last).contains(&index);
@@ -2284,18 +2263,16 @@ impl PictureBrowser {
                         let end = (start + 16).min(photos.len());
                         let mut requests = Vec::new();
                         for photo in &photos[start..end] {
-                            for file in
-                                std::iter::once(&photo.primary).chain(photo.companion.as_ref())
+                            if let Some(path) =
+                                import_thumbnail_path(photo, &this.import_view.staged)
                             {
-                                if let SourceBacking::Path(path) = &file.backing {
-                                    requests.push((
-                                        path.clone(),
-                                        RenderVariant::Thumbnail {
-                                            width: this.thumbnail_width,
-                                        },
-                                        JobPriority::speculative(0),
-                                    ));
-                                }
+                                requests.push((
+                                    path,
+                                    RenderVariant::Thumbnail {
+                                        width: this.thumbnail_width,
+                                    },
+                                    JobPriority::speculative(0),
+                                ));
                             }
                         }
                         this.import_view.directory_pass_cursor = end;
@@ -2518,4 +2495,28 @@ impl std::fmt::Debug for ImportViewState {
             .field("selected_count", &self.selected_count())
             .finish_non_exhaustive()
     }
+}
+
+/// The file whose thumbnail a photo displays: the camera-corrected JPEG
+/// companion when the primary is the raw half of a pair, else the primary.
+/// Device-sourced files resolve through the staged map; a pair whose
+/// companion has not staged yet resolves to nothing — its raw is
+/// deliberately not rendered as a stand-in.
+pub(crate) fn import_thumbnail_path(
+    photo: &import::ScannedPhoto,
+    staged: &HashMap<SourceBacking, PathBuf>,
+) -> Option<PathBuf> {
+    let resolved = |file: &import::ScannedFile| match &file.backing {
+        SourceBacking::Path(path) => Some(path.clone()),
+        other => staged.get(other).cloned(),
+    };
+    // Pairing (import scan) attaches JPEG companions to CR3 primaries, so
+    // the extension test mirrors it exactly.
+    let primary_is_raw = Path::new(&photo.primary.name)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("cr3"));
+    if primary_is_raw && let Some(companion) = &photo.companion {
+        return resolved(companion);
+    }
+    resolved(&photo.primary)
 }

@@ -51,6 +51,7 @@ fn synthetic_oriented_dng_decodes_through_the_real_raw_path() {
         &decoded,
         &PhotographicSettings::default(),
         None,
+        false,
         &Arc::new(AtomicBool::new(false)),
     )
     .unwrap();
@@ -92,8 +93,14 @@ fn report_reference_raw_exposure_and_white_balance() {
     let cancelled = Arc::new(AtomicBool::new(false));
     for path in samples {
         let decoded = decode_raw(Path::new(path), &cancelled, None).unwrap();
-        let (_, metadata) =
-            render_raw(&decoded, &PhotographicSettings::default(), None, &cancelled).unwrap();
+        let (_, metadata) = render_raw(
+            &decoded,
+            &PhotographicSettings::default(),
+            None,
+            false,
+            &cancelled,
+        )
+        .unwrap();
         eprintln!(
             "{path}: as_shot={:?} neutral={:?} auto_stops={}",
             decoded.raw.wb_coeffs,

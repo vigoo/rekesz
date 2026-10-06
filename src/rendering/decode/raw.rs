@@ -71,7 +71,16 @@ fn decode_raw(
         .and_then(|value| u8::try_from(value).ok())
         .or_else(|| u8::try_from(raw.orientation.to_u16()).ok())
         .and_then(image::metadata::Orientation::from_exif);
-    Ok(DecodedRaw { raw, orientation })
+    let focal_length = metadata
+        .exif
+        .focal_length
+        .map(|rational| rational.n as f32 / rational.d.max(1) as f32)
+        .filter(|value| *value > 0.0);
+    Ok(DecodedRaw {
+        raw,
+        orientation,
+        focal_length,
+    })
 }
 
 fn raw_decode_admitted(

@@ -44,6 +44,7 @@ pub(super) struct RenderPlan {
     raw_fidelity_warnings: u64,
     stages: Vec<RenderStage>,
     analysis_memory_budget: Option<usize>,
+    lens_correction: bool,
 }
 
 impl RenderPlan {
@@ -142,11 +143,22 @@ impl RenderPlan {
             raw_fidelity_warnings,
             stages,
             analysis_memory_budget: None,
+            lens_correction: false,
         })
     }
 
     pub(super) fn set_analysis_memory_budget(&mut self, budget: usize) {
         self.analysis_memory_budget = Some(budget);
+    }
+
+    /// Lens correction engages for photo renders; analysis and face crops
+    /// must stay in the uncorrected (analysis-geometry) space.
+    pub(super) fn set_lens_correction(&mut self, enabled: bool) {
+        self.lens_correction = enabled;
+    }
+
+    pub(super) fn lens_correction(&self) -> bool {
+        self.lens_correction
     }
 
     pub(super) fn analysis_memory_budget(&self) -> Option<usize> {

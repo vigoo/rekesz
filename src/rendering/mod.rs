@@ -13,6 +13,13 @@ mod decoded;
 mod develop;
 mod filters;
 mod photographic;
+
+/// Test access to the packaged lens profile (the module is private).
+#[cfg(test)]
+pub(crate) fn embedded_lens_profile_for_tests() -> Option<&'static photographic::lens::LensProfile>
+{
+    photographic::embedded_lens_profile()
+}
 /// Scheduling and resource-management entry point for blocking renders.
 pub(crate) mod pipeline;
 mod plan;
@@ -98,11 +105,24 @@ pub enum RenderMode {
     Developed,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RenderIdentity {
     pub mode: RenderMode,
     pub recipe_digest: [u8; 32],
     pub renderer_model: u32,
+}
+
+impl Default for RenderIdentity {
+    fn default() -> Self {
+        // The default identity (baseline renders: grid thumbnails, previews)
+        // must carry the current renderer model version — a bump has to
+        // invalidate baseline caches too, not just developed ones.
+        Self {
+            mode: RenderMode::Baseline,
+            recipe_digest: [0; 32],
+            renderer_model: crate::catalog::RENDERER_MODEL_VERSION,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -289,14 +309,19 @@ impl RenderBackend {
         let source_dimensions = decoded.source_dimensions;
         let (source_image, photographic, raw_preapplied, raw_fidelity) = match &decoded.raw_linear {
             Some(raw) => {
-                let (image, metadata) =
-                    photographic::render_raw(raw, &self.raw, plan.raw_recipe(), cancelled)
-                        .map_err(|error| {
-                            image::ImageError::Decoding(image::error::DecodingError::new(
-                                image::error::ImageFormatHint::Unknown,
-                                error,
-                            ))
-                        })?;
+                let (image, metadata) = photographic::render_raw(
+                    raw,
+                    &self.raw,
+                    plan.raw_recipe(),
+                    plan.lens_correction(),
+                    cancelled,
+                )
+                .map_err(|error| {
+                    image::ImageError::Decoding(image::error::DecodingError::new(
+                        image::error::ImageFormatHint::Unknown,
+                        error,
+                    ))
+                })?;
                 let (actions, warnings) = plan.raw_metadata();
                 (image, Some(metadata), actions, warnings)
             }
