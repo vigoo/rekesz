@@ -11,10 +11,12 @@ mod cache;
 mod decode;
 mod decoded;
 mod develop;
+mod filters;
 mod photographic;
 /// Scheduling and resource-management entry point for blocking renders.
 pub(crate) mod pipeline;
 mod plan;
+mod presence;
 mod resize;
 
 use std::{
@@ -45,6 +47,10 @@ pub fn assert_hevc_decoder_available() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Identifies the decode + face-analysis pipeline for analysis staleness.
+/// Baseline pixels are unaffected by develop-operator changes, so this only
+/// moves when decoding itself changes; render-cache identity is governed by
+/// `RENDERER_MODEL_VERSION` in the catalog instead.
 pub(crate) const DECODER_MODEL_ID: &str = "renderer-6";
 static ANALYSIS_MEMORY_BUDGET: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(768 * 1024 * 1024);

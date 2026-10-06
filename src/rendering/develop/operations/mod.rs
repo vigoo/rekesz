@@ -12,6 +12,7 @@ mod grain;
 mod heal;
 mod homography;
 mod lens_distortion;
+mod log_detail;
 mod monochrome;
 mod parametric_curve;
 mod presence;

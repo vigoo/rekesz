@@ -580,3 +580,69 @@ fn sanitize_names_are_safe_path_components() {
     assert_eq!(sanitize_name("name "), "name");
     assert_eq!(sanitize_name(""), "_");
 }
+
+/// A device-style source: rejects path backings exactly like the MTP/PTP
+/// backends do. Regression cover for staged imports — staged device files
+/// carry path backings and must be read through the path source even
+/// though the import runs with the device's source access.
+struct DeviceOnlySource;
+
+impl SourceAccess for DeviceOnlySource {
+    fn list_dir(&self, _dir: &SourceBacking) -> std::io::Result<Vec<SourceDirEntry>> {
+        Err(std::io::Error::other("device source cannot list in tests"))
+    }
+
+    fn read_file(
+        &self,
+        file: &SourceBacking,
+        _out: &mut dyn std::io::Write,
+        _cancel: &AtomicBool,
+        _progress: &mut dyn FnMut(u64),
+    ) -> std::io::Result<u64> {
+        match file {
+            SourceBacking::Path(_) => {
+                Err(std::io::Error::other("camera source cannot address paths"))
+            }
+            _ => Err(std::io::Error::other("no device in tests")),
+        }
+    }
+}
+
+#[test]
+fn staged_copies_import_through_the_path_source() {
+    use crate::sources::staged_import_access;
+    let source = tempfile::tempdir().expect("source");
+    let library = tempfile::tempdir().expect("library");
+    std::fs::write(source.path().join("IMG_0001.JPG"), b"jpeg").expect("write");
+
+    let plan = ImportPlan {
+        library_root: library.path().to_path_buf(),
+        destination_base: library.path().to_path_buf(),
+        photos: vec![file_photo(
+            "",
+            source.path().join("IMG_0001.JPG"),
+            "IMG_0001.JPG",
+            4,
+        )],
+        preset: DestinationPreset::KeepFileNames,
+    };
+    let progress = Arc::new(std::sync::Mutex::new(ImportProgress::default()));
+    // The import view wraps the source access exactly like this once
+    // preview staging has swapped device backings for cache paths.
+    let access = staged_import_access(Arc::new(DeviceOnlySource));
+    let status = run_import(
+        &plan,
+        access.as_ref(),
+        Arc::clone(&progress),
+        &AtomicBool::new(false),
+    );
+    let ImportStatus::Completed(report) = status else {
+        panic!("import must complete");
+    };
+    assert!(
+        report.failed.is_empty(),
+        "staged files must import via the path source: {:?}",
+        report.failed
+    );
+    assert_eq!(report.copied_files, 1);
+}

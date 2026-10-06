@@ -1543,18 +1543,20 @@ fn pending_batches_advance_beyond_ten_thousand_assets() {
     catalog::initialize_test_catalog(root.path()).unwrap();
     let connection = Connection::open(catalog::catalog_path(root.path())).unwrap();
     connection
-            .execute_batch(
+            .execute_batch(&format!(
                 "WITH RECURSIVE ids(id) AS (VALUES(1) UNION ALL SELECT id+1 FROM ids WHERE id<10001)
                  INSERT INTO assets(id, relative_path, scope_key)
                    SELECT id, CAST(printf('p/%05d.jpg', id) AS BLOB), CAST('p' AS BLOB) FROM ids;
                  INSERT INTO analysis_asset_inventory(asset_id, source_size, source_modified_ns,
                                                        decoder_model_id, discovered_at)
-                   SELECT id, 1, 1, 'renderer-6', datetime('now') FROM assets;
+                   SELECT id, 1, 1, '{}', datetime('now') FROM assets;
                  INSERT INTO face_analysis_state(asset_id, detector_model_id, recognizer_model_id,
                      decoder_model_id, source_size, source_modified_ns, status, attempts, updated_at)
                    SELECT id, 'yunet-2023mar+sface-2021dec', 'sface-2021dec',
-                     'renderer-6', 1, 1, 'pending', 0, datetime('now') FROM assets;",
-            )
+                     '{}', 1, 1, 'pending', 0, datetime('now') FROM assets;",
+                crate::rendering::DECODER_MODEL_ID,
+                crate::rendering::DECODER_MODEL_ID
+            ))
             .unwrap();
     let first = pending_analysis_jobs(root.path(), 10_000).unwrap();
     assert_eq!(first.len(), 10_000);
@@ -1822,18 +1824,20 @@ fn ten_thousand_asset_refill_coordinator_drains_multiple_real_scheduler_batches(
     let root = tempfile::tempdir().unwrap();
     catalog::initialize_test_catalog(root.path()).unwrap();
     let connection = Connection::open(catalog::catalog_path(root.path())).unwrap();
-    connection.execute_batch(
+    connection.execute_batch(&format!(
             "WITH RECURSIVE ids(id) AS (VALUES(1) UNION ALL SELECT id+1 FROM ids WHERE id<10001)
              INSERT INTO assets(id, relative_path, scope_key)
                SELECT id, CAST(printf('scale/%05d.jpg', id) AS BLOB), CAST('scale' AS BLOB) FROM ids;
              INSERT INTO analysis_asset_inventory(asset_id, source_size, source_modified_ns,
                                                    decoder_model_id, discovered_at)
-               SELECT id, 1, 1, 'renderer-6', datetime('now') FROM assets;
+               SELECT id, 1, 1, '{}', datetime('now') FROM assets;
              INSERT INTO face_analysis_state(asset_id, detector_model_id, recognizer_model_id,
                  decoder_model_id, source_size, source_modified_ns, status, attempts, updated_at)
-               SELECT id, 'yunet-2023mar+sface-2021dec', 'sface-2021dec', 'renderer-6',
+               SELECT id, 'yunet-2023mar+sface-2021dec', 'sface-2021dec', '{}',
                  1, 1, 'pending', 0, datetime('now') FROM assets;",
-        ).unwrap();
+            crate::rendering::DECODER_MODEL_ID,
+            crate::rendering::DECODER_MODEL_ID
+        )).unwrap();
     drop(connection);
     let scheduler = MaintenanceScheduler::new_with_admission(
         1,

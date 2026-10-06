@@ -18,7 +18,7 @@ const CATALOG_FILE: &str = "catalog.sqlite3";
 const SCHEMA_VERSION: i64 = 6;
 const CONTENT_IDENTITY_BUFFER_BYTES: usize = 64 * 1024;
 const SQLITE_APPLICATION_ID: i64 = 0x5049_4353;
-pub const RENDERER_MODEL_VERSION: u32 = 6;
+pub const RENDERER_MODEL_VERSION: u32 = 7;
 
 #[cfg(test)]
 thread_local! {

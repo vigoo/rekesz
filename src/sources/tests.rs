@@ -351,3 +351,51 @@ fn path_source_rejects_mtp_backings() {
             .is_some()
     );
 }
+
+#[test]
+fn ptp_entries_aliasing_mtp_devices_are_deduped() {
+    use crate::sources::{SourceEntry, SourceId, SourceKind, dedup_device_entries};
+    use std::path::PathBuf;
+
+    let entry = |id: &str, backing: crate::sources::SourceBacking| SourceEntry {
+        id: SourceId::new(id),
+        label: id.to_owned(),
+        kind: SourceKind::Device {
+            vendor: String::new(),
+            model: "Camera".to_owned(),
+        },
+        backing,
+        capacity: None,
+    };
+
+    let mtp = crate::sources::SourceBacking::Mtp(MtpObjectRef {
+        device_id: Arc::from("libmtp:5:12"),
+        storage_id: Arc::from("1"),
+        object: Arc::from("0"),
+    });
+    // usb:005,012 is the same physical device as libmtp:5:12.
+    let ptp_alias = crate::sources::ptp::PtpObjectRef {
+        device_id: Arc::from("gphoto:usb:005,012"),
+        folder: Arc::from("/"),
+        name: Arc::from(""),
+    };
+    let ptp_other = crate::sources::ptp::PtpObjectRef {
+        device_id: Arc::from("gphoto:usb:007,001"),
+        folder: Arc::from("/"),
+        name: Arc::from(""),
+    };
+
+    let deduped = dedup_device_entries(vec![
+        entry("mtp", mtp),
+        entry("ptp-alias", crate::sources::SourceBacking::Ptp(ptp_alias)),
+        entry(
+            "path",
+            crate::sources::SourceBacking::Path(PathBuf::from("/media/card")),
+        ),
+        entry("ptp-other", crate::sources::SourceBacking::Ptp(ptp_other)),
+    ]);
+    assert_eq!(deduped.len(), 3);
+    assert_eq!(deduped[0].id, SourceId::new("mtp"));
+    assert_eq!(deduped[1].id, SourceId::new("path"));
+    assert_eq!(deduped[2].id, SourceId::new("ptp-other"));
+}

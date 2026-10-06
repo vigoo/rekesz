@@ -1,11 +1,13 @@
-//! External import sources: mounted volumes, MTP devices, and arbitrary
-//! folders chosen by the user.
+//! External import sources: mounted volumes, MTP devices, PTP cameras, and
+//! arbitrary folders chosen by the user.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 pub mod mtp;
+pub mod ptp;
 pub mod volumes;
 
 /// Stable identifier for a source across refreshes.
@@ -37,6 +39,8 @@ pub enum SourceBacking {
     /// An MTP device object. `object == 0` denotes the root directory of the
     /// storage.
     Mtp(mtp::MtpObjectRef),
+    /// A PTP camera object. `name == ""` denotes the directory at `folder`.
+    Ptp(ptp::PtpObjectRef),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,7 +55,7 @@ impl SourceBacking {
     pub fn root_path(&self) -> Option<PathBuf> {
         match self {
             Self::Path(path) => Some(path.clone()),
-            Self::Mtp(_) => None,
+            Self::Mtp(_) | Self::Ptp(_) => None,
         }
     }
 }
@@ -100,12 +104,79 @@ pub trait SourceAccess: Send + Sync {
         cancel: &AtomicBool,
         progress: &mut dyn FnMut(u64),
     ) -> std::io::Result<u64>;
+
+    /// Stream a file's bytes directly into a new file at `destination`,
+    /// for backends with a native transfer-to-path (which must not exist
+    /// yet). Returns `None` when unsupported and the caller falls back to
+    /// [`SourceAccess::read_file`]. Progress reports copied byte counts;
+    /// cancellation and partial-output cleanup follow `read_file`.
+    fn read_file_to_path(
+        &self,
+        file: &SourceBacking,
+        destination: &Path,
+        cancel: &AtomicBool,
+        progress: &mut dyn FnMut(u64),
+    ) -> Option<std::io::Result<u64>> {
+        let _ = (file, destination, cancel, progress);
+        None
+    }
 }
 
 /// Read access to path-backed sources (volumes, folders, network mounts).
 pub struct PathSource;
 
 const COPY_CHUNK: usize = 1024 * 1024;
+
+/// Reader for imports that mix device-backed files with staged copies.
+/// Once the import view swaps staged device files over to their cache
+/// paths, one import runs against both kinds of backing — but a device
+/// source can only read its own device, so path backings are served by
+/// [`PathSource`] while everything else goes to the source's own access.
+pub(crate) struct StagedImportAccess {
+    device: Arc<dyn SourceAccess>,
+}
+
+impl SourceAccess for StagedImportAccess {
+    fn list_dir(&self, dir: &SourceBacking) -> std::io::Result<Vec<SourceDirEntry>> {
+        self.device.list_dir(dir)
+    }
+
+    fn read_file(
+        &self,
+        file: &SourceBacking,
+        out: &mut dyn std::io::Write,
+        cancel: &AtomicBool,
+        progress: &mut dyn FnMut(u64),
+    ) -> std::io::Result<u64> {
+        match file {
+            SourceBacking::Path(_) => PathSource.read_file(file, out, cancel, progress),
+            _ => self.device.read_file(file, out, cancel, progress),
+        }
+    }
+
+    fn read_file_to_path(
+        &self,
+        file: &SourceBacking,
+        destination: &Path,
+        cancel: &AtomicBool,
+        progress: &mut dyn FnMut(u64),
+    ) -> Option<std::io::Result<u64>> {
+        match file {
+            // Path backings have a native reader already; the fallback
+            // read above serves them.
+            SourceBacking::Path(_) => None,
+            _ => self
+                .device
+                .read_file_to_path(file, destination, cancel, progress),
+        }
+    }
+}
+
+/// Wrap a source's access so a mixed staging/device import can read both
+/// kinds of backing (see [`StagedImportAccess`]).
+pub(crate) fn staged_import_access(device: Arc<dyn SourceAccess>) -> Arc<dyn SourceAccess> {
+    Arc::new(StagedImportAccess { device })
+}
 
 impl SourceAccess for PathSource {
     fn list_dir(&self, dir: &SourceBacking) -> std::io::Result<Vec<SourceDirEntry>> {
@@ -208,17 +279,53 @@ impl SourceRegistry {
         let raw_volumes = volumes::VolumeProvider::raw_volumes();
         let mut entries = volumes::VolumeProvider::entries_from(&raw_volumes);
         entries.extend(mtp::DeviceProvider.collect());
+        entries.extend(ptp::DeviceProvider.collect());
+        let entries = dedup_device_entries(entries);
         merge_folder_entries(entries, folders, &raw_volumes)
     }
 
     /// The reader for a source's contents; device sources delegate to the
-    /// platform MTP backend.
+    /// platform MTP/PTP backends.
     pub fn access_for(&self, backing: &SourceBacking) -> Option<Arc<dyn SourceAccess>> {
         match backing {
             SourceBacking::Path(_) => Some(Arc::new(PathSource)),
             SourceBacking::Mtp(reference) => mtp::DeviceProvider.access_for(&reference.device_id),
+            SourceBacking::Ptp(reference) => ptp::DeviceProvider.access_for(&reference.device_id),
         }
     }
+}
+
+/// `libmtp:<bus>:<dev>` device ids carry the USB location used for the
+/// PTP-side alias check.
+fn mtp_device_id_bus_dev(id: &str) -> Option<(u32, u32)> {
+    let rest = id.strip_prefix("libmtp:")?;
+    let (bus, dev) = rest.split_once(':')?;
+    Some((bus.parse().ok()?, dev.parse().ok()?))
+}
+
+/// Drop PTP entries that alias a device the libmtp backend already lists:
+/// some devices are visible to both stacks, and one entry per device is the
+/// contract. A PTP entry without a usable USB identity is kept as-is.
+pub(crate) fn dedup_device_entries(entries: Vec<SourceEntry>) -> Vec<SourceEntry> {
+    let mtp_devices: HashSet<(u32, u32)> = entries
+        .iter()
+        .filter_map(|entry| match &entry.backing {
+            SourceBacking::Mtp(reference) => mtp_device_id_bus_dev(&reference.device_id),
+            _ => None,
+        })
+        .collect();
+    entries
+        .into_iter()
+        .filter(|entry| match &entry.backing {
+            SourceBacking::Ptp(reference) => {
+                match ptp::port_of_device_id(&reference.device_id).and_then(ptp::port_bus_dev) {
+                    Some(bus_dev) => !mtp_devices.contains(&bus_dev),
+                    None => true,
+                }
+            }
+            _ => true,
+        })
+        .collect()
 }
 
 /// Append user folder entries that are not already represented by a volume:
@@ -234,7 +341,7 @@ pub(crate) fn merge_folder_entries(
         .iter()
         .filter_map(|entry| match &entry.backing {
             SourceBacking::Path(path) => Some(path.clone()),
-            SourceBacking::Mtp(_) => None,
+            SourceBacking::Mtp(_) | SourceBacking::Ptp(_) => None,
         })
         .collect::<Vec<_>>();
     for folder in folders {

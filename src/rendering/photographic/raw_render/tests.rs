@@ -64,7 +64,7 @@ fn authored_linear_pipeline_has_stable_pixels_and_metadata() {
             (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
         });
     assert_eq!(image.dimensions(), (height, width));
-    assert_eq!(hash, 9_433_974_137_992_894_884);
+    assert_eq!(hash, 13_824_727_338_061_481_894);
     assert_eq!(metadata.automatic_exposure_stops, 0.0);
     assert!((metadata.total_exposure_stops - 1.1).abs() < f32::EPSILON);
     assert_eq!(metadata.orientation_applied, Some(6));

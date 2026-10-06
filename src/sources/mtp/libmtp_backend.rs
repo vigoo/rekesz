@@ -298,6 +298,7 @@ fn reference_for<'a>(
     match backing {
         SourceBacking::Mtp(reference) if &reference.device_id == device_id => Ok(reference),
         SourceBacking::Mtp(_) => Err(invalid("backing belongs to another device")),
+        SourceBacking::Ptp(_) => Err(invalid("device source cannot address PTP objects")),
         SourceBacking::Path(_) => Err(invalid("device source cannot address paths")),
     }
 }

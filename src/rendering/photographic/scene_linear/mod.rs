@@ -82,19 +82,26 @@ fn apply_detail_controls(
         }
     }
     if recipe.texture.is_some() || recipe.dehaze.is_some() {
-        let low = blur(pixels, width, height, 2, cancelled)?;
-        let texture = recipe.texture.unwrap_or(0.0) / 100.0;
-        let dehaze = recipe.dehaze.unwrap_or(0.0) / 100.0;
-        for (index, (pixel, low)) in pixels.iter_mut().zip(low).enumerate() {
-            if index % 4096 == 0 {
-                check_cancelled(cancelled)?;
-            }
-            for channel in 0..3 {
-                let detail = pixel[channel] - low[channel];
-                pixel[channel] = (pixel[channel] - low[channel] * dehaze * 0.2)
-                    / (1.0 - dehaze * 0.2).max(0.2)
-                    + detail * texture;
-            }
+        let scene_tone = |luma: f32| luma / (1.0 + luma);
+        if let Some(dehaze) = recipe.dehaze {
+            crate::rendering::presence::apply_dehaze(
+                pixels,
+                width as usize,
+                height as usize,
+                dehaze,
+                scene_tone,
+                cancelled,
+            )?;
+        }
+        if let Some(texture) = recipe.texture {
+            crate::rendering::presence::apply_texture(
+                pixels,
+                width as usize,
+                height as usize,
+                texture,
+                scene_tone,
+                cancelled,
+            )?;
         }
     }
     if let Some(monochrome) = recipe.monochrome {

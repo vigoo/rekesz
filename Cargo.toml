@@ -4,10 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["mtp"]
+default = ["mtp", "ptp"]
 # MTP device detection via libmtp (Linux/macOS; Windows uses the in-box WPD
 # API and does not need this feature). Requires the libmtp development files.
 mtp = ["dep:libmtp-rs"]
+# PTP camera access via libgphoto2 (Linux/macOS; Windows cameras go through
+# the WPD backend). Requires the libgphoto2 development files.
+ptp = ["dep:gphoto2"]
 
 [dependencies]
 anyhow = "1"
@@ -69,6 +72,9 @@ accesskit_unix = "0.24"
 
 [target.'cfg(unix)'.dependencies]
 libmtp-rs = { version = "0.7.7", optional = true }
+# Pinned exactly: the ptp backend leans on this crate's `Future` impl and
+# `Task::cancel` reachability (see ptp-camera-plan.md).
+gphoto2 = { version = "=3.4.1", optional = true }
 
 [build-dependencies]
 hex = "0.4"

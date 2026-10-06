@@ -7941,6 +7941,33 @@ impl PictureBrowser {
         cx.notify();
     }
 
+    /// Single-letter shortcuts live here instead of the keymap: keymap
+    /// bindings always beat key listeners, so a bound letter could never be
+    /// typed into a hand-rolled text input (the import new-folder field)
+    /// even with the action handler gated — the binding consumed the key
+    /// before the input's listener ran. Key listeners only see keys no
+    /// binding claimed, and the inputs stop propagation for keys they
+    /// consume. Add further plain-letter shortcuts here, not to
+    /// `bind_picture_browser_keys`.
+    fn handle_plain_key_down(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let keystroke = &event.keystroke;
+        if keystroke.modifiers.control
+            || keystroke.modifiers.alt
+            || keystroke.modifiers.platform
+            || keystroke.modifiers.shift
+        {
+            return;
+        }
+        if keystroke.key == "d" {
+            self.toggle_developed(&ToggleDeveloped, window, cx);
+        }
+    }
+
     fn toggle_developed(&mut self, _: &ToggleDeveloped, _: &mut Window, cx: &mut Context<Self>) {
         if self.directory_view_mode == DirectoryViewMode::Import {
             return;
@@ -10720,6 +10747,7 @@ impl Render for PictureBrowser {
             .flex()
             .flex_col()
             .key_context("PictureBrowser")
+            .on_key_down(cx.listener(Self::handle_plain_key_down))
             .on_action(cx.listener(Self::toggle_job_queue))
             .on_action(cx.listener(Self::toggle_develop_inspector))
             .on_action(cx.listener(Self::toggle_developed))
@@ -12037,7 +12065,6 @@ fn bind_picture_browser_keys(cx: &mut App) {
         KeyBinding::new("shift-up", GridExtendUp, Some("MainView")),
         KeyBinding::new("shift-down", GridExtendDown, Some("MainView")),
         KeyBinding::new("ctrl-shift-j", ToggleJobQueue, None),
-        KeyBinding::new("d", ToggleDeveloped, Some("MainView")),
         KeyBinding::new("enter", ImportNewFolderConfirm, Some("ImportNewFolder")),
     ]);
 }

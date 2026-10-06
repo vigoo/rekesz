@@ -42,9 +42,10 @@ pub(crate) struct ImportViewState {
     pub(crate) subdirectories: Vec<(String, SourceBacking)>,
     /// Live progress of the running source scan, shared with the job.
     pub(crate) scan_progress: Arc<Mutex<import::ScanProgress>>,
-    /// Downloaded device files, keyed by their object reference; the source
-    /// of thumbnails and capture dates for device-backed photos.
-    pub(crate) staged: HashMap<sources::mtp::MtpObjectRef, PathBuf>,
+    /// Downloaded device files (MTP objects, PTP camera files), keyed by
+    /// their backing reference; the source of thumbnails and capture dates
+    /// for device-backed photos.
+    pub(crate) staged: HashMap<SourceBacking, PathBuf>,
     /// Throttled cache for the footer's whole-directory thumbnail count.
     pub(crate) thumbnail_progress: std::cell::Cell<Option<(std::time::Instant, usize, usize)>>,
     /// Generation of the running whole-directory thumbnail pass; a listing
@@ -53,8 +54,10 @@ pub(crate) struct ImportViewState {
     /// Next photo index the whole-directory pass will request.
     pub(crate) directory_pass_cursor: usize,
     /// Photos of the current pass that have ever reached a terminal
-    /// thumbnail state; monotonic so LRU eviction cannot move the bar back.
-    pub(crate) directory_pass_done: std::cell::Cell<usize>,
+    /// thumbnail state; a set (not a counter) so repeated progress scans
+    /// cannot compound, and monotonic so LRU eviction cannot move the bar
+    /// back.
+    pub(crate) directory_pass_done: std::cell::RefCell<std::collections::HashSet<SourceBacking>>,
     pub(crate) staging_generation: u64,
     pub(crate) staging_cancel: Arc<AtomicBool>,
     /// Non-fatal scan findings (unreadable folders, truncation).
@@ -131,7 +134,7 @@ impl ImportViewState {
             thumbnail_progress: std::cell::Cell::new(None),
             directory_pass_generation: 0,
             directory_pass_cursor: 0,
-            directory_pass_done: std::cell::Cell::new(0),
+            directory_pass_done: std::cell::RefCell::new(std::collections::HashSet::new()),
             staging_generation: 0,
             staging_cancel: Arc::new(AtomicBool::new(false)),
             duplicates: HashSet::new(),
@@ -233,7 +236,7 @@ impl PictureBrowser {
                     // alive as long as the folder still exists on disk.
                     let still_there = matches!(&previous, Some(entry) if match &entry.backing {
                         SourceBacking::Path(path) => path.exists(),
-                        SourceBacking::Mtp(_) => false,
+                        SourceBacking::Mtp(_) | SourceBacking::Ptp(_) => false,
                     });
                     if let (true, Some(entry)) = (still_there, previous.clone()) {
                         sources.push(entry);
@@ -515,7 +518,7 @@ impl PictureBrowser {
                 this.import_view.directory_pass_generation =
                     this.import_view.directory_pass_generation.wrapping_add(1);
                 this.import_view.directory_pass_cursor = 0;
-                this.import_view.directory_pass_done.set(0);
+                this.import_view.directory_pass_done.borrow_mut().clear();
                 this.schedule_directory_thumbnail_pass(cx);
                 cx.notify();
             })
@@ -580,8 +583,8 @@ impl PictureBrowser {
                 files.push(companion);
             }
             for file in files {
-                if let SourceBacking::Mtp(reference) = &file.backing
-                    && !self.import_view.staged.contains_key(reference)
+                if !matches!(file.backing, SourceBacking::Path(_))
+                    && !self.import_view.staged.contains_key(&file.backing)
                 {
                     pending.push(file.clone());
                 }
@@ -596,9 +599,9 @@ impl PictureBrowser {
                 if cancel.load(Ordering::Acquire) {
                     return;
                 }
-                let reference = match &file.backing {
-                    SourceBacking::Mtp(reference) => reference.clone(),
+                let backing = match &file.backing {
                     SourceBacking::Path(_) => continue,
+                    backing => backing.clone(),
                 };
                 let task = cx.background_spawn({
                     let access = Arc::clone(&access);
@@ -615,7 +618,7 @@ impl PictureBrowser {
                         return;
                     }
                     if let Ok(Some(path)) = staged {
-                        this.import_view.staged.insert(reference, path);
+                        this.import_view.staged.insert(backing, path);
                     }
                     cx.notify();
                 })
@@ -796,8 +799,10 @@ impl PictureBrowser {
     fn import_new_folder_key_down(&mut self, event: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
         // Enter is handled by the ImportNewFolderConfirm action binding so it
         // takes precedence over the MainView keymap.
+        let mut handled = false;
         if event.keystroke.key == "backspace" {
             self.import_view.new_folder_name.pop();
+            handled = true;
         } else if !event.keystroke.modifiers.control
             && !event.keystroke.modifiers.platform
             && let Some(text) = &event.keystroke.key_char
@@ -806,6 +811,12 @@ impl PictureBrowser {
                 .all(|c| !c.is_control() && c != '/' && c != '\\')
         {
             self.import_view.new_folder_name.push_str(text);
+            handled = true;
+        }
+        if handled {
+            // Consumed keys must not reach the root plain-key shortcut
+            // listener (a typed "d" would otherwise toggle the view).
+            cx.stop_propagation();
         }
         cx.notify();
     }
@@ -838,14 +849,11 @@ impl PictureBrowser {
         // itself never touches the device twice.
         for photo in &mut photos {
             let staged = &self.import_view.staged;
-            if let SourceBacking::Mtp(reference) = &photo.primary.backing
-                && let Some(path) = staged.get(reference)
-            {
+            if let Some(path) = staged.get(&photo.primary.backing) {
                 photo.primary.backing = SourceBacking::Path(path.clone());
             }
             if let Some(companion) = &mut photo.companion
-                && let SourceBacking::Mtp(reference) = &companion.backing
-                && let Some(path) = staged.get(reference)
+                && let Some(path) = staged.get(&companion.backing)
             {
                 companion.backing = SourceBacking::Path(path.clone());
             }
@@ -858,6 +866,9 @@ impl PictureBrowser {
             cx.notify();
             return;
         };
+        // Preview staging swaps device backings for cache paths, so the
+        // import reads a mix of device objects and staged files.
+        let access = sources::staged_import_access(access);
         let root = self.settings.root.clone();
         let destination_base = self
             .import_view
@@ -1472,8 +1483,8 @@ impl PictureBrowser {
                                 _ => div().text_xs().child("Loading…").into_any_element(),
                             }
                         }
-                        SourceBacking::Mtp(reference) => {
-                            match self.import_view.staged.get(reference) {
+                        SourceBacking::Mtp(_) | SourceBacking::Ptp(_) => {
+                            match self.import_view.staged.get(backing) {
                                 Some(path) => {
                                     let identity = self.render_identity_for(path);
                                     match self.thumbnails.state_for(path, identity) {
@@ -2129,7 +2140,7 @@ impl PictureBrowser {
     /// Thumbnail-generation progress for the whole current directory:
     /// rendered previews over renderable photos (path-backed or staged).
     /// Throttled: the footer calls this every frame and the scan is O(photos).
-    fn import_thumbnail_progress(&self) -> (usize, usize) {
+    pub(crate) fn import_thumbnail_progress(&self) -> (usize, usize) {
         const PROGRESS_REFRESH: Duration = Duration::from_millis(250);
         if let Some((at, rendered, total)) = self.import_view.thumbnail_progress.get()
             && at.elapsed() < PROGRESS_REFRESH
@@ -2140,14 +2151,19 @@ impl PictureBrowser {
         // Monotonic per-pass accounting: a file that has EVER been rendered
         // (or terminally failed) stays counted as done even if the LRU cache
         // evicts it, so the bar never moves backwards and completion stays
-        // reachable for directories larger than the cache.
-        let mut rendered = self.import_view.directory_pass_done.get();
-        let mut total = rendered;
+        // reachable for directories larger than the cache. Done is a SET of
+        // files, not an added counter — the footer rescans every 250 ms, and
+        // an additive high-water mark would re-count every terminal file on
+        // each scan (the target racing into the thousands). The target is
+        // the count of files with a renderable path, which staging only
+        // ever grows towards its bounded budget.
+        let mut ever_rendered = self.import_view.directory_pass_done.borrow_mut();
+        let mut total = 0;
         for photo in &self.import_view.photos {
             for file in std::iter::once(&photo.primary).chain(photo.companion.as_ref()) {
                 let display_path = match &file.backing {
                     SourceBacking::Path(path) => Some(path.clone()),
-                    SourceBacking::Mtp(reference) => staged.get(reference).cloned(),
+                    other => staged.get(other).cloned(),
                 };
                 let Some(path) = display_path else {
                     continue;
@@ -2158,12 +2174,12 @@ impl PictureBrowser {
                     self.thumbnails.state_for(&path, identity),
                     PreviewState::Loaded(_) | PreviewState::Error(_)
                 ) {
-                    rendered += 1;
-                    self.import_view.directory_pass_done.set(rendered);
+                    ever_rendered.insert(file.backing.clone());
                 }
             }
         }
-        rendered = rendered.min(total);
+        let rendered = ever_rendered.len().min(total);
+        drop(ever_rendered);
         self.import_view
             .thumbnail_progress
             .set(Some((std::time::Instant::now(), rendered, total)));
@@ -2217,7 +2233,7 @@ impl PictureBrowser {
             let photo = &self.import_view.photos[index];
             let path = match &photo.primary.backing {
                 SourceBacking::Path(path) => Some(path.clone()),
-                SourceBacking::Mtp(reference) => self.import_view.staged.get(reference).cloned(),
+                other => self.import_view.staged.get(other).cloned(),
             };
             let Some(path) = path else {
                 continue;

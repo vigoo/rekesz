@@ -615,7 +615,7 @@ fn open_destination(
 }
 
 /// Where a file's bytes come from, for trace lines: the filesystem path for
-/// path-backed files (including staged device copies), the MTP object
+/// path-backed files (including staged device copies), the device object
 /// address otherwise.
 fn backing_label(backing: &SourceBacking) -> String {
     match backing {
@@ -623,6 +623,10 @@ fn backing_label(backing: &SourceBacking) -> String {
         SourceBacking::Mtp(reference) => format!(
             "mtp://{}/{}/{}",
             reference.device_id, reference.storage_id, reference.object
+        ),
+        SourceBacking::Ptp(reference) => format!(
+            "ptp://{}{}/{}",
+            reference.device_id, reference.folder, reference.name
         ),
     }
 }

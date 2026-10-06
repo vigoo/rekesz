@@ -25,7 +25,8 @@ jobs:
           components: rustfmt, clippy
 
       # gpui needs freetype/fontconfig/xkbcommon/wayland/x11 to link, and
-      # blade-graphics needs libvulkan; libmtp backs the MTP source provider.
+      # blade-graphics needs libvulkan; libmtp backs the MTP source provider
+      # and libgphoto2 the PTP camera provider.
       - name: Install Linux system packages
         if: runner.os == 'Linux'
         run: |
@@ -38,11 +39,12 @@ jobs:
             libx11-dev \
             libvulkan-dev \
             libmtp-dev \
+            libgphoto2-dev \
             pkg-config
 
       - name: Install macOS packages
         if: runner.os == 'macOS'
-        run: brew install libmtp pkg-config
+        run: brew install libmtp libgphoto2 pkg-config
 
       - uses: Swatinem/rust-cache@v2
 

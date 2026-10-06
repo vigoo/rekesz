@@ -56,7 +56,7 @@ impl DestinationPreset {
 }
 
 /// Capture date of a source file: EXIF/XMP capture time when the backing is a
-/// readable path, else the file's modification time, else today. MTP files
+/// readable path, else the file's modification time, else today. Device files
 /// fall back to their modification time; staged copies carry the device
 /// timestamp, and their EXIF is read like any library file.
 ///
@@ -66,7 +66,7 @@ impl DestinationPreset {
 pub fn capture_date(file: &ScannedFile) -> NaiveDate {
     let time = match &file.backing {
         SourceBacking::Path(path) => crate::metadata::file_capture_time(path),
-        SourceBacking::Mtp(_) => None,
+        SourceBacking::Mtp(_) | SourceBacking::Ptp(_) => None,
     }
     .or(file.modified);
     date_from(time).unwrap_or_else(|| Local::now().date_naive())

@@ -4360,13 +4360,19 @@ fn import_destination_picker_creates_folder(cx: &mut gpui::TestAppContext) {
     // keystroke-driven actions like the input's Enter binding.
     cx.update(|_, cx| bind_picture_browser_keys(cx));
 
-    cx.simulate_keystrokes("summer 2 0 2 4");
+    // "d" is regression cover: the Developed toggle used to be a keymap
+    // binding, which beats key listeners and silently swallowed the letter.
+    cx.simulate_keystrokes("d 2 0 2 4");
     cx.run_until_parked();
+    assert_eq!(
+        _view.read_with(&*cx, |view, _| view.import_view.new_folder_name.clone()),
+        "d2024"
+    );
     cx.simulate_keystrokes("enter");
     cx.run_until_parked();
 
     assert!(
-        library.join("summer2024").is_dir(),
+        library.join("d2024").is_dir(),
         "typed folder was not created"
     );
     assert_eq!(
@@ -4374,7 +4380,7 @@ fn import_destination_picker_creates_folder(cx: &mut gpui::TestAppContext) {
             view.import_view.creating_folder,
             view.import_view.picker_entries.clone().unwrap()
         )),
-        (false, vec!["summer2024".to_owned()])
+        (false, vec!["d2024".to_owned()])
     );
 }
 
@@ -4477,4 +4483,40 @@ fn import_layout_combobox_and_duplicates_toggle_persist(cx: &mut gpui::TestAppCo
         saved.contains("\"import_include_duplicates\": true"),
         "duplicates policy not persisted: {saved}"
     );
+}
+
+#[gpui::test]
+fn import_footer_progress_counts_each_file_once(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let library = root.path().join("library");
+    std::fs::create_dir(&library).unwrap();
+    let card = write_import_source(root.path(), "card", 0, 3);
+    let (_view, cx) = import_view_with_card(cx, &library, &card);
+
+    // Let the whole-directory thumbnail pass (batched on timers) and the
+    // decodes settle. Progress reads sit behind a 250 ms throttle, so every
+    // read below expires it first.
+    for _ in 0..6 {
+        cx.executor().advance_clock(Duration::from_millis(300));
+        cx.run_until_parked();
+    }
+    let (mut rendered, total) = _view.read_with(&*cx, |view, _| view.import_thumbnail_progress());
+    assert_eq!(total, 3, "target is the listing's file count");
+
+    // Repeated scans must neither compound the done counter nor grow the
+    // target — the regression for the runaway "6249 / 6293" footer, where
+    // every 250 ms rescan re-added all terminal files to the high-water
+    // mark and both numbers raced past the listing size. Rendered may grow
+    // (decodes finish between scans) but stays bounded by the target.
+    for _ in 0..4 {
+        cx.executor().advance_clock(Duration::from_millis(300));
+        let (again_rendered, again_total) =
+            _view.read_with(&*cx, |view, _| view.import_thumbnail_progress());
+        assert_eq!(again_total, 3, "target must not grow across rescans");
+        assert!(
+            again_rendered >= rendered && again_rendered <= again_total,
+            "rendered must be monotonic and bounded: {rendered} → {again_rendered}"
+        );
+        rendered = again_rendered;
+    }
 }

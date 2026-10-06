@@ -87,3 +87,102 @@ fn sanitize_components_keep_paths_safe() {
         PathBuf::from("/cache/import-staging/weird_.._device/s_t/7-a_b_c_.jpg")
     );
 }
+
+fn ptp_file(name: &str, size: u64) -> ScannedFile {
+    ScannedFile {
+        backing: SourceBacking::Ptp(crate::sources::ptp::PtpObjectRef {
+            device_id: Arc::from("gphoto:usb:005,012"),
+            folder: Arc::from("/DCIM/100CANON"),
+            name: Arc::from(""),
+        }),
+        name: name.to_owned(),
+        size,
+        modified: None,
+    }
+}
+
+#[test]
+fn ptp_staged_paths_key_folder_and_name() {
+    let file = ptp_file("IMG_0001.JPG", 10);
+    let path = staged_path(Path::new("/cache"), &file).expect("device file");
+    assert_eq!(
+        path,
+        PathBuf::from("/cache/import-staging/gphoto_usb_005_012/DCIM_100CANON-IMG_0001.JPG")
+    );
+}
+
+/// A source with a native to-path transfer, like the gphoto2 backend:
+/// the bytes never pass through `read_file`.
+struct DirectSource {
+    payload: Vec<u8>,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl SourceAccess for DirectSource {
+    fn list_dir(
+        &self,
+        _dir: &SourceBacking,
+    ) -> std::io::Result<Vec<crate::sources::SourceDirEntry>> {
+        unreachable!("staging tests never list")
+    }
+
+    fn read_file(
+        &self,
+        _file: &SourceBacking,
+        _out: &mut dyn std::io::Write,
+        _cancel: &AtomicBool,
+        _progress: &mut dyn FnMut(u64),
+    ) -> std::io::Result<u64> {
+        unreachable!("direct source transfers via read_file_to_path")
+    }
+
+    fn read_file_to_path(
+        &self,
+        _file: &SourceBacking,
+        destination: &Path,
+        cancel: &AtomicBool,
+        progress: &mut dyn FnMut(u64),
+    ) -> Option<std::io::Result<u64>> {
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            return Some(Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "cancelled",
+            )));
+        }
+        if let Err(error) = std::fs::write(destination, &self.payload) {
+            return Some(Err(error));
+        }
+        progress(self.payload.len() as u64);
+        Some(Ok(self.payload.len() as u64))
+    }
+}
+
+#[test]
+fn direct_staging_carries_the_device_timestamp() {
+    let cache = tempfile::tempdir().expect("cache");
+    let modified =
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    let mut file = ptp_file("IMG_0001.JPG", 4);
+    file.modified = Some(modified);
+
+    let source = DirectSource {
+        payload: b"jpeg".to_vec(),
+        modified: None,
+    };
+    let staged = stage_file(&source, &file, cache.path(), &AtomicBool::new(false))
+        .expect("stage")
+        .expect("device file");
+    assert_eq!(std::fs::read(&staged).expect("read"), b"jpeg");
+    // The device mtime must survive staging (the reuse check compares it
+    // against the device timestamp on every browse).
+    assert_eq!(
+        std::fs::metadata(&staged).expect("meta").modified().ok(),
+        Some(modified)
+    );
+
+    // A second stage of the same file reuses the copy.
+    let again = stage_file(&source, &file, cache.path(), &AtomicBool::new(false))
+        .expect("stage")
+        .expect("device file");
+    assert_eq!(again, staged);
+}

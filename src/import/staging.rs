@@ -1,7 +1,7 @@
-//! Staging of device files into the cache directory. MTP objects have no
-//! filesystem path, so they are downloaded once into the cache to give the
-//! render pipeline (thumbnails) and the EXIF capture-time reader a real file
-//! to work with.
+//! Staging of device files into the cache directory. Device objects (MTP
+//! objects, PTP camera files) have no filesystem path, so they are
+//! downloaded once into the cache to give the render pipeline (thumbnails)
+//! and the EXIF capture-time reader a real file to work with.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,20 +31,30 @@ fn sanitize_component(value: &str) -> String {
 /// Where a device file is staged inside the cache directory, if its backing
 /// is a device object.
 pub fn staged_path(cache_root: &Path, file: &ScannedFile) -> Option<PathBuf> {
-    let SourceBacking::Mtp(reference) = &file.backing else {
-        return None;
-    };
-    Some(
-        cache_root
-            .join("import-staging")
-            .join(sanitize_component(&reference.device_id))
-            .join(sanitize_component(&reference.storage_id))
-            .join(format!(
-                "{}-{}",
-                sanitize_component(&reference.object),
-                sanitize_component(&file.name)
-            )),
-    )
+    match &file.backing {
+        SourceBacking::Mtp(reference) => Some(
+            cache_root
+                .join("import-staging")
+                .join(sanitize_component(&reference.device_id))
+                .join(sanitize_component(&reference.storage_id))
+                .join(format!(
+                    "{}-{}",
+                    sanitize_component(&reference.object),
+                    sanitize_component(&file.name)
+                )),
+        ),
+        SourceBacking::Ptp(reference) => Some(
+            cache_root
+                .join("import-staging")
+                .join(sanitize_component(&reference.device_id))
+                .join(format!(
+                    "{}-{}",
+                    sanitize_component(reference.folder.trim_start_matches('/')),
+                    sanitize_component(&file.name)
+                )),
+        ),
+        SourceBacking::Path(_) => None,
+    }
 }
 
 /// Download a device file into the cache directory, unless a complete copy is
@@ -76,9 +86,19 @@ pub fn stage_file(
         std::fs::create_dir_all(parent)?;
     }
     let partial = destination.with_extension("rekesz-part");
-    let mut out = std::fs::File::create(&partial)?;
-    let written = access.read_file(&file.backing, &mut out, cancel, &mut |_| {})?;
-    drop(out);
+    // A leftover part file from an earlier run must go: device transfers
+    // with a native to-path download refuse existing destinations.
+    let _ = std::fs::remove_file(&partial);
+    let written = if let Some(result) =
+        access.read_file_to_path(&file.backing, &partial, cancel, &mut |_| {})
+    {
+        result?
+    } else {
+        let mut out = std::fs::File::create(&partial)?;
+        let written = access.read_file(&file.backing, &mut out, cancel, &mut |_| {})?;
+        drop(out);
+        written
+    };
     if cancel.load(Ordering::Acquire) {
         let _ = std::fs::remove_file(&partial);
         return Err(std::io::Error::new(
@@ -95,10 +115,12 @@ pub fn stage_file(
     }
     if let Some(modified) = file.modified {
         // Kept so the reuse check above can detect object-id reuse, and so
-        // tools browsing the cache see the capture order.
+        // tools browsing the cache see the capture order. Set on the
+        // part file: the destination only comes into being with the rename
+        // below, and `rename` preserves the timestamp.
         let _ = std::fs::OpenOptions::new()
             .write(true)
-            .open(&destination)
+            .open(&partial)
             .and_then(|handle| handle.set_modified(modified));
     }
     std::fs::rename(&partial, &destination)?;

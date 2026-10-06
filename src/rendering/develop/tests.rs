@@ -315,3 +315,116 @@ fn grain_is_deterministic_per_asset_seed() {
     assert_eq!(first, repeat);
     assert_ne!(first, other);
 }
+
+#[test]
+fn clarity_at_zero_is_a_pixel_identical_noop() {
+    let image = RgbaImage::from_pixel(16, 16, Rgba([90, 140, 200, 255]));
+    let mut result = image.clone();
+    Clarity { amount: 0.0 }
+        .apply(&mut result, &AtomicBool::new(false))
+        .unwrap();
+    assert_eq!(result, image);
+}
+
+#[test]
+fn clarity_keeps_neutral_gradients_neutral() {
+    let mut image = RgbaImage::new(64, 64);
+    for y in 0..64 {
+        for x in 0..64 {
+            let value = (x * 4) as u8;
+            image.put_pixel(x, y, Rgba([value, value, value, 255]));
+        }
+    }
+    let mut result = image.clone();
+    Clarity { amount: 100.0 }
+        .apply(&mut result, &AtomicBool::new(false))
+        .unwrap();
+    for (original, adjusted) in image.pixels().zip(result.pixels()) {
+        assert_eq!(adjusted[0], adjusted[1], "green diverged from red");
+        assert_eq!(adjusted[1], adjusted[2], "blue diverged from green");
+        let _ = original;
+    }
+}
+
+#[test]
+fn positive_clarity_increases_edge_contrast_and_negative_reduces_it() {
+    let mut image = RgbaImage::new(270, 540);
+    for y in 0..540 {
+        for x in 0..270 {
+            let value = if x < 135 { 51_u8 } else { 191_u8 };
+            image.put_pixel(x, y, Rgba([value, value, value, 255]));
+        }
+    }
+    let edge_difference = |image: &RgbaImage| {
+        let before = i32::from(image.get_pixel(134, 270)[0]);
+        let after = i32::from(image.get_pixel(135, 270)[0]);
+        (after - before).abs()
+    };
+    let baseline = edge_difference(&image);
+    let mut boosted = image.clone();
+    Clarity { amount: 100.0 }
+        .apply(&mut boosted, &AtomicBool::new(false))
+        .unwrap();
+    assert!(
+        edge_difference(&boosted) > baseline,
+        "positive clarity must open the edge gap: {} -> {}",
+        baseline,
+        edge_difference(&boosted)
+    );
+    let mut flattened = image.clone();
+    Clarity { amount: -100.0 }
+        .apply(&mut flattened, &AtomicBool::new(false))
+        .unwrap();
+    assert!(
+        edge_difference(&flattened) < baseline,
+        "negative clarity must close the edge gap: {} -> {}",
+        baseline,
+        edge_difference(&flattened)
+    );
+}
+
+#[test]
+fn clarity_leaves_saturated_blacks_and_whites_untouched() {
+    let mut image = RgbaImage::new(270, 540);
+    for y in 0..540 {
+        for x in 0..270 {
+            let value = if y < 180 {
+                0_u8
+            } else if y < 360 {
+                128_u8
+            } else {
+                255_u8
+            };
+            image.put_pixel(x, y, Rgba([value, value, value, 255]));
+        }
+    }
+    let mut result = image.clone();
+    Clarity { amount: 100.0 }
+        .apply(&mut result, &AtomicBool::new(false))
+        .unwrap();
+    for y in [0, 179, 360, 539] {
+        for x in [0, 135, 269] {
+            assert_eq!(
+                result.get_pixel(x, y),
+                image.get_pixel(x, y),
+                "extreme tone at ({x},{y}) changed"
+            );
+        }
+    }
+}
+
+#[test]
+fn presence_at_zero_is_a_pixel_identical_noop() {
+    let image = RgbaImage::from_pixel(16, 16, Rgba([90, 140, 200, 255]));
+    let mut round_trip = image.clone();
+    Presence {
+        texture: Some(0.0),
+        dehaze: Some(0.0),
+    }
+    .apply(&mut round_trip, &AtomicBool::new(false))
+    .unwrap();
+    assert_eq!(
+        round_trip, image,
+        "u8 to linear to u8 must round-trip exactly"
+    );
+}
