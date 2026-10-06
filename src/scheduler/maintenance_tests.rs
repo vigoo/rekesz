@@ -506,8 +506,7 @@ fn advertised_higher_rank_wins_checkpoint_race_before_registering_waiter() {
     drop(started);
 
     let high_scheduler_id = admission.register_scheduler();
-    let advertised_at = Instant::now();
-    admission.advertise(high_scheduler_id, Some((100, advertised_at)));
+    admission.advertise(high_scheduler_id, Some(100));
     *allow_checkpoint.0.lock().unwrap() = true;
     allow_checkpoint.1.notify_all();
     assert!(admission.wait_until_waiters(1, Duration::from_secs(2)));
@@ -518,7 +517,9 @@ fn advertised_higher_rank_wins_checkpoint_race_before_registering_waiter() {
     let high = thread::spawn(move || {
         let cancelled = AtomicBool::new(false);
         let permit = high_admission
-            .acquire(high_scheduler_id, 100, advertised_at, &cancelled, &|| false)
+            .acquire(high_scheduler_id, 100, Instant::now(), &cancelled, &|| {
+                false
+            })
             .expect("advertised high-priority job must acquire");
         high_order.lock().unwrap().push("high");
         high_admission.advertise(high_scheduler_id, None);
@@ -579,17 +580,15 @@ fn one_worker_checkpoint_does_not_yield_to_its_own_queued_job() {
 }
 
 #[test]
-fn rank_1000_waiter_acquires_despite_long_aged_backlog_advertisement() {
+fn rank_1000_waiter_acquires_despite_backlog_advertisement() {
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
     let admission = MaintenanceAdmission::new();
     let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // A scheduler advertising a queued job whose enqueue time predates the
-    // aging cap: its aged rank saturates below the rank-1000 inventory, so
-    // the inventory must acquire instead of wedging against the
-    // advertisement.
-    admission.advertise(7, Some((200, Instant::now() - Duration::from_secs(1200))));
+    // A scheduler advertising a queued rank-200 backlog job (its own workers
+    // have not picked it up) must not wedge the rank-1000 inventory acquire.
+    admission.advertise(7, Some(200));
     let (sender, receiver) = std::sync::mpsc::channel();
     {
         let admission = admission.clone();
@@ -599,11 +598,141 @@ fn rank_1000_waiter_acquires_despite_long_aged_backlog_advertisement() {
             let _ = sender.send(outcome);
         });
     }
-    // A regression (unbounded aging) wedges the acquire forever; fail the
-    // test instead of hanging the suite.
+    // A regression wedges the acquire forever; fail the test instead of
+    // hanging the suite.
     let outcome = receiver
         .recv_timeout(Duration::from_secs(10))
-        .expect("rank-1000 acquire must not wedge against an aged backlog");
+        .expect("rank-1000 acquire must not wedge against a backlog advertisement");
     assert_eq!(outcome, Some(42));
     assert!(!cancelled.load(std::sync::atomic::Ordering::Acquire));
+}
+
+#[test]
+fn equal_rank_advertisement_does_not_delay_equal_rank_acquire() {
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    // This is the production convoy in miniature: a scheduler with a deep
+    // backlog (its advertised job has aged to the cap) must not hold an idle
+    // permit away from another scheduler's equal-rank job. With aged
+    // advertisements the waiter could only proceed once its own aged rank
+    // matched the advertisement's (the 500s stall); with base-rank
+    // advertisements it acquires immediately.
+    let admission = MaintenanceAdmission::new();
+    admission.advertise(7, Some(0));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let (sender, receiver) = std::sync::mpsc::channel();
+    {
+        let cancelled = cancelled.clone();
+        std::thread::spawn(move || {
+            let outcome = admission.run_maintenance(0, &cancelled, || 7);
+            let _ = sender.send(outcome);
+        });
+    }
+    let outcome = receiver
+        .recv_timeout(Duration::from_millis(300))
+        .expect("equal-rank acquire must not wait behind a backlog advertisement");
+    assert_eq!(outcome, Some(7));
+    assert!(!cancelled.load(std::sync::atomic::Ordering::Acquire));
+}
+
+#[test]
+fn aged_equal_rank_waiter_does_not_preempt_at_checkpoint() {
+    let admission = MaintenanceAdmission::new();
+    let low_started = Arc::new((Mutex::new(false), Condvar::new()));
+    let allow_checkpoint = Arc::new((Mutex::new(false), Condvar::new()));
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let low = MaintenanceScheduler::new_with_admission(1, admission.clone(), {
+        let admission = admission.clone();
+        let low_started = low_started.clone();
+        let allow_checkpoint = allow_checkpoint.clone();
+        let order = order.clone();
+        Arc::new(move |_: &u8, cancelled| {
+            order.lock().unwrap().push("low-start");
+            *low_started.0.lock().unwrap() = true;
+            low_started.1.notify_all();
+            let mut allowed = allow_checkpoint.0.lock().unwrap();
+            while !*allowed {
+                allowed = allow_checkpoint.1.wait(allowed).unwrap();
+            }
+            drop(allowed);
+            assert!(admission.checkpoint(cancelled));
+            order.lock().unwrap().push("low-finish");
+            Ok(())
+        })
+    });
+    let equal = MaintenanceScheduler::new_with_admission(1, admission.clone(), {
+        let order = order.clone();
+        Arc::new(move |_: &u8, _| {
+            order.lock().unwrap().push("equal");
+            Ok(())
+        })
+    });
+    low.submit(1, 0);
+    let mut started = low_started.0.lock().unwrap();
+    while !*started {
+        started = low_started.1.wait(started).unwrap();
+    }
+    drop(started);
+    equal.submit(1, 0);
+    assert!(admission.wait_until_waiters(1, Duration::from_secs(2)));
+    // Let the equal-rank waiter age past rank 0 (the test aging interval is
+    // 10ms); an aged equal-rank waiter must still not preempt the running
+    // job. Yielding here would re-queue the runner behind the waiter with a
+    // fresh ticket, turning the checkpoint into a full aging-cap stall.
+    thread::sleep(Duration::from_millis(120));
+    *allow_checkpoint.0.lock().unwrap() = true;
+    allow_checkpoint.1.notify_all();
+    assert!(low.wait_until_settled(Duration::from_secs(2)));
+    assert!(equal.wait_until_settled(Duration::from_secs(2)));
+    assert_eq!(
+        order.lock().unwrap().as_slice(),
+        &["low-start", "low-finish", "equal"],
+        "an aged equal-rank waiter must not preempt a running job at a checkpoint"
+    );
+}
+
+#[test]
+fn widened_admission_runs_disjoint_services_concurrently_up_to_the_limit() {
+    let admission = MaintenanceAdmission::new();
+    admission.set_max_active(2);
+    admission.set_foreground_blocked(true);
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let completed = Arc::new(AtomicUsize::new(0));
+    let make_scheduler = || {
+        let admission = admission.clone();
+        let active = active.clone();
+        let peak = peak.clone();
+        let completed = completed.clone();
+        MaintenanceScheduler::new_with_admission(1, admission, {
+            Arc::new(move |_: &u8, _| {
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(50));
+                active.fetch_sub(1, Ordering::SeqCst);
+                completed.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        })
+    };
+    let first = make_scheduler();
+    let second = make_scheduler();
+    let third = make_scheduler();
+    first.submit(1, 0);
+    second.submit(1, 0);
+    third.submit(1, 0);
+    assert!(admission.wait_until_waiters(3, Duration::from_secs(2)));
+    assert_eq!(completed.load(Ordering::SeqCst), 0);
+    admission.set_foreground_blocked(false);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while completed.load(Ordering::SeqCst) < 3 && Instant::now() < deadline {
+        thread::yield_now();
+    }
+    assert_eq!(completed.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        peak.load(Ordering::SeqCst),
+        2,
+        "widened admission must run two jobs concurrently, but never more"
+    );
 }

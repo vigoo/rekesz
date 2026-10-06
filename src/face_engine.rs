@@ -3,7 +3,7 @@ use std::{
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     catalog,
+    config::FaceGpuPolicy,
     jobs::JobLimiter,
     rendering::{
         DECODER_MODEL_ID, RenderIdentity, RenderVariant,
@@ -41,6 +42,39 @@ const ANALYSIS_MODEL_ID: &str = "yunet-2023mar+sface-2021dec";
 const ANALYSIS_MAX_DIMENSION: u32 = 2048;
 const ANALYSIS_MAX_SOURCE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_AUTOMATIC_ANALYSIS_ATTEMPTS: i64 = 5;
+
+/// Targets whose bundled ONNX Runtime build ships the CUDA execution
+/// provider; mirrors the target-scoped `ort/cuda` dependency in Cargo.toml.
+#[cfg_attr(test, allow(dead_code))]
+const CUDA_EP_COMPILED: bool = cfg!(all(
+    any(target_os = "linux", target_os = "windows"),
+    target_arch = "x86_64"
+));
+
+/// Which device the bundled face models run on.
+#[cfg_attr(test, allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FaceComputeDevice {
+    Cpu,
+    Cuda,
+}
+
+#[cfg_attr(test, allow(dead_code))]
+impl FaceComputeDevice {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Cuda => "cuda",
+        }
+    }
+}
+
+/// The automatic device probe's verdict, process-wide, so every analysis
+/// worker lands on the same device instead of each re-attempting (and
+/// re-diagnosing) a failing CUDA session. The probe is unreferenced in test
+/// builds, which pin the device to CPU for deterministic embeddings.
+#[cfg_attr(test, allow(dead_code))]
+static AUTO_COMPUTE_DEVICE: OnceLock<FaceComputeDevice> = OnceLock::new();
 
 #[cfg(test)]
 pub(crate) static ORT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -297,8 +331,9 @@ pub struct FaceAnalysisService {
 }
 
 /// Runtime counters for validating and diagnosing the bounded inference pool.
-/// These counters instrument the production worker/session path (rather than a
-/// parallel test executor), and are intentionally cheap enough to leave on.
+/// These counters instrument the production worker pool itself (one
+/// session per worker, up to `parallelism` concurrent inferences), and are
+/// intentionally cheap enough to leave on.
 #[derive(Default)]
 pub struct FaceAnalysisInstrumentation {
     engines_constructed: std::sync::atomic::AtomicUsize,
@@ -574,6 +609,7 @@ impl FaceAnalysisService {
             limiter,
             admission,
             pipeline,
+            FaceGpuPolicy::Off,
             Arc::new(LiveAnalysisStages),
             None,
         )
@@ -585,6 +621,7 @@ impl FaceAnalysisService {
         admission: MaintenanceAdmission,
         pipeline: RenderPipeline,
         recognition: RecognitionRefreshService,
+        gpu_policy: FaceGpuPolicy,
     ) -> Self {
         let wake = Arc::new(move |root: PathBuf| {
             recognition.enqueue(root, 0);
@@ -594,6 +631,7 @@ impl FaceAnalysisService {
             limiter,
             admission,
             pipeline,
+            gpu_policy,
             Arc::new(LiveAnalysisStages),
             Some(wake),
         )
@@ -604,6 +642,7 @@ impl FaceAnalysisService {
         limiter: JobLimiter,
         admission: MaintenanceAdmission,
         pipeline: RenderPipeline,
+        gpu_policy: FaceGpuPolicy,
         analysis_stages: Arc<dyn ProductionAnalysisStages>,
         recognition_wake: Option<Arc<dyn Fn(PathBuf) + Send + Sync>>,
     ) -> Self {
@@ -619,17 +658,19 @@ impl FaceAnalysisService {
                 observer: analysis_stages,
                 instrumentation: instrumentation.clone(),
             });
-        // The shared maintenance controller admits exactly one resource-heavy
-        // executor at a time. A single face worker therefore avoids retaining
-        // additional idle ONNX sessions without reducing admitted throughput.
+        // One stateful engine per worker: the scheduler parallelism is also
+        // the explicit inference-session cap, and the shared maintenance
+        // admission (widened to the worker count) keeps that many executors
+        // running at once.
         let scheduler = MaintenanceScheduler::new_with_admission_factory(
-            usize::from(parallelism > 0),
+            parallelism,
             admission,
             Arc::new(move |_| {
                 let executor_paused = executor_paused.clone();
                 let executor_admission = executor_admission.clone();
                 let limiter = limiter.clone();
                 let pipeline = pipeline.clone();
+                let gpu_policy = gpu_policy;
                 let stages = executor_stages.clone();
                 let instrumentation = executor_instrumentation.clone();
                 let analysis_stages = executor_analysis_stages.clone();
@@ -664,7 +705,7 @@ impl FaceAnalysisService {
                         let initialized = if forced_failure {
                             Err(anyhow::anyhow!("injected face-engine setup failure"))
                         } else {
-                            FaceEngine::new()
+                            FaceEngine::with_gpu_policy(gpu_policy)
                         };
                         engine = Some(match initialized {
                             Ok(engine) => engine,
@@ -1036,27 +1077,24 @@ pub struct FaceEngine {
 }
 
 impl FaceEngine {
-    pub fn new() -> Result<Self> {
+    /// Builds the engine, honoring the configured GPU policy. `Auto` probes
+    /// CUDA once per process and falls back to CPU when the driver, CUDA
+    /// runtime, or cuDNN userland libraries are missing; `Off` pins CPU.
+    pub fn with_gpu_policy(policy: FaceGpuPolicy) -> Result<Self> {
+        let device = resolve_compute_device(policy);
+        let engine = Self::build(device)?;
+        crate::trace::event(&format!(
+            "face engine: {} inference sessions (policy {policy:?})",
+            device.as_str(),
+        ));
+        Ok(engine)
+    }
+
+    fn build(device: FaceComputeDevice) -> Result<Self> {
         validate_packaged_face_assets()?;
         Ok(Self {
-            detector: Session::builder()?
-                // Keep one background analysis worker from expanding into an
-                // unbounded host-sized ORT pool. Two intra-op threads retain
-                // useful model parallelism while respecting the release CPU
-                // envelope; the models are invoked sequentially.
-                .with_intra_threads(2)
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?
-                .with_inter_threads(1)
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?
-                .commit_from_memory(YUNET)
-                .context("load bundled YuNet face detector")?,
-            recognizer: Session::builder()?
-                .with_intra_threads(2)
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?
-                .with_inter_threads(1)
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?
-                .commit_from_memory(SFACE)
-                .context("load bundled SFace recognizer")?,
+            detector: build_inference_session(YUNET, device, "YuNet face detector")?,
+            recognizer: build_inference_session(SFACE, device, "SFace recognizer")?,
             network: OfflineNetworkCapability,
         })
     }
@@ -1175,6 +1213,142 @@ impl FaceEngine {
     }
 }
 
+/// Picks the inference device for the configured policy. `Auto` benchmarks
+/// both devices once per process (CUDA only when the whole stack — driver,
+/// CUDA runtime, cuDNN, execution provider — initializes) and keeps the
+/// faster one: these models are small enough that a latency-bound GPU can
+/// lose to the CPU. Any failure falls back to CPU with a diagnostic. Face
+/// tests are pinned to CPU so their embeddings stay deterministic regardless
+/// of the host GPU.
+fn resolve_compute_device(policy: FaceGpuPolicy) -> FaceComputeDevice {
+    #[cfg(test)]
+    {
+        let _ = policy;
+        FaceComputeDevice::Cpu
+    }
+    #[cfg(not(test))]
+    match policy {
+        FaceGpuPolicy::Off => FaceComputeDevice::Cpu,
+        FaceGpuPolicy::Auto => {
+            if !CUDA_EP_COMPILED {
+                FaceComputeDevice::Cpu
+            } else {
+                *AUTO_COMPUTE_DEVICE.get_or_init(benchmark_auto_device)
+            }
+        }
+    }
+}
+
+/// One-time `Auto` probe: time the YuNet detection pass on each device and
+/// keep the winner. Detection is the heavier of the two models (640×640
+/// input versus 112×112), so it is a representative proxy for photo cost.
+#[cfg(not(test))]
+fn benchmark_auto_device() -> FaceComputeDevice {
+    let describe = |result: &Result<std::time::Duration>| match result {
+        Ok(duration) => format!("{}ms", duration.as_millis()),
+        Err(error) => format!("failed ({error:#})"),
+    };
+    let cpu = benchmark_device(FaceComputeDevice::Cpu);
+    let cuda = benchmark_device(FaceComputeDevice::Cuda);
+    match (&cpu, &cuda) {
+        (Ok(cpu_time), Ok(cuda_time)) => {
+            let device = if cuda_time < cpu_time {
+                FaceComputeDevice::Cuda
+            } else {
+                FaceComputeDevice::Cpu
+            };
+            crate::trace::slow_event(&format!(
+                "face engine: auto device benchmark · cpu {} · cuda {} per detection → {}",
+                describe(&cpu),
+                describe(&cuda),
+                device.as_str(),
+            ));
+            device
+        }
+        _ => {
+            crate::trace::slow_event(&format!(
+                "face engine: auto device benchmark · cpu {} · cuda {} → cpu fallback",
+                describe(&cpu),
+                describe(&cuda),
+            ));
+            FaceComputeDevice::Cpu
+        }
+    }
+}
+
+/// Average steady-state duration of one detection pass on `device`.
+#[cfg(not(test))]
+fn benchmark_device(device: FaceComputeDevice) -> Result<std::time::Duration> {
+    // Enough warmup for cuDNN plan caching and a measure of GPU clock ramp;
+    // the comparison measures steady state, the regime a 150k-photo backlog
+    // actually runs in.
+    const WARMUP_RUNS: usize = 8;
+    const TIMED_RUNS: usize = 6;
+    let mut engine = FaceEngine::build(device)?;
+    // Structured synthetic frame: detection cost is input-shape dominated,
+    // so the content only needs to exercise the full session path.
+    let frame = DynamicImage::ImageRgb8(image::RgbImage::from_fn(640, 480, |x, y| {
+        Rgb([
+            (x * 255 / 640) as u8,
+            (y * 255 / 480) as u8,
+            ((x + y) % 256) as u8,
+        ])
+    }));
+    for _ in 0..WARMUP_RUNS {
+        engine.detect(&frame)?;
+    }
+    let started = std::time::Instant::now();
+    for _ in 0..TIMED_RUNS {
+        engine.detect(&frame)?;
+    }
+    Ok(started.elapsed() / TIMED_RUNS as u32)
+}
+
+fn build_inference_session(
+    model: &[u8],
+    device: FaceComputeDevice,
+    label: &str,
+) -> Result<Session> {
+    // Bounded per-worker ORT pools: each session gets two intra-op threads,
+    // so N workers use 2N ORT threads; the models are invoked sequentially
+    // within each job.
+    let builder = Session::builder()?
+        .with_intra_threads(2)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?
+        .with_inter_threads(1)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    // Registration errors must propagate (error_on_failure): ort otherwise
+    // swallows a failed CUDA EP registration — its log line is compiled out
+    // without the tracing feature — and silently commits the session on CPU.
+    #[cfg(all(
+        any(target_os = "linux", target_os = "windows"),
+        target_arch = "x86_64"
+    ))]
+    let mut builder = if device == FaceComputeDevice::Cuda {
+        use ort::ep::cuda::ConvAlgorithmSearch;
+        builder
+            .with_execution_providers([ort::ep::CUDA::default()
+                .with_device_id(0)
+                // The analysis input shapes are fixed, so the exhaustive
+                // first-run algorithm benchmarking buys nothing.
+                .with_conv_algorithm_search(ConvAlgorithmSearch::Heuristic)
+                .build()
+                .error_on_failure()])
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?
+    } else {
+        builder
+    };
+    #[cfg(not(all(
+        any(target_os = "linux", target_os = "windows"),
+        target_arch = "x86_64"
+    )))]
+    let mut builder = builder;
+    let _ = device;
+    builder
+        .commit_from_memory(model)
+        .with_context(|| format!("load bundled {label}"))
+}
+
 pub fn validate_packaged_face_assets() -> Result<()> {
     for (name, bytes, expected) in [
         ("YuNet", YUNET, YUNET_SHA256),
@@ -1211,7 +1385,7 @@ pub fn index_batch(root: &Path, limit: usize) -> Result<usize> {
     if !catalog_path.is_file() || limit == 0 {
         return Ok(0);
     }
-    let mut engine = FaceEngine::new()?;
+    let mut engine = FaceEngine::with_gpu_policy(FaceGpuPolicy::Auto)?;
     let mut indexed = 0;
     while indexed < limit && index_next_asset(root, &catalog_path, &mut engine)? {
         indexed += 1;

@@ -47,6 +47,18 @@ pub(crate) enum FaceCropDiskCachePolicy {
     Disk,
 }
 
+/// How face inference picks its device. `Auto` benchmarks both devices once
+/// at startup — CUDA only when the driver, CUDA runtime, and cuDNN are all
+/// present — and keeps the faster one (these models are small enough that a
+/// latency-bound GPU can lose to the CPU); `Off` pins the CPU.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum FaceGpuPolicy {
+    #[default]
+    Auto,
+    Off,
+}
+
 impl From<PairPreference> for RawJpegPreference {
     fn from(value: PairPreference) -> Self {
         match value {
@@ -87,6 +99,8 @@ pub(crate) struct AppSettings {
     pub face_worker_memory_bytes: u64,
     #[serde(default)]
     pub face_crop_disk_cache: FaceCropDiskCachePolicy,
+    #[serde(default)]
+    pub face_gpu: FaceGpuPolicy,
     #[serde(default)]
     pub import_recent_sources: Vec<PathBuf>,
     #[serde(default)]
@@ -217,6 +231,7 @@ fn defaults(dirs: &directories::ProjectDirs) -> Result<AppSettings> {
         face_workers: default_face_workers(),
         face_worker_memory_bytes: DEFAULT_FACE_WORKER_MEMORY_BYTES,
         face_crop_disk_cache: FaceCropDiskCachePolicy::MemoryOnly,
+        face_gpu: FaceGpuPolicy::Auto,
     })
 }
 

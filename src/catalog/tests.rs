@@ -1885,6 +1885,7 @@ fn reference_people_resource_profile() {
             1,
             1,
         ),
+        crate::config::FaceGpuPolicy::Off,
         Arc::new(RunningStageBarrier {
             target: crate::face_engine::FaceAnalysisStage::Embedding,
             reached: reached.clone(),
@@ -4559,6 +4560,7 @@ fn run_reimport_restart_cancel_soak(cycles: usize, max_duration: Option<Duration
                 1,
                 1,
             ),
+            crate::config::FaceGpuPolicy::Off,
             Arc::new(RunningStageBarrier {
                 target: crate::face_engine::FaceAnalysisStage::Decoding,
                 reached: reached.clone(),
@@ -6067,6 +6069,7 @@ fn losing_service_setup_failure_cannot_clobber_an_active_analysis_claim() {
             1,
             1,
         ),
+        crate::config::FaceGpuPolicy::Off,
         Arc::new(ReleasableStageBarrier {
             target: crate::face_engine::FaceAnalysisStage::Decoding,
             reached: reached.clone(),

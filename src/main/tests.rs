@@ -310,6 +310,7 @@ fn gpui_test_config(root: &Path, cache: &Path) -> Config {
             face_workers: 1,
             face_worker_memory_bytes: 512 * 1024 * 1024,
             face_crop_disk_cache: config::FaceCropDiskCachePolicy::default(),
+            face_gpu: config::FaceGpuPolicy::default(),
             import_recent_sources: Vec::new(),
             import_destination_preset: Default::default(),
             import_include_duplicates: false,

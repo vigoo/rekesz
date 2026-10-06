@@ -25,6 +25,7 @@ fn persisted_settings_are_loaded_and_cli_values_override_them() {
         face_workers: default_face_workers(),
         face_worker_memory_bytes: default_face_worker_memory_bytes(),
         face_crop_disk_cache: FaceCropDiskCachePolicy::default(),
+        face_gpu: FaceGpuPolicy::default(),
         import_recent_sources: Vec::new(),
         import_destination_preset: Default::default(),
         import_include_duplicates: false,

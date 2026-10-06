@@ -11,14 +11,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Point-in-time view of the exclusive maintenance permit, for diagnostic
-/// surfaces: whether foreground work is gating maintenance, whether the
-/// permit is held (and at what rank), and how much is waiting.
+/// Point-in-time view of the maintenance permits, for diagnostic surfaces:
+/// whether foreground work is gating maintenance, how many jobs are admitted
+/// (and at what rank), and how much is waiting.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AdmissionSnapshot {
     pub foreground_blocked: bool,
     pub foreground_activities: usize,
+    /// Highest rank among the admitted jobs; `None` when nothing is admitted.
     pub active_rank: Option<i32>,
+    pub active_jobs: usize,
     pub waiters: usize,
     pub advertised: usize,
 }
@@ -33,20 +35,54 @@ struct AdmissionShared {
     wake: Condvar,
 }
 
-#[derive(Default)]
 struct AdmissionState {
     foreground_blocked: bool,
     foreground_activities: usize,
-    active: Option<(thread::ThreadId, u64, i32)>,
+    /// One entry per admitted job, bounded by `max_active`. The default of one
+    /// keeps the permit exclusive; face analysis widens it so its inference
+    /// workers can run concurrently.
+    active: HashMap<thread::ThreadId, ActiveSlot>,
+    max_active: usize,
     next_ticket: u64,
     waiters: HashMap<u64, AdmissionWaiter>,
     next_scheduler_id: u64,
-    advertised: HashMap<u64, AdmissionWaiter>,
+    advertised: HashMap<u64, Advertisement>,
+}
+
+impl Default for AdmissionState {
+    fn default() -> Self {
+        Self {
+            foreground_blocked: false,
+            foreground_activities: 0,
+            active: HashMap::new(),
+            max_active: 1,
+            next_ticket: 0,
+            waiters: HashMap::new(),
+            next_scheduler_id: 0,
+            advertised: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ActiveSlot {
+    scheduler_id: u64,
+    rank: i32,
 }
 
 struct AdmissionWaiter {
     rank: i32,
     queued_at: Instant,
+}
+
+/// A scheduler's promise that its best queued job needs this base rank.
+/// Unlike real waiters, advertisements are not aged: a deep backlog whose
+/// jobs have all aged to the cap would otherwise present a phantom high rank
+/// and block every other scheduler's equal-priority job for the entire aging
+/// window while the permits sit idle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Advertisement {
+    rank: i32,
 }
 
 struct MaintenancePermit {
@@ -90,6 +126,9 @@ impl MaintenanceAdmission {
         }
     }
 
+    /// Runs the closure once a maintenance permit is admitted at `rank`.
+    /// A thread may hold at most one permit at a time (no nesting); the
+    /// permit is released when the returned guard is dropped.
     pub fn run_maintenance<R>(
         &self,
         rank: i32,
@@ -115,10 +154,22 @@ impl MaintenanceAdmission {
         AdmissionSnapshot {
             foreground_blocked: Self::foreground_blocked(&state),
             foreground_activities: state.foreground_activities,
-            active_rank: state.active.map(|(_, _, rank)| rank),
+            active_rank: state.active.values().map(|slot| slot.rank).max(),
+            active_jobs: state.active.len(),
             waiters: state.waiters.len(),
             advertised: state.advertised.len(),
         }
+    }
+
+    /// Sets the maximum number of concurrently admitted maintenance jobs to
+    /// `n.max(1)`. Foreground gating and rank ordering are unchanged. Use
+    /// this when a service's workers are safe to run in parallel (face
+    /// inference); the default of one keeps the permit exclusive.
+    pub fn set_max_active(&self, n: usize) {
+        let mut state = self.shared.state.lock().unwrap();
+        state.max_active = n.max(1);
+        drop(state);
+        self.shared.wake.notify_all();
     }
 
     fn acquire(
@@ -143,21 +194,28 @@ impl MaintenanceAdmission {
                 return None;
             }
             let waiter_rank = admission_effective_rank(state.waiters.get(&ticket).unwrap());
-            let beats_advertised = state.advertised.iter().all(|(other_id, other)| {
-                *other_id == scheduler_id || admission_effective_rank(other) <= waiter_rank
-            });
+            let beats_advertised = state
+                .advertised
+                .iter()
+                .all(|(other_id, other)| *other_id == scheduler_id || other.rank <= waiter_rank);
             let is_best = state.waiters.iter().all(|(other_ticket, other)| {
                 (admission_effective_rank(other), Reverse(*other_ticket))
                     <= (waiter_rank, Reverse(ticket))
             });
             if !Self::foreground_blocked(&state)
-                && state.active.is_none()
+                && state.active.len() < state.max_active
                 && beats_advertised
                 && is_best
             {
                 state.waiters.remove(&ticket);
                 let owner = thread::current().id();
-                state.active = Some((owner, scheduler_id, rank));
+                // One permit per thread: a nested acquire on the same thread
+                // would overwrite this entry and let the inner permit's drop
+                // free the outer job's lane while it still runs.
+                debug_assert!(!state.active.contains_key(&owner));
+                state
+                    .active
+                    .insert(owner, ActiveSlot { scheduler_id, rank });
                 let waited = queued_at.elapsed();
                 if waited >= Duration::from_secs(5) {
                     crate::trace::slow_event(&format!(
@@ -170,6 +228,10 @@ impl MaintenanceAdmission {
                 } else {
                     crate::trace::event(&format!("admission: rank {rank} acquired"));
                 }
+                drop(state);
+                // A newly freed lane can make another waiter eligible; wake
+                // it instead of letting it ride the 20ms poll.
+                self.shared.wake.notify_all();
                 return Some(MaintenancePermit {
                     admission: self.clone(),
                     owner,
@@ -205,12 +267,12 @@ impl MaintenanceAdmission {
         id
     }
 
-    fn advertise(&self, scheduler_id: u64, candidate: Option<(i32, Instant)>) {
+    fn advertise(&self, scheduler_id: u64, candidate: Option<i32>) {
         let mut state = self.shared.state.lock().unwrap();
-        if let Some((rank, queued_at)) = candidate {
+        if let Some(rank) = candidate {
             state
                 .advertised
-                .insert(scheduler_id, AdmissionWaiter { rank, queued_at });
+                .insert(scheduler_id, Advertisement { rank });
         } else {
             state.advertised.remove(&scheduler_id);
         }
@@ -236,8 +298,7 @@ impl MaintenanceAdmission {
     pub(crate) fn checkpoint(&self, cancelled: &AtomicBool) -> bool {
         let owner = thread::current().id();
         let mut state = self.shared.state.lock().unwrap();
-        let Some((_, scheduler_id, rank)) = state.active.filter(|(active, _, _)| *active == owner)
-        else {
+        let Some(slot) = state.active.get(&owner).copied() else {
             drop(state);
             let wait_started = Instant::now();
             let resumed = self.wait(cancelled);
@@ -250,23 +311,40 @@ impl MaintenanceAdmission {
             }
             return resumed;
         };
-        let higher_waiting = state
-            .waiters
-            .values()
-            .any(|waiter| admission_effective_rank(waiter) > rank)
+        let ActiveSlot { scheduler_id, rank } = slot;
+        // Only strictly higher *base* ranks preempt the running job. Equal-
+        // rank waiters must not: this job would re-queue with a fresh ticket
+        // at base rank and could then never win against the waiter it yielded
+        // to (same aging rate, older ticket), so a one-second-old equal-rank
+        // batch would turn a checkpoint into a full aging-cap stall. Aging
+        // still decides *acquisition* order once the job finishes.
+        let higher_waiting = state.waiters.values().any(|waiter| waiter.rank > rank)
             || state.advertised.iter().any(|(other_scheduler, waiter)| {
-                *other_scheduler != scheduler_id && admission_effective_rank(waiter) > rank
+                *other_scheduler != scheduler_id && waiter.rank > rank
             });
         if !Self::foreground_blocked(&state) && !higher_waiting {
             return !cancelled.load(Ordering::Acquire);
         }
 
         // A cooperative stage boundary temporarily returns the global resource
-        // permit. Foreground work always wins; otherwise the highest-ranked
-        // maintenance waiter runs before this job resumes.
+        // permit. Foreground work always wins; otherwise strictly
+        // higher-ranked waiters get the freed capacity first, and this job
+        // then re-competes under the normal admission rules.
+        //
+        // The re-queued waiter deliberately starts with a fresh aging clock:
+        // preserving the job's accumulated age would let a long-queued job
+        // (aged to the cap) immediately reacquire past the very preemptor it
+        // yielded to, turning the yield into a no-op.
+        //
+        // Equal-rank work never preempts here, so a service that loops over
+        // its whole durable backlog between checkpoints (the recognition
+        // refresh batches) holds its lane until the backlog drains. That is
+        // bounded and correct: it holds one lane of `max_active`, and any
+        // strictly higher-ranked arrival (selected subtree, inventory) still
+        // takes the lane at its next checkpoint.
         let yield_started = Instant::now();
         crate::trace::event(&format!("admission: rank {rank} yielding at a checkpoint"));
-        state.active = None;
+        state.active.remove(&owner);
         let ticket = state.next_ticket;
         state.next_ticket = state.next_ticket.wrapping_add(1);
         state.waiters.insert(
@@ -284,25 +362,28 @@ impl MaintenanceAdmission {
                 return false;
             }
             let waiter_rank = admission_effective_rank(state.waiters.get(&ticket).unwrap());
-            // A queued job from this same scheduler cannot execute until this
-            // worker exits (notably for the production one-worker services),
-            // so it must not self-deadlock the active job's reacquisition.
-            // Other schedulers' advertisements remain authoritative even
-            // before their workers have registered admission waiters.
+            // A queued job from this same scheduler may be unreachable until a
+            // worker frees up (for single-worker services, until this very
+            // worker exits), so its advertisement must not block this job's
+            // reacquisition. Other schedulers' advertisements remain
+            // authoritative even before their workers have registered
+            // admission waiters.
             let beats_advertised = state.advertised.iter().all(|(other_scheduler, other)| {
-                *other_scheduler == scheduler_id || admission_effective_rank(other) <= waiter_rank
+                *other_scheduler == scheduler_id || other.rank <= waiter_rank
             });
             let is_best = state.waiters.iter().all(|(other_ticket, other)| {
                 (admission_effective_rank(other), Reverse(*other_ticket))
                     <= (waiter_rank, Reverse(ticket))
             });
             if !Self::foreground_blocked(&state)
-                && state.active.is_none()
+                && state.active.len() < state.max_active
                 && beats_advertised
                 && is_best
             {
                 state.waiters.remove(&ticket);
-                state.active = Some((owner, scheduler_id, rank));
+                state
+                    .active
+                    .insert(owner, ActiveSlot { scheduler_id, rank });
                 let waited = yield_started.elapsed();
                 if waited >= Duration::from_secs(5) {
                     crate::trace::slow_event(&format!(
@@ -312,6 +393,8 @@ impl MaintenanceAdmission {
                         state.advertised.len(),
                     ));
                 }
+                drop(state);
+                self.shared.wake.notify_all();
                 return true;
             }
             let (next, _) = self
@@ -357,10 +440,12 @@ impl Drop for ForegroundActivity {
 impl Drop for MaintenancePermit {
     fn drop(&mut self) {
         let mut state = self.admission.shared.state.lock().unwrap();
-        if state.active.is_some_and(|(owner, scheduler_id, _)| {
-            owner == self.owner && scheduler_id == self.scheduler_id
-        }) {
-            state.active = None;
+        if state
+            .active
+            .get(&self.owner)
+            .is_some_and(|slot| slot.scheduler_id == self.scheduler_id)
+        {
+            state.active.remove(&self.owner);
         }
         drop(state);
         self.admission.shared.wake.notify_all();
@@ -478,11 +563,12 @@ struct Job {
 const MAINTENANCE_AGING_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg(test)]
 const MAINTENANCE_AGING_INTERVAL: Duration = Duration::from_millis(10);
-// Aging must stay bounded: queued work ages from its original enqueue time,
-// so an unbounded backlog's advertisement (rank 200 + hours) would
-// eventually outrank — and permanently wedge — the higher-ranked inventory
-// pass (rank 1000). The cap keeps every analysis rank below the inventory
-// while still reordering work within the analysis backlog.
+// Aging must stay bounded: waiting work ages from its original enqueue time,
+// so an unbounded backlog of waiters would eventually outrank — and
+// permanently wedge — the higher-ranked inventory pass (rank 1000). The cap
+// keeps every analysis rank below the inventory while still reordering work
+// within the analysis backlog. Advertisements are exempt from aging: they
+// report the base rank so a deep backlog cannot fabricate priority.
 #[cfg(not(test))]
 const MAINTENANCE_AGING_CAP: Duration = Duration::from_secs(500);
 #[cfg(test)]
@@ -513,7 +599,7 @@ where
         .iter()
         .filter_map(|key| state.jobs.get(key))
         .max_by_key(|job| (effective_rank(job), Reverse(job.sequence)))
-        .map(|job| (job.rank, job.queued_at));
+        .map(|job| job.rank);
     state.advertised_key = state
         .queue
         .iter()
@@ -541,10 +627,9 @@ where
             });
     if replace {
         state.advertised_key = Some(key.clone());
-        shared.admission.advertise(
-            shared.scheduler_id,
-            Some((candidate.rank, candidate.queued_at)),
-        );
+        shared
+            .admission
+            .advertise(shared.scheduler_id, Some(candidate.rank));
     }
 }
 

@@ -1,5 +1,6 @@
 use super::*;
 use crate::rendering::FaceTransform;
+use std::sync::Condvar;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 fn lock_ort() -> std::sync::MutexGuard<'static, ()> {
@@ -128,7 +129,7 @@ fn real_detect_and_embed_run_with_socket_syscalls_denied() {
     let socket_error = std::net::TcpStream::connect(("127.0.0.1", 9)).unwrap_err();
     assert_eq!(socket_error.kind(), std::io::ErrorKind::PermissionDenied);
     let image = DynamicImage::new_rgb8(112, 112);
-    let mut engine = FaceEngine::new().unwrap();
+    let mut engine = FaceEngine::with_gpu_policy(FaceGpuPolicy::Auto).unwrap();
     engine.detect(&image).unwrap();
     let face = DetectedFace {
         bounds: [0.0, 0.0, 1.0, 1.0],
@@ -151,7 +152,7 @@ fn synthetic_fixture(bytes: &[u8]) -> DynamicImage {
 #[test]
 fn packaged_models_detect_synthetic_frontal_and_group_faces() {
     let _ort = lock_ort();
-    let mut engine = FaceEngine::new().unwrap();
+    let mut engine = FaceEngine::with_gpu_policy(FaceGpuPolicy::Auto).unwrap();
     let frontal = synthetic_fixture(include_bytes!(
         "../../assets/face/fixtures/synthetic-person-a-frontal.png"
     ));
@@ -180,7 +181,7 @@ fn packaged_models_detect_synthetic_frontal_and_group_faces() {
 #[test]
 fn packaged_sface_scores_same_synthetic_identity_above_different_identity() {
     let _ort = lock_ort();
-    let mut engine = FaceEngine::new().unwrap();
+    let mut engine = FaceEngine::with_gpu_policy(FaceGpuPolicy::Auto).unwrap();
     let images = [
         synthetic_fixture(include_bytes!(
             "../../assets/face/fixtures/synthetic-person-a-frontal.png"
@@ -267,7 +268,7 @@ fn oriented_jpeg_and_raw_face_crops_preserve_the_synthetic_face_region() {
         "../../assets/face/fixtures/synthetic-person-a-frontal.png"
     ))
     .resize_exact(512, 384, image::imageops::FilterType::Triangle);
-    let mut engine = FaceEngine::new().unwrap();
+    let mut engine = FaceEngine::with_gpu_policy(FaceGpuPolicy::Auto).unwrap();
     let faces = engine.detect(&source).unwrap();
     assert_eq!(faces.len(), 1);
     let canonical_bounds = FaceTransform::orientation(6)
@@ -1028,7 +1029,7 @@ fn face_engine_has_no_network_or_map_dependency() {
 #[test]
 fn bundled_models_load_and_black_frame_has_no_faces() {
     let _ort = lock_ort();
-    let mut engine = FaceEngine::new().unwrap();
+    let mut engine = FaceEngine::with_gpu_policy(FaceGpuPolicy::Auto).unwrap();
     assert!(
         engine
             .detect(&DynamicImage::ImageRgb8(RgbImage::new(32, 32)))
@@ -1359,6 +1360,9 @@ fn production_service_bounds_and_reuses_inference_sessions_under_concurrency() {
     sync_analysis_inventory(root.path(), &sources).unwrap();
     let jobs = pending_analysis_jobs(root.path(), sources.len()).unwrap();
     let admission = MaintenanceAdmission::new();
+    // Mirror the production posture: two workers sharing a two-lane
+    // maintenance admission.
+    admission.set_max_active(2);
     admission.set_foreground_blocked(true);
     let service = FaceAnalysisService::new_with_pipeline(
         2,
@@ -1385,12 +1389,114 @@ fn production_service_bounds_and_reuses_inference_sessions_under_concurrency() {
     assert_eq!(observed.active_inference, 0);
     assert_eq!(observed.inference_started, sources.len());
     assert_eq!(observed.inference_completed, sources.len());
-    assert_eq!(observed.engines_constructed, 1);
-    assert_eq!(observed.max_active_inference, 1);
+    assert!(
+        observed.engines_constructed <= 2,
+        "one engine per worker at most, observed {}",
+        observed.engines_constructed
+    );
     assert!(
         observed.engines_constructed < sources.len(),
         "sessions must be reused instead of constructed per asset"
     );
+    assert!(
+        observed.max_active_inference >= 1 && observed.max_active_inference <= 2,
+        "inference must stay within the worker cap, observed {}",
+        observed.max_active_inference
+    );
+}
+
+#[test]
+fn two_face_workers_run_inference_concurrently_within_the_widened_admission() {
+    let _ort = lock_ort();
+    let root = tempfile::tempdir().unwrap();
+    let sources = (0..2)
+        .map(|index| {
+            let source = root.path().join(format!("lanes-{index}.png"));
+            RgbImage::new(32, 32).save(&source).unwrap();
+            source
+        })
+        .collect::<Vec<_>>();
+    catalog::initialize_test_catalog(root.path()).unwrap();
+    sync_analysis_inventory(root.path(), &sources).unwrap();
+    let jobs = pending_analysis_jobs(root.path(), sources.len()).unwrap();
+
+    // Hold every claimed job at the Decoding stage until both workers have
+    // arrived, which makes the concurrent-inference assertion deterministic.
+    let arrivals = Arc::new((Mutex::new(0usize), Condvar::new()));
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    struct LaneLatch {
+        arrivals: Arc<(Mutex<usize>, Condvar)>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+    impl ProductionAnalysisStages for LaneLatch {
+        fn reached(&self, stage: FaceAnalysisStage, _cancelled: &Arc<AtomicBool>) {
+            if stage != FaceAnalysisStage::Decoding {
+                return;
+            }
+            let (arrived, wake) = &*self.arrivals;
+            *arrived.lock().unwrap() += 1;
+            wake.notify_all();
+            let (open, release_wake) = &*self.release;
+            let mut open = open.lock().unwrap();
+            while !*open {
+                open = release_wake.wait(open).unwrap();
+            }
+        }
+    }
+
+    let admission = MaintenanceAdmission::new();
+    admission.set_max_active(2);
+    let service = FaceAnalysisService::new_with_pipeline_and_stages(
+        2,
+        JobLimiter::new(2),
+        admission,
+        RenderPipeline::with_source_cache_capacity(root.path().join("cache"), 2, 1, 1),
+        FaceGpuPolicy::Off,
+        Arc::new(LaneLatch {
+            arrivals: arrivals.clone(),
+            release: release.clone(),
+        }),
+        None,
+    );
+    for job in jobs {
+        assert!(service.enqueue(job, 0));
+    }
+    let (arrived, arrived_wake) = &*arrivals;
+    let mut arrived_count = arrived.lock().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while *arrived_count < 2 && std::time::Instant::now() < deadline {
+        let (next, _) = arrived_wake
+            .wait_timeout(arrived_count, std::time::Duration::from_millis(200))
+            .unwrap();
+        arrived_count = next;
+    }
+    drop(arrived_count);
+    // Open the latch on unwind too, so a failing assertion cannot leave the
+    // two worker threads parked on the condvar forever.
+    struct OpenOnDrop(Arc<(Mutex<bool>, Condvar)>);
+    impl Drop for OpenOnDrop {
+        fn drop(&mut self) {
+            let (open, wake) = &*self.0;
+            *open.lock().unwrap() = true;
+            wake.notify_all();
+        }
+    }
+    let _release_on_drop = OpenOnDrop(release.clone());
+    assert_eq!(
+        service.instrumentation().max_active_inference,
+        2,
+        "both workers must hold inference permits at the same time"
+    );
+    let (open, release_wake) = &*release;
+    *open.lock().unwrap() = true;
+    release_wake.notify_all();
+    assert!(
+        service
+            .scheduler
+            .wait_until_settled(std::time::Duration::from_secs(120)),
+        "latched jobs must finish after release"
+    );
+    assert_eq!(service.stats().completed, 2);
 }
 
 #[test]
@@ -1590,6 +1696,7 @@ fn cancellation_at_every_analysis_stage_restores_durable_pending_state() {
             JobLimiter::new(2),
             MaintenanceAdmission::new(),
             RenderPipeline::with_source_cache_capacity(root.path().join("cache"), 1, 1, 1),
+            FaceGpuPolicy::Off,
             Arc::new(CancellingStageHook {
                 target: stage,
                 observed: observed.clone(),
@@ -1910,6 +2017,7 @@ fn analysis_completes_while_the_shared_pipeline_is_under_render_pressure() {
         admission.clone(),
         pipeline.clone(),
         crate::face_engine::RecognitionRefreshService::new(1, admission.clone()),
+        FaceGpuPolicy::Off,
     );
     assert!(service.enqueue(job, 0));
 
@@ -1988,6 +2096,7 @@ fn analysis_completes_under_slow_background_decode_saturation() {
         admission.clone(),
         pipeline.clone(),
         crate::face_engine::RecognitionRefreshService::new(1, admission.clone()),
+        FaceGpuPolicy::Off,
     );
     assert!(service.enqueue(job, 0));
 

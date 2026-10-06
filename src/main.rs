@@ -1738,6 +1738,11 @@ impl PictureBrowser {
             settings.face_worker_memory_bytes,
             settings.face_workers,
         );
+        // Face inference workers are safe to run in parallel; the widened
+        // maintenance admission lets all of them run at once, and with a
+        // single face worker the second lane stays free for light
+        // maintenance services.
+        maintenance_admission.set_max_active(face_workers.max(2));
         let recognition_refresh =
             face_engine::RecognitionRefreshService::new(1, maintenance_admission.clone());
         let face_analysis = face_engine::FaceAnalysisService::new_with_pipeline_and_recognition(
@@ -1746,6 +1751,7 @@ impl PictureBrowser {
             maintenance_admission.clone(),
             render_pipeline.pipeline.clone(),
             recognition_refresh.clone(),
+            settings.face_gpu,
         );
         let people_summary_rebuild =
             face_engine::PeopleSummaryRebuildService::new(maintenance_admission.clone());
@@ -9707,7 +9713,13 @@ impl Render for PictureBrowser {
         let admission = self.maintenance_admission.snapshot();
         let held = admission
             .active_rank
-            .map(|rank| format!("held (rank {rank})"))
+            .map(|rank| {
+                if admission.active_jobs > 1 {
+                    format!("held (rank {rank} · {} jobs)", admission.active_jobs)
+                } else {
+                    format!("held (rank {rank})")
+                }
+            })
             .unwrap_or_else(|| "idle".to_owned());
         let admission_summary = format!(
             "background permit: {}{} · waiters {} · advertised {}",

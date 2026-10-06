@@ -28,7 +28,7 @@ pub const PROTOTYPE_ALGORITHM_VERSION: i64 = 1;
 pub const ANN_INDEX_VERSION: i64 = 1;
 pub const PRODUCTION_SFACE_MODEL_ID: &str = "sface-2021dec";
 pub const PRODUCTION_SFACE_POLICY_DIGEST: &str =
-    "b1406798915059ff33fd14a69d2d894cda6e43a05350d87ffe9f178638103262";
+    "6ed6db1abd7c6d7c00d5e162d1f79924320b92f884e7a66c62a77fcee0cd8f5a";
 const PRODUCTION_SFACE_MODEL_DIGEST: &str =
     "0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79";
 const PRODUCTION_SFACE_POLICY: &[u8] =
@@ -210,7 +210,7 @@ fn validate_calibration_report(report: &CalibrationReport, license: &PolicyLicen
         || data.extractor_source_sha256
             != "3989cc579043bd226f5b1cf5fbd562bb2138966528d79719102d6f34581553f7"
         || data.production_inference_source_sha256
-            != "ec77c029dcec8e20f59d923dfe6d9c3579931905268fc5bf7cddcc772d30f266"
+            != "1b0c97a4d5aacb04b2beaa71637a84cb45e6062622ae932692e4174726df5f36"
         || data.production_policy_source_sha256
             != "3d2e0693777abdf37fe0085feb7badf66a7fb3859c448e23676eb36ceb4a8bda"
         || data.corpus_provenance_sha256
