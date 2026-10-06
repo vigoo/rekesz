@@ -119,9 +119,7 @@ impl ToneFit {
         }
         let upper = match self.l_bins.partition_point(|&value| value < l) {
             0 => return Some(self.j_values[0]),
-            index if index >= self.l_bins.len() => {
-                return Some(*self.j_values.last().unwrap())
-            }
+            index if index >= self.l_bins.len() => return Some(*self.j_values.last().unwrap()),
             index => index,
         };
         let lower = upper.saturating_sub(1);
@@ -670,6 +668,18 @@ pub struct VerifyStats {
     /// Median global displacement between JPEG and corrected raw
     /// (full-resolution pixels) — a center/offset convention mismatch.
     pub shift_px: f32,
+    /// Median displacement components (JPEG relative to corrected raw,
+    /// full-resolution pixels). A consistent direction across pairs means
+    /// the optical center is off the frame center (decentering), which a
+    /// center-symmetric radial model cannot represent.
+    pub shift_dx: f32,
+    pub shift_dy: f32,
+    /// Median SIGNED radial component of the patch displacements
+    /// (full-res px; positive = the JPEG's content sits farther out than
+    /// the corrected raw's). A large value with ~zero dx/dy medians is a
+    /// residual radial scale error — the correction strength itself, not
+    /// a center offset.
+    pub shift_radial: f32,
 }
 
 fn radius_of(index: usize, width: u32, height: u32) -> f32 {
@@ -739,20 +749,38 @@ pub fn verify_pair(
     let mut dst = gray(jpeg, width, height);
     let mut src = gray(corrected, width, height);
     let mut scale = 1.0_f32;
-    while dst.width > 640 && dst.width >= 8 && dst.height >= 8 {
+    while dst.width > 640 && dst.height >= 8 {
         dst = downsample(&dst);
         src = downsample(&src);
         scale *= 2.0;
     }
     let shifts = ncc_displacements(&dst, &src, 16, 5, 0.3);
-    let shift_px = if shifts.is_empty() {
-        0.0
+    let (shift_px, shift_dx, shift_dy, shift_radial) = if shifts.is_empty() {
+        (0.0, 0.0, 0.0, 0.0)
     } else {
-        let magnitudes: Vec<f32> = shifts
-            .iter()
-            .map(|&(_, _, dx, dy)| (dx * dx + dy * dy).sqrt())
-            .collect();
-        median(&magnitudes).unwrap_or(0.0) * scale
+        let (cx_l, cy_l, _) = radius_map(dst.width, dst.height);
+        let mut magnitudes: Vec<f32> = Vec::with_capacity(shifts.len());
+        let mut dxs: Vec<f32> = Vec::with_capacity(shifts.len());
+        let mut dys: Vec<f32> = Vec::with_capacity(shifts.len());
+        let mut radials: Vec<f32> = Vec::with_capacity(shifts.len());
+
+        for &(bx, by, dx, dy) in &shifts {
+            magnitudes.push((dx * dx + dy * dy).sqrt());
+            dxs.push(dx);
+            dys.push(dy);
+            let pdx = bx + 8.0 - cx_l;
+            let pdy = by + 8.0 - cy_l;
+            let r = (pdx * pdx + pdy * pdy).sqrt();
+            if r > 0.0 {
+                radials.push((dx * pdx + dy * pdy) / r);
+            }
+        }
+        (
+            median(&magnitudes).unwrap_or(0.0) * scale,
+            median(&dxs).unwrap_or(0.0) * scale,
+            median(&dys).unwrap_or(0.0) * scale,
+            median(&radials).unwrap_or(0.0) * scale,
+        )
     };
     VerifyStats {
         center_residual: median(&residuals[0].0).unwrap_or(0.0),
@@ -762,6 +790,9 @@ pub fn verify_pair(
         channel_r: channel_spatial(0),
         channel_b: channel_spatial(2),
         shift_px,
+        shift_dx,
+        shift_dy,
+        shift_radial,
     }
 }
 

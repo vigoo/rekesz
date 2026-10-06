@@ -196,6 +196,12 @@ pub enum DirectoryMetadataStatus {
 pub struct DirectoryScan {
     pub directories: Vec<PathBuf>,
     pub images: Vec<PathBuf>,
+    /// CR3 → JPEG companion for every pair collapsed by the listing's
+    /// RAW/JPEG preference. Empty when the preference retains JPEGs (the
+    /// listing already shows them) or when the directory has no pairs.
+    /// Learned by the same scan that produced the listing, so pairs are
+    /// re-learned automatically whenever a directory is displayed.
+    pub companions: HashMap<PathBuf, PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -485,18 +491,20 @@ pub fn scan_directory(
         .iter()
         .map(|(modified, path)| (path.clone(), *modified))
         .collect::<HashMap<_, _>>();
-    let mut images = deduplicate_cr3_jpeg_pairs(
+    let (retained, companions) = deduplicate_cr3_jpeg_pairs(
         image_paths.into_iter().map(|(_, path)| path).collect(),
         pair_preference,
-    )
-    .into_iter()
-    .map(|path| (modified_by_path.get(&path).copied().flatten(), path))
-    .collect::<Vec<_>>();
+    );
+    let mut images = retained
+        .into_iter()
+        .map(|path| (modified_by_path.get(&path).copied().flatten(), path))
+        .collect::<Vec<_>>();
     directories.sort_by_cached_key(|path| sort_key(path));
     images.sort_by_cached_key(|(time, path)| (time.is_none(), *time, sort_key(path)));
     Ok(DirectoryScan {
         directories,
         images: images.into_iter().map(|(_, path)| path).collect(),
+        companions,
     })
 }
 
@@ -556,7 +564,10 @@ pub fn scan_library_inventory_with_progress(
     Ok(images)
 }
 
-fn deduplicate_cr3_jpeg_pairs(paths: Vec<PathBuf>, preference: RawJpegPreference) -> Vec<PathBuf> {
+fn deduplicate_cr3_jpeg_pairs(
+    paths: Vec<PathBuf>,
+    preference: RawJpegPreference,
+) -> (Vec<PathBuf>, HashMap<PathBuf, PathBuf>) {
     let mut by_stem: HashMap<String, Vec<PathBuf>> = HashMap::new();
     for path in paths {
         let stem = path
@@ -567,7 +578,8 @@ fn deduplicate_cr3_jpeg_pairs(paths: Vec<PathBuf>, preference: RawJpegPreference
         by_stem.entry(stem).or_default().push(path);
     }
 
-    by_stem
+    let mut companions = HashMap::new();
+    let retained = by_stem
         .into_values()
         .flat_map(|group| {
             let cr3 = group
@@ -580,6 +592,12 @@ fn deduplicate_cr3_jpeg_pairs(paths: Vec<PathBuf>, preference: RawJpegPreference
                 .cloned();
             match (cr3, jpeg) {
                 (Some(raw), Some(jpeg)) => {
+                    // The non-preferred half leaves the listing but is
+                    // remembered as the thumbnail companion (raw listings
+                    // only; JPEG-preferred listings already show it).
+                    if preference == RawJpegPreference::Raw {
+                        companions.insert(raw.clone(), jpeg.clone());
+                    }
                     let mut retained = group
                         .into_iter()
                         .filter(|path| !has_extension(path, &["cr3", "jpg", "jpeg"]))
@@ -593,7 +611,8 @@ fn deduplicate_cr3_jpeg_pairs(paths: Vec<PathBuf>, preference: RawJpegPreference
                 _ => group,
             }
         })
-        .collect()
+        .collect::<Vec<_>>();
+    (retained, companions)
 }
 
 fn has_extension(path: &Path, expected: &[&str]) -> bool {

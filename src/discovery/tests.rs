@@ -101,15 +101,23 @@ fn deduplicates_cr3_jpeg_pairs_according_to_preference() {
         PathBuf::from("IMG_1.PNG"),
         PathBuf::from("IMG_2.JPG"),
     ];
-    let raw = deduplicate_cr3_jpeg_pairs(paths.clone(), RawJpegPreference::Raw);
+    let (raw, companions) = deduplicate_cr3_jpeg_pairs(paths.clone(), RawJpegPreference::Raw);
     assert!(raw.contains(&PathBuf::from("IMG_1.CR3")));
     assert!(!raw.contains(&PathBuf::from("IMG_1.JPG")));
     assert!(raw.contains(&PathBuf::from("IMG_2.JPG")));
     assert!(raw.contains(&PathBuf::from("IMG_1.PNG")));
+    // The collapsed JPEG is remembered as the raw's thumbnail companion.
+    assert_eq!(
+        companions.get(&PathBuf::from("IMG_1.CR3")),
+        Some(&PathBuf::from("IMG_1.JPG"))
+    );
+    assert_eq!(companions.len(), 1);
 
-    let jpeg = deduplicate_cr3_jpeg_pairs(paths, RawJpegPreference::Jpeg);
+    let (jpeg, jpeg_companions) = deduplicate_cr3_jpeg_pairs(paths, RawJpegPreference::Jpeg);
     assert!(jpeg.contains(&PathBuf::from("IMG_1.JPG")));
     assert!(!jpeg.contains(&PathBuf::from("IMG_1.CR3")));
+    // JPEG-preferred listings already display the JPEG; nothing to map.
+    assert!(jpeg_companions.is_empty());
 }
 
 #[test]
@@ -131,6 +139,7 @@ fn loaded_and_failed_nodes_are_cached() {
         Ok(DirectoryScan {
             directories: vec![PathBuf::from("/pictures/a")],
             images: vec![PathBuf::from("/pictures/one.jpg")],
+            companions: HashMap::new(),
         }),
     ));
     assert!(model.begin_load(root).is_none());
@@ -153,6 +162,7 @@ fn newly_loaded_metadata_proposes_order_without_applying_it() {
                 PathBuf::from("/pictures/later.jpg"),
                 PathBuf::from("/pictures/earlier.jpg"),
             ],
+            companions: HashMap::new(),
         }),
     );
     let (request, _) = model.begin_metadata_load(root).unwrap();
@@ -210,6 +220,7 @@ fn cached_metadata_is_applied_to_the_initial_order() {
                 PathBuf::from("/pictures/later.jpg"),
                 PathBuf::from("/pictures/earlier.jpg"),
             ],
+            companions: HashMap::new(),
         }),
     );
     assert!(model.apply_cached_metadata(
@@ -253,6 +264,7 @@ fn metadata_that_keeps_the_current_order_does_not_offer_apply() {
         Ok(DirectoryScan {
             directories: Vec::new(),
             images: vec![earlier.clone(), later.clone()],
+            companions: HashMap::new(),
         }),
     );
     let (request, _) = model.begin_metadata_load(root).unwrap();
@@ -312,6 +324,7 @@ fn stale_results_are_ignored() {
         Ok(DirectoryScan {
             directories: Vec::new(),
             images: Vec::new(),
+            companions: HashMap::new(),
         }),
     ));
     assert!(matches!(

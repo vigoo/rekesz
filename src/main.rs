@@ -1018,6 +1018,12 @@ struct PictureBrowser {
     pending_import_demand: Option<Range<usize>>,
     import_demand_scheduled: bool,
     recipes: Option<Arc<HashMap<PathBuf, catalog::RecipeEntry>>>,
+    /// CR3 → JPEG companions learned from directory scans (see
+    /// `discovery::DirectoryScan::companions`). Every listing is produced
+    /// by a live scan, so pairs — including ones that predate this
+    /// feature — are re-learned automatically each time a directory is
+    /// displayed.
+    thumbnail_companions: HashMap<PathBuf, PathBuf>,
     people_overview: PeoplePageLoad<catalog::people::PersonPage>,
     people_diagnostics: Option<Result<Arc<catalog::people::PeopleDiagnostics>, Arc<str>>>,
     people_faces: PeoplePageLoad<catalog::people::FaceReviewPage>,
@@ -1643,6 +1649,7 @@ enum RecursiveGridStatus {
 struct RecursiveImages {
     paths: Vec<PathBuf>,
     coordinates: HashMap<PathBuf, metadata::GeoCoordinate>,
+    companions: HashMap<PathBuf, PathBuf>,
 }
 
 struct PathContextMenu {
@@ -1846,6 +1853,7 @@ impl PictureBrowser {
             pending_import_demand: None,
             import_demand_scheduled: false,
             recipes: None,
+            thumbnail_companions: HashMap::new(),
             people_overview: PeoplePageLoad::Loading,
             people_diagnostics: None,
             people_faces: PeoplePageLoad::Loading,
@@ -2009,6 +2017,7 @@ impl PictureBrowser {
                 this.work.finish(scan_work);
                 let loaded = match result {
                     Ok((scan, cached_metadata, missing_metadata)) => {
+                        this.thumbnail_companions.extend(scan.companions.clone());
                         let loaded = this.model.finish_load(node, request, Ok(scan));
                         if loaded {
                             this.model.apply_cached_metadata(
@@ -2281,6 +2290,25 @@ impl PictureBrowser {
         }
     }
 
+    /// The file a thumbnail is rendered from: the JPEG companion of a
+    /// paired CR3 (fast, camera-corrected) unless the raw renders as
+    /// Developed — its recipe must stay visible. Mirrors the condition in
+    /// [`Self::render_identity_for`]; both must agree or tiles wait on a
+    /// file that is never requested.
+    fn thumbnail_display_path(&self, path: &std::path::Path) -> PathBuf {
+        let developed = self.developed
+            && self
+                .recipes
+                .as_ref()
+                .is_some_and(|recipes| recipes.contains_key(path));
+        thumbnail_display_path_for(
+            path,
+            developed,
+            self.recipes.as_deref(),
+            &self.thumbnail_companions,
+        )
+    }
+
     fn render_identity_for(&self, path: &std::path::Path) -> RenderIdentity {
         self.developed
             .then(|| self.recipes.as_ref()?.get(path))
@@ -2472,8 +2500,13 @@ impl PictureBrowser {
     }
 
     fn publish_grid_demand(&mut self, pending: PendingGridDemand, cx: &mut Context<Self>) {
+        let resolved: Vec<PathBuf> = self
+            .selected_images()
+            .iter()
+            .map(|path| self.thumbnail_display_path(path))
+            .collect();
         let visible = visible_thumbnail_demands(
-            self.selected_images(),
+            &resolved,
             pending.visible_rows.clone(),
             pending.columns,
             pending.thumbnail_width,
@@ -2519,7 +2552,11 @@ impl PictureBrowser {
         let near_start = visible_rows.start.saturating_sub(before);
         let near_end = visible_rows.end.saturating_add(after);
         let mut near = Vec::new();
-        let images = self.selected_images();
+        let images: Vec<PathBuf> = self
+            .selected_images()
+            .iter()
+            .map(|path| self.thumbnail_display_path(path))
+            .collect();
         for row in near_start..near_end {
             if visible_rows.contains(&row) {
                 continue;
@@ -2531,7 +2568,7 @@ impl PictureBrowser {
             };
             near.extend(
                 visible_thumbnail_demands(
-                    images,
+                    &images,
                     row..row.saturating_add(1),
                     columns,
                     thumbnail_width,
@@ -2611,7 +2648,7 @@ impl PictureBrowser {
             .enumerate()
             .map(|(rank, index)| {
                 (
-                    self.selected_images()[index].clone(),
+                    self.thumbnail_display_path(&self.selected_images()[index]),
                     thumbnail_variant,
                     JobPriority::speculative(-(rank.min(i32::MAX as usize) as i32)),
                 )
@@ -6661,7 +6698,7 @@ impl PictureBrowser {
                 let popup_top = (anchor_y * self.map_render_size.1 as f32 - 24.0)
                     .clamp(8.0, (self.map_render_size.1 as f32 - 310.0).max(8.0));
                 let tiles = card.page_items().iter().enumerate().map(|(position, item)| {
-                    let path = item.path.clone();
+                    let path = self.thumbnail_display_path(&item.path);
                     let identity = self.render_identity_for(&path);
                     let thumbnail = match self.thumbnails.state_for(&path, identity) {
                         PreviewState::Loaded(preview) => img(preview.image.clone())
@@ -6833,7 +6870,7 @@ impl PictureBrowser {
             .iter()
             .map(|item| {
                 (
-                    item.path.clone(),
+                    self.thumbnail_display_path(&item.path),
                     RenderVariant::Thumbnail { width: 120 },
                     JobPriority::INTERACTIVE,
                 )
@@ -7045,7 +7082,10 @@ impl PictureBrowser {
                 }
                 if let Some(active) = &mut this.recursive_grid {
                     active.status = match result {
-                        Ok(images) => RecursiveGridStatus::Loaded(images),
+                        Ok(images) => {
+                            this.thumbnail_companions.extend(images.companions.clone());
+                            RecursiveGridStatus::Loaded(images)
+                        }
                         Err(error) => RecursiveGridStatus::Error(error.to_string().into()),
                     };
                 }
@@ -7128,8 +7168,9 @@ impl PictureBrowser {
                 }) {
                     let index = *index;
                     let path = path.clone();
-                    let identity = self.render_identity_for(&path);
-                    let image_content = match self.thumbnails.state_for(&path, identity) {
+                    let display = self.thumbnail_display_path(&path);
+                    let identity = self.render_identity_for(&display);
+                    let image_content = match self.thumbnails.state_for(&display, identity) {
                         PreviewState::Loaded(preview) => img(preview.image.clone())
                             .max_w_full()
                             .max_h_full()
@@ -8454,6 +8495,26 @@ fn visible_rows(
     rows
 }
 
+/// Pure core of [`PictureBrowser::thumbnail_display_path`]: the JPEG
+/// companion for a paired raw unless the raw renders as Developed (its
+/// recipe must stay visible). `recipes` is only consulted when
+/// `developed` is set.
+fn thumbnail_display_path_for(
+    path: &std::path::Path,
+    developed: bool,
+    recipes: Option<&HashMap<PathBuf, catalog::RecipeEntry>>,
+    companions: &HashMap<PathBuf, PathBuf>,
+) -> PathBuf {
+    let has_recipe = developed && recipes.is_some_and(|recipes| recipes.contains_key(path));
+    if has_recipe {
+        return path.to_path_buf();
+    }
+    companions
+        .get(path)
+        .cloned()
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
 fn visible_thumbnail_demands(
     images: &[PathBuf],
     row_range: Range<usize>,
@@ -9619,6 +9680,7 @@ fn collect_recursive_images(
     let mut pending = vec![root];
     let mut visited = HashSet::new();
     let mut images = Vec::new();
+    let mut companions: HashMap<PathBuf, PathBuf> = HashMap::new();
     while let Some(directory) = pending.pop() {
         if cancelled.load(Ordering::Acquire) {
             return Err(std::io::Error::new(
@@ -9639,6 +9701,7 @@ fn collect_recursive_images(
             DirectoryScanPriority::Background,
         )?;
         images.extend(scan.images);
+        companions.extend(scan.companions);
         pending.extend(scan.directories);
     }
     let mut metadata = metadata_loader.load_directory(images, cancelled);
@@ -9654,6 +9717,7 @@ fn collect_recursive_images(
     Ok(RecursiveImages {
         paths: metadata.into_iter().map(|entry| entry.path).collect(),
         coordinates,
+        companions,
     })
 }
 

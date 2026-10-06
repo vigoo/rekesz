@@ -3642,6 +3642,7 @@ fn collapsing_a_branch_removes_all_descendant_rows() {
         Ok(DirectoryScan {
             directories: vec![PathBuf::from("/pictures/a")],
             images: Vec::new(),
+            companions: HashMap::new(),
         }),
     );
     let child = model.loaded(root).unwrap().children[0];
@@ -3652,6 +3653,7 @@ fn collapsing_a_branch_removes_all_descendant_rows() {
         Ok(DirectoryScan {
             directories: vec![PathBuf::from("/pictures/a/b")],
             images: Vec::new(),
+            companions: HashMap::new(),
         }),
     );
 
@@ -3679,6 +3681,7 @@ fn hidden_subtree_moves_to_the_virtual_bottom_section() {
         Ok(DirectoryScan {
             directories: vec![PathBuf::from("/pictures/a"), PathBuf::from("/pictures/z")],
             images: Vec::new(),
+            companions: HashMap::new(),
         }),
     );
     let hidden = HashSet::from([PathBuf::from("/pictures/a")]);
@@ -4678,4 +4681,96 @@ fn packaged_lens_profile_loads_and_selects() {
     // Tele end: nearly flat.
     let tele = profile.select("PowerShot V1", Some(25.6)).unwrap();
     assert!(*tele.vignette.last().unwrap() < 3.0);
+}
+
+#[test]
+fn thumbnail_display_path_prefers_jpeg_companions_and_keeps_developed_raws() {
+    let raw = PathBuf::from("/lib/IMG_1.CR3");
+    let jpeg = PathBuf::from("/lib/IMG_1.JPG");
+    let mut companions = std::collections::HashMap::new();
+    companions.insert(raw.clone(), jpeg.clone());
+    let recipes = Arc::new(std::collections::HashMap::new());
+    let none: Option<&std::collections::HashMap<PathBuf, catalog::RecipeEntry>> = Some(&recipes);
+
+    // Baseline: paired raw → JPEG companion.
+    assert_eq!(
+        thumbnail_display_path_for(&raw, false, none, &companions),
+        jpeg
+    );
+    // Unpaired files and JPEGs display themselves.
+    assert_eq!(
+        thumbnail_display_path_for(&jpeg, false, none, &companions),
+        jpeg
+    );
+    let unpaired = PathBuf::from("/lib/IMG_9.CR3");
+    assert_eq!(
+        thumbnail_display_path_for(&unpaired, false, none, &companions),
+        unpaired
+    );
+    // A raw with a develop recipe (Developed mode on) keeps the raw: the
+    // recipe's edits exist only there.
+    let mut edited = std::collections::HashMap::new();
+    edited.insert(
+        raw.clone(),
+        catalog::RecipeEntry {
+            recipe: catalog::DevelopRecipe::default(),
+            digest: [0; 32],
+        },
+    );
+    assert_eq!(
+        thumbnail_display_path_for(&raw, true, Some(&edited), &companions),
+        raw
+    );
+}
+
+/// Library-grid regression for pair re-learning: a pre-existing CR3+JPG
+/// pair (never imported through the app) must be paired by the directory
+/// scan that produces the listing, and the tile must render from the JPEG
+/// even though the raw fails to decode.
+#[gpui::test]
+fn library_grid_learns_cr3_jpeg_pairs_from_the_listing_scan(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    // The raw half is garbage: if the tile rendered from it, the grid
+    // would show "Cannot decode" instead of the JPEG's pixels.
+    std::fs::write(root.path().join("pair-1.CR3"), b"not a raw").unwrap();
+    image::RgbImage::from_pixel(8, 8, image::Rgb([200, 100, 50]))
+        .save(root.path().join("pair-1.jpg"))
+        .unwrap();
+    write_photo_stub(root.path(), "photo-0", 47.5, 19.05);
+    let mut config = gpui_test_config(root.path(), cache.path());
+    config.settings.automatic_face_analysis = false;
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+
+    // The scan that produced the listing must have taught the browser the
+    // pair — this is the automatic re-learning of existing libraries.
+    let (pair, total) = view.read_with(&*cx, |view, _| {
+        (
+            view.thumbnail_companions
+                .get(&root.path().join("pair-1.CR3"))
+                .cloned(),
+            view.thumbnail_companions.len(),
+        )
+    });
+    assert_eq!(pair, Some(root.path().join("pair-1.jpg")));
+    assert_eq!(total, 1, "only the pair is mapped");
+
+    // The tile resolves to the JPEG and reaches a terminal (loaded) state.
+    for _ in 0..10 {
+        cx.executor().advance_clock(Duration::from_millis(300));
+        let _ = cx.refresh();
+        cx.run_until_parked();
+    }
+    let resolved = view.read_with(&*cx, |view, _| {
+        let raw = root.path().join("pair-1.CR3");
+        let display = view.thumbnail_display_path(&raw);
+        let identity = view.render_identity_for(&display);
+        match view.thumbnails.state_for(&display, identity) {
+            PreviewState::Loaded(_) => "loaded",
+            PreviewState::Error(_) => "error",
+            _ => "pending",
+        }
+    });
+    assert_eq!(resolved, "loaded", "paired tile must render from the JPEG");
 }

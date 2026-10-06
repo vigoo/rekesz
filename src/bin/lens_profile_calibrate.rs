@@ -36,9 +36,9 @@ struct Args {
     /// Folder containing CR3 files with same-stem JPEG companions.
     #[arg(long)]
     dir: PathBuf,
-    /// Output profile JSON path.
-    #[arg(long)]
-    out: PathBuf,
+    /// Output profile JSON path (not needed with --verify).
+    #[arg(long, required_unless_present = "verify")]
+    out: Option<PathBuf>,
     /// Override the profile's camera model key.
     #[arg(long)]
     model: Option<String>,
@@ -141,9 +141,10 @@ fn main() -> anyhow::Result<()> {
     }
 
     let profile = lens::LensProfile { model, entries };
-    std::fs::create_dir_all(args.out.parent().unwrap_or(Path::new(".")))?;
-    std::fs::write(&args.out, serde_json::to_string_pretty(&profile)?)?;
-    println!("wrote {}", args.out.display());
+    let out = args.out.expect("required for calibration by clap");
+    std::fs::create_dir_all(out.parent().unwrap_or(Path::new(".")))?;
+    std::fs::write(&out, serde_json::to_string_pretty(&profile)?)?;
+    println!("wrote {}", out.display());
     Ok(())
 }
 
@@ -289,11 +290,10 @@ fn srgb_to_linear(value: u8) -> f32 {
     } else {
         ((value + 0.055) / 1.055).powf(2.4)
     }
-}\n
+}
 fn verify(args: &Args, profile_path: &Path) -> anyhow::Result<()> {
-    let profile: lens::LensProfile =
-        serde_json::from_str(&std::fs::read_to_string(profile_path)?)
-            .context("parsing the lens profile")?;
+    let profile: lens::LensProfile = serde_json::from_str(&std::fs::read_to_string(profile_path)?)
+        .context("parsing the lens profile")?;
     let pairs = discover_pairs(&args.dir)?;
     if pairs.is_empty() {
         bail!("no CR3+JPEG pairs found in {}", args.dir.display());
@@ -325,7 +325,7 @@ fn verify(args: &Args, profile_path: &Path) -> anyhow::Result<()> {
                 continue;
             }
         };
-        let Some(mut entry) = profile.select(&pair.model, Some(pair.focal_mm)) else {
+        let Some(entry) = profile.select(&pair.model, Some(pair.focal_mm)) else {
             eprintln!("skipping {name}: no profile entry for {}", pair.model);
             skipped += 1;
             continue;
@@ -333,7 +333,8 @@ fn verify(args: &Args, profile_path: &Path) -> anyhow::Result<()> {
         let mut corrected = pair.linear;
         lens::apply_geometry(&mut corrected, pair.width, pair.height, &entry);
         lens::apply_vignette(&mut corrected, pair.width, pair.height, &entry.vignette);
-        let stats = lens::calibrate::verify_pair(&corrected, &pair.jpeg_linear, pair.width, pair.height);
+        let stats =
+            lens::calibrate::verify_pair(&corrected, &pair.jpeg_linear, pair.width, pair.height);
         rows.push(Row {
             name,
             focal_mm: pair.focal_mm,
@@ -344,7 +345,7 @@ fn verify(args: &Args, profile_path: &Path) -> anyhow::Result<()> {
     // Aggregate per focal length (medians).
     rows.sort_by(|a, b| a.focal_mm.total_cmp(&b.focal_mm).then(a.name.cmp(&b.name)));
     println!(
-        "\n{:>9} {:>5} {:>8} {:>8} {:>9} {:>8} {:>7} {:>7} {:>6}",
+        "\n{:>9} {:>5} {:>8} {:>8} {:>9} {:>8} {:>7} {:>7} {:>12}",
         "focal", "n", "center", "mid", "periphery", "signed", "ch_r", "ch_b", "shift"
     );
     for group in rows.chunk_by(|a, b| (a.focal_mm * 10.0) as u32 == (b.focal_mm * 10.0) as u32) {
@@ -354,13 +355,16 @@ fn verify(args: &Args, profile_path: &Path) -> anyhow::Result<()> {
         };
         let mut center: Vec<f32> = group.iter().map(|row| row.stats.center_residual).collect();
         let mut mid: Vec<f32> = group.iter().map(|row| row.stats.mid_residual).collect();
-        let mut periphery: Vec<f32> = group.iter().map(|row| row.stats.periphery_residual).collect();
+        let mut periphery: Vec<f32> = group
+            .iter()
+            .map(|row| row.stats.periphery_residual)
+            .collect();
         let mut signed: Vec<f32> = group.iter().map(|row| row.stats.periphery_signed).collect();
         let mut channel_r: Vec<f32> = group.iter().map(|row| row.stats.channel_r).collect();
         let mut channel_b: Vec<f32> = group.iter().map(|row| row.stats.channel_b).collect();
         let mut shift: Vec<f32> = group.iter().map(|row| row.stats.shift_px).collect();
         println!(
-            "{:>8.1}mm {:>5} {:>8.4} {:>8.4} {:>9.4} {:+>8.4} {:>7.3} {:>7.3} {:>5.1}px",
+            "{:>8.1}mm {:>5} {:>8.4} {:>8.4} {:>9.4} {:+>8.4} {:>7.3} {:>7.3} {:>4.1}px rad {:+>5.1}",
             group[0].focal_mm,
             group.len(),
             pick(&mut center),
@@ -370,16 +374,24 @@ fn verify(args: &Args, profile_path: &Path) -> anyhow::Result<()> {
             pick(&mut channel_r),
             pick(&mut channel_b),
             pick(&mut shift),
+            {
+                let mut radial: Vec<f32> = group.iter().map(|row| row.stats.shift_radial).collect();
+                pick(&mut radial)
+            },
         );
     }
 
     // Worst pairs by periphery residual.
     let mut worst: Vec<&Row> = rows.iter().collect();
-    worst.sort_by(|a, b| b.stats.periphery_residual.total_cmp(&a.stats.periphery_residual));
+    worst.sort_by(|a, b| {
+        b.stats
+            .periphery_residual
+            .total_cmp(&a.stats.periphery_residual)
+    });
     println!("\nworst pairs (periphery residual):");
     for row in worst.iter().take(8) {
         println!(
-            "  {} ({:.1}mm): periphery {:.4} (signed {:+.4}) ch_r {:.3} ch_b {:.3} shift {:.1}px",
+            "  {} ({:.1}mm): periphery {:.4} (signed {:+.4}) ch_r {:.3} ch_b {:.3} shift {:.1}px radial {:+.1}",
             row.name,
             row.focal_mm,
             row.stats.periphery_residual,
@@ -387,6 +399,7 @@ fn verify(args: &Args, profile_path: &Path) -> anyhow::Result<()> {
             row.stats.channel_r,
             row.stats.channel_b,
             row.stats.shift_px,
+            row.stats.shift_radial,
         );
     }
     if skipped > 0 {
