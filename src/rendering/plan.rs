@@ -286,6 +286,7 @@ fn partition_raw_recipe(recipe: &DevelopRecipe) -> RawRecipePartition {
         tone_curve, tone_curve_red, tone_curve_green, tone_curve_blue);
     raw_group!(develop::actions::DETAIL; detail);
     raw_group!(develop::actions::TEXTURE_DEHAZE; texture, dehaze);
+    raw_group!(develop::actions::CLARITY; clarity);
     raw_group!(develop::actions::MONOCHROME; monochrome);
     raw_group!(develop::actions::PARAMETRIC_CURVE; parametric_curve);
 

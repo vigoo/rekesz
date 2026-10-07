@@ -4676,8 +4676,21 @@ fn packaged_lens_profile_loads_and_selects() {
     // The wide end's black-circle recovery is the headline number from the
     // calibration against the real card.
     let wide = profile.select("PowerShot V1", Some(8.2)).unwrap();
-    assert!(*wide.vignette.last().unwrap() > 10.0, "corner gain");
-    assert!(wide.k1 > 0.05, "wide-end distortion correction");
+    // DNG-oracle profile: the wide-end correction is the per-channel warp
+    // (Adobe-decoded camera data) — the corrected corner samples the raw
+    // at ~0.82·r (strong demagnification, inside the circle — no blob).
+    assert!(
+        wide.warp.iter().any(|plane| plane[0] > 0.0),
+        "packaged profile must carry the DNG warp"
+    );
+    let f_corner = |plane: [f32; 4]| plane[0] + plane[1] + plane[2] + plane[3];
+    for plane in wide.warp {
+        let factor = f_corner(plane);
+        assert!(
+            (0.7..0.95).contains(&factor),
+            "corner warp factor {factor} must demagnify into the circle"
+        );
+    }
     // Tele end: nearly flat.
     let tele = profile.select("PowerShot V1", Some(25.6)).unwrap();
     assert!(*tele.vignette.last().unwrap() < 3.0);

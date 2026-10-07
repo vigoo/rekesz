@@ -40,7 +40,9 @@ fn raw_plan_partitions_controls_without_double_application() {
     assert_eq!(plan.raw_recipe().unwrap().exposure_ev, Some(1.0));
     assert_eq!(plan.post_recipe().unwrap().exposure_ev, None);
     assert_eq!(plan.post_recipe().unwrap().white_balance, None);
-    assert_eq!(plan.post_recipe().unwrap().clarity, Some(10.0));
+    // Clarity is raw-owned since the scene-linear presence stage.
+    assert_eq!(plan.post_recipe().unwrap().clarity, None);
+    assert_eq!(plan.raw_recipe().unwrap().clarity, Some(10.0));
     assert!(plan.post_recipe().unwrap().crop.is_some());
     assert_ne!(plan.raw_metadata().0 & develop::actions::EXPOSURE, 0);
 }
@@ -128,7 +130,7 @@ fn raw_partition_classifies_every_develop_recipe_control() {
     assert_eq!(post.monochrome, None);
     assert_eq!(post.parametric_curve, None);
 
-    assert_eq!(post.clarity, recipe.clarity);
+    assert_eq!(post.clarity, None);
     assert_eq!(post.crop, recipe.crop);
     assert_eq!(post.vignette, recipe.vignette);
     assert_eq!(post.upright_homography, recipe.upright_homography);
@@ -142,6 +144,7 @@ fn raw_partition_classifies_every_develop_recipe_control() {
             | develop::actions::BASIC_TONE
             | develop::actions::COLOR
             | develop::actions::TONE_CURVE
+            | develop::actions::CLARITY
             | develop::actions::DETAIL
             | develop::actions::TEXTURE_DEHAZE
             | develop::actions::MONOCHROME

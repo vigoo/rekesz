@@ -103,6 +103,16 @@ fn apply_detail_controls(
                 cancelled,
             )?;
         }
+        if let Some(clarity) = recipe.clarity {
+            crate::rendering::presence::apply_clarity(
+                pixels,
+                width as usize,
+                height as usize,
+                clarity,
+                scene_tone,
+                cancelled,
+            )?;
+        }
     }
     if let Some(monochrome) = recipe.monochrome {
         for (index, pixel) in pixels.iter_mut().enumerate() {

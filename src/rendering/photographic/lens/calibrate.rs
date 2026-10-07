@@ -156,41 +156,67 @@ impl ToneFit {
 /// tone-neutralized luminance ratio binned by radius (annulus medians),
 /// then median-combined across pairs and normalized to `G(0) = 1`.
 /// Radii with insufficient data stay at 1.0.
-pub fn vignette_gain(pairs: &[Pair<'_>]) -> Vec<f32> {
+///
+/// `corrected_radius` maps a sample's RAW-frame radius to the radius it
+/// occupies in the corrected output — the runtime indexes the LUT by
+/// corrected radius (the gain is applied after the warp), so the binning
+/// must use the same map. Samples whose corrected radius falls outside
+/// the output frame are cropped there and skipped.
+pub fn vignette_gain(
+    pairs: &[Pair<'_>],
+    corrected_radius: impl Fn(f32) -> f32 + Clone,
+) -> Vec<f32> {
+    let curves: Vec<Vec<f32>> = pairs
+        .iter()
+        .map(|pair| pair_vignette_curve(pair, corrected_radius.clone()))
+        .collect();
+    vignette_gain_from_curves(curves)
+}
+
+/// Peripheral illumination gain measured from ONE pair (33-bin curve).
+pub fn pair_vignette_curve(pair: &Pair<'_>, corrected_radius: impl Fn(f32) -> f32) -> Vec<f32> {
+    const RADII: usize = VIGNETTE_LUT_LEN;
+    let tone = ToneFit::fit(pair.raw, pair.jpeg, pair.width, pair.height);
+    let (cx, cy, r_max) = radius_map(pair.width, pair.height);
+    let mut per_bin: Vec<Vec<f32>> = vec![Vec::new(); RADII];
+    for (index, (raw_pixel, jpeg_pixel)) in pair.raw.iter().zip(pair.jpeg).enumerate() {
+        let x = index as u32 % pair.width;
+        let y = index as u32 / pair.width;
+        let dx = x as f32 + 0.5 - cx;
+        let dy = y as f32 + 0.5 - cy;
+        let t = (dx * dx + dy * dy).sqrt() / r_max;
+        let r = corrected_radius(t);
+        if r >= 1.0 {
+            continue;
+        }
+        let l = luma(raw_pixel);
+        let j = luma(jpeg_pixel);
+        if !(0.02..0.95).contains(&j) || l <= 1e-5 {
+            continue;
+        }
+        let Some(l_inverted) = tone.invert(j) else {
+            continue;
+        };
+        let ratio = l_inverted / l;
+        if !(0.05..20.0).contains(&ratio) {
+            continue;
+        }
+        let bin = ((r * (RADII - 1) as f32).round() as usize).min(RADII - 1);
+        per_bin[bin].push(ratio);
+    }
+    per_bin
+        .iter()
+        .map(|samples| median(samples).unwrap_or(1.0))
+        .collect()
+}
+
+/// Median-combines per-pair curves and normalizes to `G(0) = 1`.
+pub fn vignette_gain_from_curves(curves: Vec<Vec<f32>>) -> Vec<f32> {
     const RADII: usize = VIGNETTE_LUT_LEN;
     let mut combined: Vec<Vec<f32>> = vec![Vec::new(); RADII];
-    for pair in pairs {
-        let tone = ToneFit::fit(pair.raw, pair.jpeg, pair.width, pair.height);
-        let (cx, cy, r_max) = radius_map(pair.width, pair.height);
-        let mut per_bin: Vec<Vec<f32>> = vec![Vec::new(); RADII];
-        for (index, (raw_pixel, jpeg_pixel)) in pair.raw.iter().zip(pair.jpeg).enumerate() {
-            let x = index as u32 % pair.width;
-            let y = index as u32 / pair.width;
-            let dx = x as f32 + 0.5 - cx;
-            let dy = y as f32 + 0.5 - cy;
-            let r = (dx * dx + dy * dy).sqrt() / r_max;
-            if r >= 1.0 {
-                continue;
-            }
-            let l = luma(raw_pixel);
-            let j = luma(jpeg_pixel);
-            if !(0.02..0.95).contains(&j) || l <= 1e-5 {
-                continue;
-            }
-            let Some(l_inverted) = tone.invert(j) else {
-                continue;
-            };
-            let ratio = l_inverted / l;
-            if !(0.05..20.0).contains(&ratio) {
-                continue;
-            }
-            let bin = ((r * (RADII - 1) as f32).round() as usize).min(RADII - 1);
-            per_bin[bin].push(ratio);
-        }
-        for (bin, samples) in per_bin.into_iter().enumerate() {
-            if let Some(value) = median(&samples) {
-                combined[bin].push(value);
-            }
+    for curve in &curves {
+        for (bin, value) in curve.iter().enumerate() {
+            combined[bin].push(*value);
         }
     }
     let mut curve: Vec<f32> = combined
@@ -328,8 +354,15 @@ fn ncc(
 }
 
 /// Estimated geometry for one focal length, plus fit diagnostics.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct GeometryFit {
+    /// Measured source-radius factor per output-radius bin
+    /// ([`super::VIGNETTE_LUT_LEN`] entries; 0.0 = no data in that bin).
+    /// `radial_map[i]` is `r_src / r_out` at `r_out = i / (LEN − 1)` — the
+    /// direct measurement the runtime gather interpolates, with no
+    /// extrapolation beyond the last confident match.
+    pub radial_map: Vec<f32>,
+    pub zoom: f32,
     pub k1: f32,
     pub k2: f32,
     pub scale_r: f32,
@@ -381,8 +414,11 @@ pub fn geometry_fit(pair: &Pair<'_>) -> GeometryFit {
                 continue;
             }
             let mut best = (f32::MIN, seed_x as i32, seed_y as i32);
-            for oy in -2_i32..=2 {
-                for ox in -2_i32..=2 {
+            // ±4: wide enough to track a residual displacement of ~1% of
+            // the frame width at this level — without it, corner patches
+            // (where the fit is extrapolating) silently drop out.
+            for oy in -4_i32..=4 {
+                for ox in -4_i32..=4 {
                     let sx = bx2 as i32 + seed_x as i32 / 2 + ox;
                     let sy = by2 as i32 + seed_y as i32 / 2 + oy;
                     if sx < 0 || sy < 0 || sx + 12 > dst.width as i32 || sy + 12 > dst.height as i32
@@ -430,8 +466,11 @@ pub fn geometry_fit(pair: &Pair<'_>) -> GeometryFit {
             working = level;
         }
 
-        // Enough precision already; skip refining the largest levels.
-        if levels[level].0.width <= 1400 {
+        // Refine up to the ~720-px level: farther-out samples shrink the
+        // k1/k2/zoom degeneracy and make the corner extrapolation (the
+        // runtime solves the fixed point up to r = 1) trustworthy. Beyond
+        // that the NCC cost grows too fast for the gain.
+        if levels[level].0.width >= 640 {
             break;
         }
     }
@@ -441,6 +480,7 @@ pub fn geometry_fit(pair: &Pair<'_>) -> GeometryFit {
     let (cx, cy, r_max) = radius_map(dst_level.width, dst_level.height);
     let mut samples: Vec<(f32, f32)> = Vec::new();
     let mut tangential_samples: Vec<f32> = Vec::new();
+    let mut ones: Vec<()> = Vec::new();
     for &(bx, by, dx, dy) in &matches {
         let pdx = bx + 6.0 - cx;
         let pdy = by + 6.0 - cy;
@@ -454,24 +494,49 @@ pub fn geometry_fit(pair: &Pair<'_>) -> GeometryFit {
         if r_dst <= 0.0 || r_src <= 0.0 {
             continue;
         }
-        // Runtime samples the raw at r_src = r_out · s(r_out); the
-        // measured field is the inverse ratio, so invert it here.
-        samples.push((r_dst / r_max, r_dst / r_src - 1.0));
+        // The runtime's magnification is a function of the RAW radius:
+        // r_out = t·a(t), and the gather's fixed point evaluates a at t.
+        // The measurement pair (r_src = t, r_dst = r_out) therefore fits
+        // y = a(t) − 1 against x = t — not against the corrected radius.
+        samples.push((r_src / r_max, r_dst / r_src - 1.0));
+        // The intercept (zoom) absorbs the camera's overall rectification
+        // resample; without it a constant scale error masquerades as
+        // uncorrectable radial displacement.
+        ones.push(());
         let (ux, uy) = (pdx / r_dst, pdy / r_dst);
         tangential_samples.push((-dx * uy + dy * ux).abs() / r_dst);
     }
-    let (k1, k2, residual) = fit_radial(&samples);
+    // Mismatched NCC patches produce physically impossible displacement
+    // ratios; the robust fit's first solve must not see them.
+    samples.retain(|&(_, y)| y.abs() <= 0.5);
+    let (zoom, k1, k2, residual) = fit_radial(&samples);
     let tangential = median(&tangential_samples).unwrap_or(0.0);
     let max_radius = samples
         .iter()
         .map(|(r, _)| *r)
         .fold(0.0_f32, |acc, r| acc.max(r));
+    // The measured radial map: per output-radius bin, the median
+    // source/output ratio. This is what the runtime gathers with — no
+    // polynomial extrapolation into unmeasured corners.
+    let mut radial_bins: Vec<Vec<f32>> = vec![Vec::new(); super::VIGNETTE_LUT_LEN];
+    for &(r_out, y) in &samples {
+        let bin = ((r_out * (super::VIGNETTE_LUT_LEN - 1) as f32).round() as usize)
+            .min(super::VIGNETTE_LUT_LEN - 1);
+        // The gather needs r_src / r_out; y was fitted as r_out / r_src − 1.
+        radial_bins[bin].push(1.0 / (1.0 + y));
+    }
+    let radial_map: Vec<f32> = radial_bins
+        .iter()
+        .map(|values| median(values).unwrap_or(0.0))
+        .collect();
 
     // Lateral CA from the raw's own channel displacements (camera JPEG
     // channels are corrected by construction).
     let (scale_r, scale_b) = channel_scales(pair, 20, 5);
 
     GeometryFit {
+        radial_map,
+        zoom,
         k1,
         k2,
         scale_r,
@@ -492,40 +557,58 @@ fn subpixel_shift(minus: f32, center: f32, plus: f32) -> f32 {
     (0.5 * (minus - plus) / denom).clamp(-0.5, 0.5)
 }
 
-fn fit_radial(samples: &[(f32, f32)]) -> (f32, f32, f32) {
+/// Radius-weighted least squares for
+/// `a(r) = zoom + k1·r² + k2·r⁴` (the runtime magnification over the RAW
+/// radius), with σ-trim outlier rejection. The intercept matters: without
+/// it, the camera's overall rectification resample cannot be represented.
+fn fit_radial(samples: &[(f32, f32)]) -> (f32, f32, f32, f32) {
     let mut active = samples.to_vec();
+    let mut zoom = 1.0_f32;
     let mut k1 = 0.0_f32;
     let mut k2 = 0.0_f32;
     let mut residual = f32::INFINITY;
+    // The fitted model's constant term is zoom − 1 (y = a − 1); predict
+    // must match it or the trim compares against a curve shifted by 1.
+    let predict =
+        |zoom: f32, k1: f32, k2: f32, r: f32| (zoom - 1.0) + k1 * r * r + k2 * r * r * r * r;
     for _ in 0..3 {
         if active.len() < 16 {
             break;
         }
-        // Radius-weighted normal equations for y = a·x1 + b·x2 with
-        // x1 = r², x2 = r⁴: larger radii carry the larger signal, so they
-        // dominate the fit.
-        let (mut s11, mut s12, mut s22, mut sy1, mut sy2) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        // Weighted normal equations; weight = r² so the corner (where the
+        // signal is largest) dominates. The basis is fit CENTERED in
+        // u = r² for numerical stability. The model is deliberately
+        // zoom + k1·r² only: the r⁴ term is degenerate over the reachable
+        // radius range (NCC never matches the extreme corner), and a free
+        // r⁴ coefficient extrapolates wildly — a fitted k2 = −0.2 drove
+        // the corner magnification below 1, which is physically impossible
+        // for barrel correction. Monotone quadratic extrapolation stays
+        // sane where the data ends.
+        let u_mean = active.iter().map(|&(r, _)| r * r).sum::<f32>() / active.len() as f32;
+        let mut m = [[0.0_f32; 2]; 2];
+        let mut v = [0.0_f32; 2];
         for &(r, y) in &active {
             let weight = r * r;
-            let (x1, x2) = (r * r * weight, r * r * r * r * weight);
-            s11 += r * r * x1;
-            s12 += r * r * x2;
-            s22 += x2 * x2;
-            sy1 += x1 * y;
-            sy2 += x2 * y;
+            let u = r * r - u_mean;
+            let basis = [1.0, u];
+            for (row, basis_row) in basis.iter().enumerate() {
+                for (column, basis_column) in basis.iter().enumerate() {
+                    m[row][column] += weight * basis_row * basis_column;
+                }
+                v[row] += weight * basis_row * y;
+            }
         }
-        let det = s11 * s22 - s12 * s12;
-        if det.abs() < 1e-12 {
+        let Some(solution) = solve_2x2(&m, &v) else {
             break;
-        }
-        k1 = (sy1 * s22 - sy2 * s12) / det;
-        k2 = (s11 * sy2 - s12 * sy1) / det;
+        };
+        // Expand back: y = (b0 − b1·ū) + b1·r². y = a − 1, so the fitted
+        // intercept is zoom − 1.
+        zoom = 1.0 + solution[0] - solution[1] * u_mean;
+        k1 = solution[1];
+        k2 = 0.0;
         let errors: Vec<f32> = active
             .iter()
-            .map(|&(r, y)| {
-                let predicted = k1 * r * r + k2 * r * r * r * r;
-                (y - predicted).abs()
-            })
+            .map(|&(r, y)| (y - predict(zoom, k1, k2, r)).abs())
             .collect();
         residual = median(&errors).unwrap_or(f32::INFINITY);
         // Trim outliers and refit.
@@ -533,17 +616,48 @@ fn fit_radial(samples: &[(f32, f32)]) -> (f32, f32, f32) {
         let next: Vec<(f32, f32)> = active
             .iter()
             .copied()
-            .filter(|&(r, y)| {
-                let predicted = k1 * r * r + k2 * r * r * r * r;
-                (y - predicted).abs() <= limit
-            })
+            .filter(|&(r, y)| (y - predict(zoom, k1, k2, r)).abs() <= limit)
             .collect();
         if next.len() < active.len() / 2 {
             break;
         }
         active = next;
     }
-    (k1, k2, residual)
+    (zoom, k1, k2, residual)
+}
+
+/// Cramer solver for a 2×2 system; `None` when singular.
+fn solve_2x2(m: &[[f32; 2]; 2], v: &[f32; 2]) -> Option<[f32; 2]> {
+    let det = m[0][0] * m[1][1] - m[0][1] * m[1][0];
+    if det.abs() < 1e-12 {
+        return None;
+    }
+    Some([
+        (v[0] * m[1][1] - v[1] * m[0][1]) / det,
+        (m[0][0] * v[1] - m[1][0] * v[0]) / det,
+    ])
+}
+
+/// Cramer solver for a 3×3 system; `None` when singular.
+fn solve_3x3(m: &[[f32; 3]; 3], v: &[f32; 3]) -> Option<[f32; 3]> {
+    let det = |a: &[[f32; 3]; 3]| {
+        a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1])
+            - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0])
+            + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0])
+    };
+    let d = det(m);
+    if d.abs() < 1e-12 {
+        return None;
+    }
+    let mut out = [0.0_f32; 3];
+    for index in 0..3 {
+        let mut modified = *m;
+        for (row, modified_row) in modified.iter_mut().enumerate() {
+            modified_row[index] = v[row];
+        }
+        out[index] = det(&modified) / d;
+    }
+    Some(out)
 }
 
 /// Per-channel radial scale of `raw`'s R and B channels relative to its G
@@ -618,28 +732,140 @@ fn ncc_displacements_within(
 
 /// Full calibration of one focal-length entry from a pair set.
 pub fn calibrate_entry(pairs: &[Pair<'_>], focal_mm: f32) -> FocalEntry {
-    let vignette = vignette_gain(pairs);
+    // Geometry and vignette are coupled: the NCC stage cannot match the
+    // raw's near-black corners (image circle), so a single-pass fit
+    // extrapolates the magnification and undershoots exactly where the
+    // correction is strongest. The loop breaks the coupling:
+    // fit geometry → build the vignette LUT → brighten the raws with it →
+    // re-fit geometry on the brightened frames (corner texture now
+    // visible) → recompute. Two rounds converge for this lens.
+    let median_of = |values: &mut Vec<f32>| {
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        values.get(values.len() / 2).copied().unwrap_or(0.0)
+    };
+    let fits: Vec<(GeometryFit, bool)> = pairs
+        .iter()
+        .map(|pair| {
+            let fit = geometry_fit(pair);
+            let usable = fit.tangential < 0.02;
+            (fit, usable)
+        })
+        .collect();
+
+    let medians = |usable_fits: &[(GeometryFit, bool)]| -> (f32, f32, f32, f32, f32, Vec<f32>) {
+        let mut zooms: Vec<f32> = Vec::new();
+        let mut k1s: Vec<f32> = Vec::new();
+        let mut k2s: Vec<f32> = Vec::new();
+        let mut sr: Vec<f32> = Vec::new();
+        let mut sb: Vec<f32> = Vec::new();
+        let mut maps: Vec<Vec<f32>> = Vec::new();
+        for (fit, usable) in usable_fits {
+            if *usable {
+                zooms.push(fit.zoom);
+                k1s.push(fit.k1);
+                k2s.push(fit.k2);
+                sr.push(fit.scale_r);
+                sb.push(fit.scale_b);
+                if fit.radial_map.len() == super::VIGNETTE_LUT_LEN {
+                    maps.push(fit.radial_map.clone());
+                }
+            }
+        }
+        // Median radial map per bin; gaps inherit the nearest measured
+        // bin (center defaults to 1.0).
+        let mut map = vec![0.0_f32; super::VIGNETTE_LUT_LEN];
+        for (bin, slot) in map.iter_mut().enumerate() {
+            let values: Vec<f32> = maps
+                .iter()
+                .filter(|per_pair| per_pair[bin] > 0.0)
+                .map(|per_pair| per_pair[bin])
+                .collect();
+            *slot = median(&values).unwrap_or(0.0);
+        }
+        let mut last = 1.0_f32;
+        for slot in &mut map {
+            if *slot > 0.0 {
+                last = *slot;
+            } else {
+                *slot = last;
+            }
+        }
+        (
+            if zooms.is_empty() {
+                1.0
+            } else {
+                median_of(&mut zooms)
+            },
+            median_of(&mut k1s),
+            median_of(&mut k2s),
+            if sr.is_empty() {
+                1.0
+            } else {
+                median_of(&mut sr)
+            },
+            if sb.is_empty() {
+                1.0
+            } else {
+                median_of(&mut sb)
+            },
+            map,
+        )
+    };
+
+    // Round 2: brighten the raws with the round-1 vignette and re-fit.
+    let mut fits_refined: Vec<(GeometryFit, bool)> = fits.clone();
+    let (round1_zoom, round1_k1, round1_k2, _, _, round1_map) = medians(&fits);
+    let round1_vignette = {
+        let corrected_radius = |t: f32| {
+            if round1_map.len() == super::VIGNETTE_LUT_LEN {
+                t / super::vignette_at(&round1_map, t)
+            } else {
+                t * (round1_zoom + round1_k1 * t * t + round1_k2 * t * t * t * t)
+            }
+        };
+        vignette_gain(pairs, corrected_radius)
+    };
+    for (index, (pair, (fit, usable))) in pairs.iter().zip(&fits).enumerate() {
+        if !usable {
+            continue;
+        }
+        let mut brightened = pair.raw.to_vec();
+        super::apply_vignette(&mut brightened, pair.width, pair.height, &round1_vignette);
+        let brightened_pair = Pair {
+            raw: &brightened,
+            jpeg: pair.jpeg,
+            width: pair.width,
+            height: pair.height,
+        };
+        let refined = geometry_fit(&brightened_pair);
+        // Keep the refinement when it did not degrade the fit.
+        if refined.tangential <= fit.tangential + 0.01
+            && refined.samples * 2 >= fits[index].0.samples
+        {
+            fits_refined[index] = (refined, true);
+        }
+    }
+    let (zoom, k1, k2, scale_r, scale_b, radial_map) = medians(&fits_refined);
+
+    // Final vignette through the converged map.
+    let corrected_radius = |t: f32| {
+        if radial_map.len() == super::VIGNETTE_LUT_LEN {
+            t / super::vignette_at(&radial_map, t)
+        } else {
+            t * (zoom + k1 * t * t + k2 * t * t * t * t)
+        }
+    };
+    let vignette = vignette_gain(pairs, corrected_radius);
     let mut vignette_lut = vec![1.0; VIGNETTE_LUT_LEN];
     for (index, value) in vignette.into_iter().take(VIGNETTE_LUT_LEN).enumerate() {
         vignette_lut[index] = value;
     }
-    let mut k1 = 0.0;
-    let mut k2 = 0.0;
-    let mut scale_r = 1.0;
-    let mut scale_b = 1.0;
-    if let Some(first) = pairs.first() {
-        // Geometry uses one representative pair per focal length (median
-        // behavior comes from the vignette stage); the tool reports fit
-        // diagnostics so bad frames are visible.
-        let fit = geometry_fit(first);
-        k1 = fit.k1;
-        k2 = fit.k2;
-        scale_r = fit.scale_r;
-        scale_b = fit.scale_b;
-    }
     FocalEntry {
         focal_mm,
         vignette: vignette_lut,
+        warp: [[0.0; 4]; 3],
+        radial_map,
+        zoom,
         k1,
         k2,
         scale_r,
@@ -813,7 +1039,10 @@ mod tests {
         let mut pixels = Vec::with_capacity((width * height) as usize);
         for y in 0..height {
             for x in 0..width {
-                let value = 0.15 + 0.7 * hash(x / 3, y / 3);
+                // 9-px blocks survive every pyramid level down to the
+                // coarsest NCC scale, matching real photos' multi-scale
+                // texture.
+                let value = 0.15 + 0.7 * hash(x / 9, y / 9);
                 pixels.push([value * 1.05, value, value * 0.95]);
             }
         }
@@ -837,7 +1066,8 @@ mod tests {
             width,
             height,
         }];
-        let recovered = vignette_gain(&pairs);
+        // Identity geometry: the corrected radius is the raw radius.
+        let recovered = vignette_gain(&pairs, |t| t);
         // The recovered transmittance must be the inverse gain: ~1 at the
         // center, ≈ lut⁻¹ at the corner, within a few percent.
         assert!((recovered[0] - 1.0).abs() < 0.02, "{:?}", recovered[0]);
@@ -851,6 +1081,23 @@ mod tests {
     }
 
     #[test]
+    fn fit_radial_recovers_an_exact_polynomial() {
+        // The model is zoom + k1·r² (no r⁴ term — see fit_radial); the
+        // r⁴-only synthetic exercises the pure-quadratic recovery.
+        let samples: Vec<(f32, f32)> = (0..40)
+            .map(|index| {
+                let r = 0.15 + 0.5 * index as f32 / 39.0;
+                (r, 0.18 * r * r)
+            })
+            .collect();
+        let (zoom, k1, _k2, residual) = fit_radial(&samples);
+        assert!(
+            (zoom - 1.0).abs() < 1e-3 && (k1 - 0.18).abs() < 1e-3,
+            "zoom {zoom} k1 {k1} residual {residual}"
+        );
+    }
+
+    #[test]
     fn geometry_calibration_recovers_known_distortion() {
         let (width, height) = (512_u32, 384_u32);
         let clean = scene(width, height);
@@ -858,6 +1105,9 @@ mod tests {
         let entry = FocalEntry {
             focal_mm: 8.2,
             vignette: vec![1.0; VIGNETTE_LUT_LEN],
+            warp: [[0.0; 4]; 3],
+            radial_map: Vec::new(),
+            zoom: 1.0,
             k1: 0.18,
             k2: 0.04,
             scale_r: 1.0,
@@ -872,13 +1122,51 @@ mod tests {
             height,
         };
         let fit = geometry_fit(&pairs);
-        // The raw content was pulled outward by the backward map; fitting
-        // the JPEG→raw displacement must recover the same coefficients.
-        assert!(
-            (fit.k1 - entry.k1).abs() < 0.05 && (fit.k2 - entry.k2).abs() < 0.06,
-            "fit {fit:?} vs {:?}",
-            (entry.k1, entry.k2)
-        );
+        // Sanity: the zoom stays physical and the wide-end correction is
+        // positive. Exact k1/k2 recovery is NOT asserted — over the
+        // reachable radius range (~0.63 here) the three coefficients are
+        // degenerate; what production needs is that the fitted correction
+        // UNDOES the corruption, asserted end-to-end below.
+        assert!((fit.zoom - 1.0).abs() < 0.1 && fit.k1 > 0.0, "fit {fit:?}");
+        let fitted = FocalEntry {
+            focal_mm: 8.2,
+            vignette: vec![1.0; VIGNETTE_LUT_LEN],
+            warp: [[0.0; 4]; 3],
+            radial_map: fit.radial_map.clone(),
+            zoom: fit.zoom,
+            k1: fit.k1,
+            k2: fit.k2,
+            scale_r: 1.0,
+            scale_b: 1.0,
+        };
+        let mut corrected = raw.clone();
+        super::super::apply_geometry(&mut corrected, width, height, &fitted);
+        // The same-size corruption has no corner data (its backward map
+        // samples past the frame), so end-to-end recovery is asserted over
+        // the calibrated range; the corners are validated against real
+        // pairs by the calibration tool's --verify sweep.
+        let (cx, cy) = (width as f32 / 2.0, height as f32 / 2.0);
+        let r_max = (cx * cx + cy * cy).sqrt();
+        let mut error_sum = 0.0_f32;
+        let mut error_count = 0_usize;
+        for (index, (corrected_pixel, clean_pixel)) in corrected.iter().zip(&clean).enumerate() {
+            let x = index as u32 % width;
+            let y = index as u32 / width;
+            let dx = x as f32 + 0.5 - cx;
+            let dy = y as f32 + 0.5 - cy;
+            if (dx * dx + dy * dy).sqrt() / r_max > 0.6 {
+                continue;
+            }
+            error_sum += (corrected_pixel[0] - clean_pixel[0])
+                .abs()
+                .max((corrected_pixel[1] - clean_pixel[1]).abs());
+            error_count += 1;
+        }
+        let error = error_sum / error_count.max(1) as f32;
+        // Tolerance note: subpixel NCC bias on the blocky synthetic scene
+        // limits in-range recovery to a few percent; a direction or
+        // inversion error produces an order of magnitude more.
+        assert!(error < 0.04, "mean end-to-end correction error {error}");
         assert!(fit.tangential < 0.02, "tangential {}", fit.tangential);
     }
 }

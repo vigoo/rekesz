@@ -28,7 +28,7 @@ const ASSETS: [(&str, &str); 5] = [
     ),
     (
         "assets/lens/powershot_v1.json",
-        "06cab9c3876a381cd1d7656970ba7b64b3c198409d851f30513d939ea50fdb10",
+        "db250a329effaa914dfa878283f05bf7b384c876db362504af8659a54103bebe",
     ),
 ];
 

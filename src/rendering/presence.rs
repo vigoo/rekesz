@@ -12,6 +12,16 @@ use crate::rendering::filters::{box_min, guided_smooth, scaled_radius};
 
 /// Texture extracts a fine mid-frequency band; finer than Clarity's band,
 /// coarser than sharpening.
+/// Clarity band radius (matches the u8-domain operator's BASE_RADIUS).
+const CLARITY_RADIUS: f32 = 8.0;
+const CLARITY_EPSILON: f32 = 0.25;
+const CLARITY_POSITIVE_GAIN: f32 = 1.8;
+const CLARITY_SHAPE_SIGMA_POSITIVE: f32 = 0.8;
+const CLARITY_SHAPE_SIGMA_NEGATIVE: f32 = 1.5;
+const CLARITY_NOISE_GATE_HIGH: f32 = 0.03;
+const CLARITY_HIGHLIGHT_PROTECT_LOW: f32 = 0.85;
+const CLARITY_HIGHLIGHT_PROTECT_HIGH: f32 = 0.98;
+
 const TEXTURE_RADIUS: f32 = 2.5;
 const TEXTURE_EPSILON: f32 = 0.25;
 const TEXTURE_POSITIVE_GAIN: f32 = 1.5;
@@ -70,6 +80,68 @@ fn smoothstep(low: f32, high: f32, value: f32) -> f32 {
 /// Positive amounts raise band contrast (crisp surfaces stay crisp, noise
 /// and extremes are masked); negative amounts subtract the band, smoothing
 /// surfaces while the guided base layer keeps edges intact.
+/// Midtone-weighted local contrast on scene-linear pixels: an edge-aware
+/// detail band from log2(luma) re-applied as a multiplicative gain. The
+/// same algorithm as the u8-domain clarity operator, expressed for the
+/// scene-linear stage (before tone mapping).
+pub fn apply_clarity(
+    pixels: &mut [[f32; 3]],
+    width: usize,
+    height: usize,
+    amount: f32,
+    normalize_tone: fn(f32) -> f32,
+    cancelled: &AtomicBool,
+) -> Result<(), String> {
+    let strength = amount.clamp(-100.0, 100.0) / 100.0;
+    if strength == 0.0 {
+        return Ok(());
+    }
+    let mut log_luma = vec![0.0_f32; pixels.len()];
+    let mut tones = vec![0.0_f32; pixels.len()];
+    for (index, pixel) in pixels.iter().enumerate() {
+        let luma = luminance(*pixel);
+        tones[index] = normalize_tone(luma);
+        log_luma[index] = luma.max(LOG_LUMA_FLOOR).log2();
+    }
+    let base = guided_smooth(
+        &log_luma,
+        width,
+        height,
+        CLARITY_RADIUS,
+        CLARITY_EPSILON,
+        cancelled,
+    )?;
+    let positive = strength > 0.0;
+    let band_gain = if positive { CLARITY_POSITIVE_GAIN } else { 1.0 };
+    for (index, pixel) in pixels.iter_mut().enumerate() {
+        if index % 16_384 == 0 {
+            check_cancelled(cancelled)?;
+        }
+        let detail = log_luma[index] - base[index];
+        let shaped = shape_detail(
+            detail,
+            CLARITY_SHAPE_SIGMA_POSITIVE,
+            CLARITY_SHAPE_SIGMA_NEGATIVE,
+        );
+        let mask = if positive {
+            smoothstep(0.0, CLARITY_NOISE_GATE_HIGH, tones[index])
+                * (1.0
+                    - smoothstep(
+                        CLARITY_HIGHLIGHT_PROTECT_LOW,
+                        CLARITY_HIGHLIGHT_PROTECT_HIGH,
+                        tones[index],
+                    ))
+        } else {
+            1.0
+        };
+        let factor = 2.0_f32.powf(shaped * band_gain * mask * strength);
+        for channel in pixel {
+            *channel *= factor;
+        }
+    }
+    Ok(())
+}
+
 pub fn apply_texture(
     pixels: &mut [[f32; 3]],
     width: usize,

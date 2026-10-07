@@ -22,6 +22,10 @@ use serde::{Deserialize, Serialize};
 /// Radii of the vignette gain table: entry i sits at radius i / (LEN - 1).
 pub const VIGNETTE_LUT_LEN: usize = 33;
 
+fn default_zoom() -> f32 {
+    1.0
+}
+
 /// Calibrated lens correction for one camera model. Produced by the
 /// `lens-profile-calibrate` bin from raw+camera-JPEG pairs.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -40,7 +44,29 @@ pub struct FocalEntry {
     pub focal_mm: f32,
     /// Exactly [`VIGNETTE_LUT_LEN`] gains (serde stops at 32 for arrays).
     pub vignette: Vec<f32>,
-    /// Backward radial distortion: `r_src = r_out * (1 + k1·r_out² + k2·r_out⁴)`.
+    /// DNG `WarpRectilinear`-style per-channel radial warp
+    /// (`[kr0, kr1, kr2, kr3]` for R, G, B): the gather factor for an
+    /// output pixel at normalized radius r is
+    /// `kr0 + kr1·r² + kr2·r⁴ + kr3·r⁶`, evaluated per channel. Populated
+    /// from Adobe-converted DNG opcodes (the camera's own correction).
+    /// All zeros = use `radial_map`/polynomial instead.
+    #[serde(default)]
+    pub warp: [[f32; 4]; 3],
+    /// Measured source-radius factor per output-radius bin
+    /// ([`VIGNETTE_LUT_LEN`] entries: entry i is `r_src / r_out` at
+    /// normalized output radius `i / (LEN − 1)`). When populated (length
+    /// matches), the runtime gathers through this table directly; the
+    /// `zoom`/`k1` polynomial is then only informational. Empty = use the
+    /// polynomial.
+    #[serde(default)]
+    pub radial_map: Vec<f32>,
+    /// The measured clean→raw magnification is
+    /// `a(r) = zoom + k1·r² + k2·r⁴` over the RAW radius r; the gather's
+    /// fixed point solves `t·a(t) = r_out`. `zoom` ≈ 1 absorbs the
+    /// camera's overall resample (rectification scale); ≠ 1 shows up as a
+    /// radius-proportional displacement, unlike k1/k2.
+    #[serde(default = "default_zoom")]
+    pub zoom: f32,
     pub k1: f32,
     pub k2: f32,
     /// Lateral chromatic aberration as per-channel radial scales relative
@@ -81,9 +107,23 @@ impl LensProfile {
         for (index, value) in vignette.iter_mut().enumerate() {
             *value = lerp(lower.vignette[index], upper.vignette[index]);
         }
+        let radial_map = if lower.radial_map.len() == VIGNETTE_LUT_LEN
+            && upper.radial_map.len() == VIGNETTE_LUT_LEN
+        {
+            let mut map = vec![0.0; VIGNETTE_LUT_LEN];
+            for (index, value) in map.iter_mut().enumerate() {
+                *value = lerp(lower.radial_map[index], upper.radial_map[index]);
+            }
+            map
+        } else {
+            Vec::new()
+        };
         Some(FocalEntry {
             focal_mm: focal,
             vignette,
+            warp: [[0.0; 4]; 3],
+            radial_map,
+            zoom: lerp(lower.zoom, upper.zoom),
             k1: lerp(lower.k1, upper.k1),
             k2: lerp(lower.k2, upper.k2),
             scale_r: lerp(lower.scale_r, upper.scale_r),
@@ -127,7 +167,15 @@ pub fn apply_vignette(pixels: &mut [[f32; 3]], width: u32, height: u32, lut: &[f
 /// fixed point of `t·a(t) = r_out` — per channel scaled by the lateral CA
 /// factors (green = 1). Same-size canvas; edges clamp.
 pub fn apply_geometry(pixels: &mut Vec<[f32; 3]>, width: u32, height: u32, entry: &FocalEntry) {
-    let magnification = |r: f32| 1.0 + entry.k1 * r * r + entry.k2 * r * r * r * r;
+    let polynomial = |r_out: f32| {
+        let a = |r: f32| 1.0 + entry.k1 * r * r + entry.k2 * r * r * r * r;
+        let mut t = r_out;
+        for _ in 0..6 {
+            t = r_out / a(t);
+        }
+        let factor = (t / r_out).clamp(0.2, 1.0);
+        [factor, factor, factor]
+    };
     let (cx, cy) = (width as f32 / 2.0, height as f32 / 2.0);
     let r_max = (cx * cx + cy * cy).sqrt();
     let mut warped = vec![[0.0_f32; 3]; pixels.len()];
@@ -137,16 +185,25 @@ pub fn apply_geometry(pixels: &mut Vec<[f32; 3]>, width: u32, height: u32, entry
         let dx = x as f32 + 0.5 - cx;
         let dy = y as f32 + 0.5 - cy;
         let r_out = (dx * dx + dy * dy).sqrt() / r_max;
-        // Solve t·a(t) = r_out. The naive t = r_out / a(r_out) is only
-        // first-order accurate; iterate to the fixed point (converges in
-        // a few steps for smooth magnifications).
-        let mut t = r_out;
-        for _ in 0..4 {
-            t = r_out / magnification(t);
-        }
-        let factor = t / r_out;
-        for (channel, scale) in [(0usize, entry.scale_r), (1, 1.0), (2, entry.scale_b)] {
-            let offset = factor * scale;
+        // Priority: exact per-channel DNG warp (the camera's own correction
+        // via Adobe's converter) → measured radial map → polynomial fixed
+        // point. All factors clamp so the gather never leaves the raw.
+        let factors: [f32; 3] = {
+            let r2 = r_out * r_out;
+            let f = |plane: [f32; 4]| {
+                (plane[0] + plane[1] * r2 + plane[2] * r2 * r2 + plane[3] * r2 * r2 * r2)
+                    .clamp(0.2, 1.0)
+            };
+            if entry.warp.iter().any(|plane| plane[0] > 0.0) {
+                [f(entry.warp[0]), f(entry.warp[1]), f(entry.warp[2])]
+            } else if entry.radial_map.len() == VIGNETTE_LUT_LEN {
+                let factor = vignette_at(&entry.radial_map, r_out);
+                [factor, factor, factor]
+            } else {
+                polynomial(r_out)
+            }
+        };
+        for (channel, offset) in factors.into_iter().enumerate() {
             out[channel] = sample_bilinear(
                 pixels,
                 width,
@@ -170,7 +227,7 @@ pub(crate) fn corrupt_forward(
     height: u32,
     entry: &FocalEntry,
 ) {
-    let magnification = |r: f32| 1.0 + entry.k1 * r * r + entry.k2 * r * r * r * r;
+    let magnification = |r: f32| entry.zoom + entry.k1 * r * r + entry.k2 * r * r * r * r;
     let (cx, cy) = (width as f32 / 2.0, height as f32 / 2.0);
     let r_max = (cx * cx + cy * cy).sqrt();
     let mut warped = vec![[0.0_f32; 3]; pixels.len()];
@@ -237,6 +294,9 @@ mod tests {
                 FocalEntry {
                     focal_mm: 8.2,
                     vignette: low,
+                    warp: [[0.0; 4]; 3],
+                    radial_map: Vec::new(),
+                    zoom: 1.0,
                     k1: 0.1,
                     k2: 0.02,
                     scale_r: 1.001,
@@ -245,6 +305,9 @@ mod tests {
                 FocalEntry {
                     focal_mm: 25.6,
                     vignette: high,
+                    warp: [[0.0; 4]; 3],
+                    radial_map: Vec::new(),
+                    zoom: 1.0,
                     k1: 0.02,
                     k2: 0.0,
                     scale_r: 1.0,
@@ -294,6 +357,9 @@ mod tests {
             &FocalEntry {
                 focal_mm: 8.2,
                 vignette: vec![1.0; VIGNETTE_LUT_LEN],
+                warp: [[0.0; 4]; 3],
+                radial_map: Vec::new(),
+                zoom: 1.0,
                 k1: 0.0,
                 k2: 0.0,
                 scale_r: 1.0,
@@ -317,6 +383,9 @@ mod tests {
         let entry = FocalEntry {
             focal_mm: 8.2,
             vignette: vec![1.0; VIGNETTE_LUT_LEN],
+            warp: [[0.0; 4]; 3],
+            radial_map: Vec::new(),
+            zoom: 1.0,
             k1: 0.18,
             k2: 0.04,
             scale_r: 1.0,
