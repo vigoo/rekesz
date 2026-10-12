@@ -47,7 +47,19 @@ fn persisted_settings_are_loaded_and_cli_values_override_them() {
     assert_eq!(config.settings.image_cache_size, 3);
     assert_eq!(config.settings.pair_preference, PairPreference::Jpeg);
     assert_eq!(config.settings.job_parallelism, 6);
-    assert_eq!(config.settings.root, PathBuf::from("/stored"));
+    // A drive-less "/stored" anchors to the current drive on Windows and the
+    // loader normalizes separators, so compare the normalized tail instead of
+    // exact PathBuf equality.
+    assert!(
+        config
+            .settings
+            .root
+            .to_string_lossy()
+            .replace('\\', "/")
+            .ends_with("/stored"),
+        "settings root did not survive the round trip: {:?}",
+        config.settings.root
+    );
 }
 
 #[test]

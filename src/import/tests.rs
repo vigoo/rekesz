@@ -96,7 +96,10 @@ fn capture_date_prefers_mtime_fallback() {
     let root = tempfile::tempdir().expect("tempdir");
     let path = root.path().join("x.jpg");
     std::fs::write(&path, b"jpeg").expect("write");
-    std::fs::File::open(&path)
+    // Windows needs a write handle to set file times; File::open is read-only.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
         .and_then(|file| file.set_modified(fixed_time()))
         .expect("set mtime");
     let file = ScannedFile {
@@ -508,7 +511,9 @@ fn registry_access_for_path_sources() {
             .access_for(&SourceBacking::Path(PathBuf::from("/tmp")))
             .is_some()
     );
-    // Device backings resolve through the platform MTP backend.
+    // Device backings resolve through the platform MTP backend, which only
+    // exists on unix; the Windows stub has no registry entry.
+    #[cfg(unix)]
     assert!(
         registry
             .access_for(&SourceBacking::Mtp(crate::sources::mtp::MtpObjectRef {

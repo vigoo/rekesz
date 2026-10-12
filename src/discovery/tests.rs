@@ -311,13 +311,18 @@ fn initial_directory_order_uses_modification_time() {
     let earlier = root.path().join("earlier.jpg");
     fs::write(&later, b"not decoded during enumeration").unwrap();
     fs::write(&earlier, b"not decoded during enumeration").unwrap();
-    fs::File::open(&later)
+    // Windows needs a write handle to set file times; File::open is read-only.
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&later)
         .unwrap()
         .set_times(
             fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
         )
         .unwrap();
-    fs::File::open(&earlier)
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&earlier)
         .unwrap()
         .set_times(
             fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(10)),

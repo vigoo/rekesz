@@ -1,6 +1,10 @@
-# Hash-pinned bundled assets: git must never rewrite their bytes on checkout
-# (Windows autocrlf would turn the text assets into CRLF and break the pinned
-# SHA-256 validation in build.rs).
+# Normalize every text file to LF on all platforms: several verifiers hash
+# committed bytes (build.rs asset pins, the SFace policy's source bindings), and
+# Windows autocrlf checkouts were breaking them.
+* text=auto eol=lf
+
+# Bundled assets are hash-pinned by build.rs; git must never rewrite their
+# bytes at all (auto-detection could reclassify a file as text).
 assets/** -text
 
 # Shell scripts must keep LF line endings wherever they are checked out.
