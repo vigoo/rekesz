@@ -1833,6 +1833,8 @@ fn representative_quality_order_is_identical_in_summary_and_live_fallback() {
     );
 }
 
+// Measures itself via getrusage(2), which Windows does not expose.
+#[cfg(unix)]
 #[test]
 #[ignore = "tagged reference-host resource gate; run through scripts/people-release-validation.sh"]
 fn reference_people_resource_profile() {
@@ -4399,30 +4401,41 @@ fn run_generated_people_catalog_profile_with_lifecycle(
         }
     }
 
-    let in_flight_cancelled = Arc::new(AtomicBool::new(false));
-    let query_cancelled = in_flight_cancelled.clone();
-    let query_root = root.path().to_path_buf();
-    let started = std::time::Instant::now();
-    let query = std::thread::spawn(move || {
-        people::list_people_page_sorted_cancellable(
-            &query_root,
-            None,
-            people::PeopleSort::Confirmed,
-            0,
-            30,
-            HashMap::new(),
-            query_cancelled,
-        )
-    });
-    std::thread::sleep(Duration::from_millis(1));
-    in_flight_cancelled.store(true, std::sync::atomic::Ordering::Release);
+    // Cancellation is only observable while the query is still running: if the
+    // page finishes inside the 1 ms grace window the race is lost and an Ok
+    // result says nothing about the flag being honored. Retry until one attempt
+    // is actually cancelled in flight.
+    let mut cancelled_in_flight = false;
+    for _ in 0..100 {
+        let in_flight_cancelled = Arc::new(AtomicBool::new(false));
+        let query_cancelled = in_flight_cancelled.clone();
+        let query_root = root.path().to_path_buf();
+        let started = std::time::Instant::now();
+        let query = std::thread::spawn(move || {
+            people::list_people_page_sorted_cancellable(
+                &query_root,
+                None,
+                people::PeopleSort::Confirmed,
+                0,
+                30,
+                HashMap::new(),
+                query_cancelled,
+            )
+        });
+        std::thread::sleep(Duration::from_millis(1));
+        in_flight_cancelled.store(true, std::sync::atomic::Ordering::Release);
+        if query.join().unwrap().is_err() {
+            assert!(
+                started.elapsed() < Duration::from_millis(500),
+                "query cancellation was not prompt"
+            );
+            cancelled_in_flight = true;
+            break;
+        }
+    }
     assert!(
-        query.join().unwrap().is_err(),
+        cancelled_in_flight,
         "large in-flight production query ignored cancellation"
-    );
-    assert!(
-        started.elapsed() < Duration::from_millis(500),
-        "query cancellation was not prompt"
     );
     eprintln!(
         "generated People profile: {face_count} faces, review query {elapsed:?}",

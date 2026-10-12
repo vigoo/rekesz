@@ -2181,8 +2181,11 @@ pub(crate) fn decode_relative_path(encoded: &[u8]) -> Result<PathBuf> {
     if encoded.first() != Some(&b'w') || !(encoded.len() - 1).is_multiple_of(2) {
         bail!("catalog path was created on an incompatible platform");
     }
+    // `chunks` instead of `chunks_exact`: the even-length check above already
+    // guarantees there is no remainder, and plain chunks keeps this branch
+    // clean under clippy's constant-chunk-size lint on every toolchain.
     let units = encoded[1..]
-        .chunks_exact(2)
+        .chunks(2)
         .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
         .collect::<Vec<_>>();
     Ok(PathBuf::from(std::ffi::OsString::from_wide(&units)))

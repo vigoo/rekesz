@@ -46,6 +46,7 @@ jobs:
             libgphoto2-dev \
             libde265-dev \
             libx265-dev \
+            libnuma-dev \
             libaom-dev \
             libdav1d-dev \
             ripgrep \

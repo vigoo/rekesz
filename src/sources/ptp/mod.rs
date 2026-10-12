@@ -67,6 +67,8 @@ pub(crate) mod backend {
 
 /// The camera-side path of a listing entry: the folder itself for
 /// directories, the parent folder + file name for files.
+/// Only the gphoto2 backend consumes this; the stub backend has no listing.
+#[cfg(all(unix, feature = "ptp"))]
 pub(crate) fn child_path(folder: &str, name: &str) -> String {
     if folder.ends_with('/') {
         format!("{folder}{name}")
