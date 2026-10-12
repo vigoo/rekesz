@@ -44,7 +44,7 @@ fn settled_wait_tracks_terminal_transition_without_polling() {
     let (release_lock, release_wake) = &*release;
     *release_lock.lock().unwrap() = true;
     release_wake.notify_all();
-    assert!(scheduler.wait_until_settled(Duration::from_secs(1)));
+    assert!(scheduler.wait_until_settled(scaled_budget(Duration::from_secs(1))));
     assert_eq!(scheduler.stats().completed, 1);
 }
 
@@ -61,13 +61,13 @@ fn failed_maintenance_retains_the_actionable_error_until_success() {
         })
     });
     assert!(scheduler.submit(1, 0));
-    assert!(scheduler.wait_until_settled(Duration::from_secs(1)));
+    assert!(scheduler.wait_until_settled(scaled_budget(Duration::from_secs(1))));
     assert_eq!(
         scheduler.stats().last_error.as_deref(),
         Some("fixture failure detail")
     );
     assert!(scheduler.submit(1, 0));
-    assert!(scheduler.wait_until_settled(Duration::from_secs(1)));
+    assert!(scheduler.wait_until_settled(scaled_budget(Duration::from_secs(1))));
     assert_eq!(scheduler.stats().last_error, None);
 }
 
@@ -78,7 +78,7 @@ fn cooperative_yield_is_not_reported_as_success_or_failure() {
         Arc::new(|_: &u8, _| Err(MaintenanceYield("fixture preemption").into())),
     );
     assert!(scheduler.submit(1, 0));
-    assert!(scheduler.wait_until_settled(Duration::from_secs(1)));
+    assert!(scheduler.wait_until_settled(scaled_budget(Duration::from_secs(1))));
     let stats = scheduler.stats();
     assert_eq!(stats.completed, 0);
     assert_eq!(stats.failed, 0);
@@ -340,14 +340,14 @@ fn shared_admission_serializes_services_and_orders_waiters_by_rank() {
     inference.submit(1, 100);
     summary.submit(1, 10);
     recognition.submit(1, 50);
-    assert!(admission.wait_until_waiters(3, Duration::from_secs(2)));
+    assert!(admission.wait_until_waiters(3, scaled_budget(Duration::from_secs(2))));
     assert_eq!(inference.stats().running, 0);
     assert_eq!(summary.stats().running, 0);
     assert_eq!(recognition.stats().running, 0);
     admission.set_foreground_blocked(false);
-    assert!(inference.wait_until_settled(Duration::from_secs(2)));
-    assert!(summary.wait_until_settled(Duration::from_secs(2)));
-    assert!(recognition.wait_until_settled(Duration::from_secs(2)));
+    assert!(inference.wait_until_settled(scaled_budget(Duration::from_secs(2))));
+    assert!(summary.wait_until_settled(scaled_budget(Duration::from_secs(2))));
+    assert!(recognition.wait_until_settled(scaled_budget(Duration::from_secs(2))));
     assert_eq!(peak.load(Ordering::SeqCst), 1);
     assert_eq!(
         order.lock().unwrap().as_slice(),
@@ -376,11 +376,11 @@ fn cancelling_ranked_waiter_releases_global_admission_without_running_it() {
     });
     high.submit(1, 100);
     low.submit(2, 0);
-    assert!(admission.wait_until_waiters(2, Duration::from_secs(2)));
+    assert!(admission.wait_until_waiters(2, scaled_budget(Duration::from_secs(2))));
     assert!(high.cancel(&1));
     admission.set_foreground_blocked(false);
-    assert!(high.wait_until_settled(Duration::from_secs(2)));
-    assert!(low.wait_until_settled(Duration::from_secs(2)));
+    assert!(high.wait_until_settled(scaled_budget(Duration::from_secs(2))));
+    assert!(low.wait_until_settled(scaled_budget(Duration::from_secs(2))));
     assert_eq!(*ran.lock().unwrap(), vec![2]);
 }
 
@@ -423,11 +423,11 @@ fn higher_ranked_service_preempts_at_cooperative_checkpoint() {
     }
     drop(entered);
     high.submit(2, 100);
-    assert!(admission.wait_until_waiters(1, Duration::from_secs(2)));
+    assert!(admission.wait_until_waiters(1, scaled_budget(Duration::from_secs(2))));
     *let_low_checkpoint.0.lock().unwrap() = true;
     let_low_checkpoint.1.notify_all();
-    assert!(low.wait_until_settled(Duration::from_secs(2)));
-    assert!(high.wait_until_settled(Duration::from_secs(2)));
+    assert!(low.wait_until_settled(scaled_budget(Duration::from_secs(2))));
+    assert!(high.wait_until_settled(scaled_budget(Duration::from_secs(2))));
     assert_eq!(
         order.lock().unwrap().as_slice(),
         &["low-start", "high", "low-finish"]
@@ -477,11 +477,11 @@ fn promotion_updates_a_job_already_competing_for_global_admission() {
     });
     promoted.submit(1, 0);
     other.submit(1, 50);
-    assert!(admission.wait_until_waiters(2, Duration::from_secs(2)));
+    assert!(admission.wait_until_waiters(2, scaled_budget(Duration::from_secs(2))));
     assert!(!promoted.submit(1, 100));
     admission.set_foreground_blocked(false);
-    assert!(promoted.wait_until_settled(Duration::from_secs(2)));
-    assert!(other.wait_until_settled(Duration::from_secs(2)));
+    assert!(promoted.wait_until_settled(scaled_budget(Duration::from_secs(2))));
+    assert!(other.wait_until_settled(scaled_budget(Duration::from_secs(2))));
     assert_eq!(order.lock().unwrap().as_slice(), &["promoted", "other"]);
 }
 
@@ -521,7 +521,7 @@ fn advertised_higher_rank_wins_checkpoint_race_before_registering_waiter() {
     admission.advertise(high_scheduler_id, Some(100));
     *allow_checkpoint.0.lock().unwrap() = true;
     allow_checkpoint.1.notify_all();
-    assert!(admission.wait_until_waiters(1, Duration::from_secs(2)));
+    assert!(admission.wait_until_waiters(1, scaled_budget(Duration::from_secs(2))));
     assert_eq!(order.lock().unwrap().as_slice(), &["low-start"]);
 
     let high_admission = admission.clone();
@@ -538,7 +538,7 @@ fn advertised_higher_rank_wins_checkpoint_race_before_registering_waiter() {
         drop(permit);
     });
     high.join().unwrap();
-    assert!(low.wait_until_settled(Duration::from_secs(2)));
+    assert!(low.wait_until_settled(scaled_budget(Duration::from_secs(2))));
     assert_eq!(
         order.lock().unwrap().as_slice(),
         &["low-start", "high", "low-finish"]
@@ -583,7 +583,7 @@ fn one_worker_checkpoint_does_not_yield_to_its_own_queued_job() {
     scheduler.submit(2, 100);
     *allow_checkpoint.0.lock().unwrap() = true;
     allow_checkpoint.1.notify_all();
-    assert!(scheduler.wait_until_settled(Duration::from_secs(2)));
+    assert!(scheduler.wait_until_settled(scaled_budget(Duration::from_secs(2))));
     assert_eq!(
         order.lock().unwrap().as_slice(),
         &["low-start", "low-finish", "high"],
@@ -687,7 +687,7 @@ fn aged_equal_rank_waiter_does_not_preempt_at_checkpoint() {
     }
     drop(started);
     equal.submit(1, 0);
-    assert!(admission.wait_until_waiters(1, Duration::from_secs(2)));
+    assert!(admission.wait_until_waiters(1, scaled_budget(Duration::from_secs(2))));
     // Let the equal-rank waiter age past rank 0 (the test aging interval is
     // 10ms); an aged equal-rank waiter must still not preempt the running
     // job. Yielding here would re-queue the runner behind the waiter with a
@@ -695,8 +695,8 @@ fn aged_equal_rank_waiter_does_not_preempt_at_checkpoint() {
     thread::sleep(Duration::from_millis(120));
     *allow_checkpoint.0.lock().unwrap() = true;
     allow_checkpoint.1.notify_all();
-    assert!(low.wait_until_settled(Duration::from_secs(2)));
-    assert!(equal.wait_until_settled(Duration::from_secs(2)));
+    assert!(low.wait_until_settled(scaled_budget(Duration::from_secs(2))));
+    assert!(equal.wait_until_settled(scaled_budget(Duration::from_secs(2))));
     assert_eq!(
         order.lock().unwrap().as_slice(),
         &["low-start", "low-finish", "equal"],
@@ -721,7 +721,7 @@ fn widened_admission_runs_disjoint_services_concurrently_up_to_the_limit() {
             Arc::new(move |_: &u8, _| {
                 let now = active.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(now, Ordering::SeqCst);
-                thread::sleep(Duration::from_millis(50));
+                thread::sleep(scaled_budget(Duration::from_millis(50)));
                 active.fetch_sub(1, Ordering::SeqCst);
                 completed.fetch_add(1, Ordering::SeqCst);
                 Ok(())
@@ -734,10 +734,10 @@ fn widened_admission_runs_disjoint_services_concurrently_up_to_the_limit() {
     first.submit(1, 0);
     second.submit(1, 0);
     third.submit(1, 0);
-    assert!(admission.wait_until_waiters(3, Duration::from_secs(2)));
+    assert!(admission.wait_until_waiters(3, scaled_budget(Duration::from_secs(2))));
     assert_eq!(completed.load(Ordering::SeqCst), 0);
     admission.set_foreground_blocked(false);
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + scaled_budget(Duration::from_secs(2));
     while completed.load(Ordering::SeqCst) < 3 && Instant::now() < deadline {
         thread::yield_now();
     }

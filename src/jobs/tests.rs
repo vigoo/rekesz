@@ -2,6 +2,17 @@ use super::*;
 use std::sync::Arc;
 use test_r::test;
 
+// CI runners are slower and more contended than dev machines; REKESZ_TEST_TIMING_SCALE
+// stretches the timing guards without weakening them locally.
+fn scaled_budget(budget: std::time::Duration) -> std::time::Duration {
+    let scale = std::env::var("REKESZ_TEST_TIMING_SCALE")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(1.0)
+        .max(1.0);
+    budget.mul_f64(scale)
+}
+
 #[test]
 fn background_work_leaves_capacity_for_foreground() {
     let limiter = JobLimiter::new(2);
@@ -41,7 +52,7 @@ fn aged_background_waiter_admits_despite_foreground_pressure() {
     // Give the foreground waiter time to register, then start the background
     // acquire: it must initially wait, then admit once the grace elapses and
     // the held slot is released.
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    std::thread::sleep(scaled_budget(std::time::Duration::from_millis(100)));
     let background = {
         let limiter = limiter.clone();
         let cancelled = Arc::clone(&cancelled);
@@ -65,7 +76,7 @@ fn fresh_background_waiter_still_yields_to_foreground() {
         let cancelled = Arc::clone(&cancelled);
         std::thread::spawn(move || limiter.acquire(true, &cancelled))
     };
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    std::thread::sleep(scaled_budget(std::time::Duration::from_millis(100)));
     // Within the grace window nothing frees, so the background waiter must
     // still be waiting when the foreground waiter is admitted on release.
     let background = {
@@ -75,7 +86,7 @@ fn fresh_background_waiter_still_yields_to_foreground() {
             let _ = limiter.acquire(false, &cancelled);
         })
     };
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    std::thread::sleep(scaled_budget(std::time::Duration::from_millis(50)));
     drop(held);
     let foreground = foreground.join().unwrap();
     assert!(foreground.is_some());

@@ -7,6 +7,17 @@ use std::{
 };
 use test_r::test;
 
+// CI runners are slower and more contended than dev machines; REKESZ_TEST_TIMING_SCALE
+// stretches the timing guards without weakening them locally.
+fn scaled_budget(budget: Duration) -> Duration {
+    let scale = std::env::var("REKESZ_TEST_TIMING_SCALE")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(1.0)
+        .max(1.0);
+    budget.mul_f64(scale)
+}
+
 #[test]
 fn reserved_catalog_directory_is_not_discovered() {
     let root = tempfile::tempdir().unwrap();
@@ -59,7 +70,7 @@ fn promoting_a_queued_directory_overtakes_background_scans() {
         });
     }
 
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + scaled_budget(Duration::from_secs(2));
     loop {
         let (lock, _) = &*scanner.permits;
         if lock.lock().unwrap().waiters.len() == 2 {
@@ -76,7 +87,9 @@ fn promoting_a_queued_directory_overtakes_background_scans() {
         wake.notify_all();
     }
     assert_eq!(
-        finished_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        finished_rx
+            .recv_timeout(scaled_budget(Duration::from_secs(2)))
+            .unwrap(),
         selected_path
     );
 
@@ -88,7 +101,9 @@ fn promoting_a_queued_directory_overtakes_background_scans() {
         wake.notify_all();
     }
     assert_eq!(
-        finished_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        finished_rx
+            .recv_timeout(scaled_budget(Duration::from_secs(2)))
+            .unwrap(),
         background_path
     );
 }

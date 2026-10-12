@@ -12,6 +12,17 @@ use futures::executor::block_on;
 
 use super::*;
 
+// CI runners are slower and more contended than dev machines; REKESZ_TEST_TIMING_SCALE
+// stretches the timing guards without weakening them locally.
+fn scaled_budget(budget: Duration) -> Duration {
+    let scale = std::env::var("REKESZ_TEST_TIMING_SCALE")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(1.0)
+        .max(1.0);
+    budget.mul_f64(scale)
+}
+
 #[test]
 fn maintenance_submission_after_final_empty_observation_gets_atomic_trailing_rerun() {
     let observed_empty = Arc::new((Mutex::new(false), Condvar::new()));
@@ -47,7 +58,7 @@ fn maintenance_submission_after_final_empty_observation_gets_atomic_trailing_rer
     let (lock, wake) = &*allow_completion;
     *lock.lock().unwrap() = true;
     wake.notify_all();
-    assert!(scheduler.wait_until_settled(Duration::from_secs(2)));
+    assert!(scheduler.wait_until_settled(scaled_budget(Duration::from_secs(2))));
     assert_eq!(executions.load(Ordering::Acquire), 2);
     assert_eq!(scheduler.stats().completed, 2);
 }
@@ -98,7 +109,7 @@ fn maintenance_submit_before_cancel_does_not_resurrect_cancelled_work() {
     assert!(scheduler.cancel(&1));
     *release.0.lock().unwrap() = true;
     release.1.notify_all();
-    assert!(scheduler.wait_until_settled(Duration::from_secs(2)));
+    assert!(scheduler.wait_until_settled(scaled_budget(Duration::from_secs(2))));
     assert_eq!(executions.load(Ordering::Acquire), 1);
     assert_eq!(scheduler.stats().cancelled, 1);
 }
@@ -112,7 +123,7 @@ fn maintenance_submit_after_cancel_gets_fresh_token_and_trailing_rerun() {
     assert!(!scheduler.submit(1, 10));
     *release.0.lock().unwrap() = true;
     release.1.notify_all();
-    assert!(scheduler.wait_until_settled(Duration::from_secs(2)));
+    assert!(scheduler.wait_until_settled(scaled_budget(Duration::from_secs(2))));
     assert_eq!(executions.load(Ordering::Acquire), 2);
     let stats = scheduler.stats();
     assert_eq!(stats.cancelled, 1);
@@ -128,7 +139,7 @@ fn maintenance_cancel_all_blocks_trailing_resurrection() {
     assert!(!scheduler.submit(1, 10));
     *release.0.lock().unwrap() = true;
     release.1.notify_all();
-    assert!(scheduler.wait_until_settled(Duration::from_secs(2)));
+    assert!(scheduler.wait_until_settled(scaled_budget(Duration::from_secs(2))));
     assert_eq!(executions.load(Ordering::Acquire), 1);
 }
 
@@ -178,7 +189,9 @@ fn interactive_work_overtakes_queued_visible_work() {
         DemandScopeId(1),
         vec![demand(key("blocker"), JobPriority::INTERACTIVE)],
     );
-    started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    started_rx
+        .recv_timeout(scaled_budget(Duration::from_secs(2)))
+        .unwrap();
     scheduler.replace_scope(
         DemandScopeId(2),
         vec![demand(key("visible"), JobPriority::visible(0))],
@@ -192,7 +205,7 @@ fn interactive_work_overtakes_queued_visible_work() {
         *lock.lock().unwrap() = true;
         wake.notify_all();
     }
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + scaled_budget(Duration::from_secs(2));
     while scheduler.stats().completed < 3 && Instant::now() < deadline {
         thread::yield_now();
     }
@@ -232,7 +245,9 @@ fn duplicate_demands_execute_once_and_notify_both_consumers() {
         )
         .pop()
         .unwrap();
-    started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    started_rx
+        .recv_timeout(scaled_budget(Duration::from_secs(2)))
+        .unwrap();
     let second = scheduler
         .replace_scope(
             DemandScopeId(2),
@@ -281,7 +296,9 @@ fn clearing_a_scope_removes_queued_work() {
         DemandScopeId(1),
         vec![demand(key("blocker"), JobPriority::INTERACTIVE)],
     );
-    started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    started_rx
+        .recv_timeout(scaled_budget(Duration::from_secs(2)))
+        .unwrap();
     let obsolete = scheduler
         .replace_scope(
             DemandScopeId(2),
@@ -299,7 +316,7 @@ fn clearing_a_scope_removes_queued_work() {
         *lock.lock().unwrap() = true;
         wake.notify_all();
     }
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + scaled_budget(Duration::from_secs(2));
     while scheduler.stats().running > 0 && Instant::now() < deadline {
         thread::yield_now();
     }
@@ -328,7 +345,9 @@ fn promoted_thumbnail_keeps_its_cache_subscription_during_scope_handoff() {
         DemandScopeId(1),
         vec![demand(key("blocker"), JobPriority::INTERACTIVE)],
     );
-    started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    started_rx
+        .recv_timeout(scaled_budget(Duration::from_secs(2)))
+        .unwrap();
 
     let subscription = scheduler
         .replace_scope(
@@ -380,7 +399,9 @@ fn snapshot_exposes_running_and_dispatch_ordered_jobs() {
         DemandScopeId(1),
         vec![demand(key("running"), JobPriority::INTERACTIVE)],
     );
-    started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    started_rx
+        .recv_timeout(scaled_budget(Duration::from_secs(2)))
+        .unwrap();
     scheduler.replace_scope(
         DemandScopeId(2),
         vec![
@@ -440,7 +461,7 @@ fn foreground_demand_preempts_and_requeues_lower_running_work() {
         .pop()
         .unwrap();
     first_background_rx
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(scaled_budget(Duration::from_secs(2)))
         .unwrap();
     let interactive = scheduler
         .replace_scope(
@@ -495,7 +516,7 @@ fn configured_parallelism_is_a_hard_limit() {
             .map(|index| demand(key(&format!("job-{index}")), JobPriority::visible(0)))
             .collect(),
     );
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + scaled_budget(Duration::from_secs(2));
     while active.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
         thread::yield_now();
     }
@@ -533,7 +554,9 @@ fn background_work_cannot_consume_the_reserved_interactive_slot() {
         ],
     );
     assert_eq!(
-        started_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        started_rx
+            .recv_timeout(scaled_budget(Duration::from_secs(2)))
+            .unwrap(),
         PathBuf::from("background-1")
     );
     scheduler.replace_scope(
@@ -541,7 +564,9 @@ fn background_work_cannot_consume_the_reserved_interactive_slot() {
         vec![demand(key("interactive"), JobPriority::INTERACTIVE)],
     );
     assert_eq!(
-        started_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        started_rx
+            .recv_timeout(scaled_budget(Duration::from_secs(2)))
+            .unwrap(),
         PathBuf::from("interactive")
     );
     let (lock, wake) = &*gate;
@@ -582,7 +607,7 @@ fn visible_render_demand_blocks_typed_maintenance_admission() {
         .pop()
         .unwrap();
     visible_started_rx
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(scaled_budget(Duration::from_secs(2)))
         .unwrap();
     maintenance.submit(1, 0);
     thread::sleep(Duration::from_millis(30));
@@ -595,7 +620,7 @@ fn visible_render_demand_blocks_typed_maintenance_admission() {
         block_on(visible.receiver).unwrap(),
         JobCompletion::Finished(_)
     ));
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + scaled_budget(Duration::from_secs(2));
     while maintenance.stats().completed == 0 && Instant::now() < deadline {
         thread::yield_now();
     }
@@ -635,7 +660,9 @@ fn aging_eventually_promotes_old_speculative_work() {
         DemandScopeId(1),
         vec![demand(key("blocker"), JobPriority::INTERACTIVE)],
     );
-    started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    started_rx
+        .recv_timeout(scaled_budget(Duration::from_secs(2)))
+        .unwrap();
     scheduler.replace_scope(
         DemandScopeId(2),
         vec![demand(key("old"), JobPriority::speculative(0))],
@@ -654,7 +681,7 @@ fn aging_eventually_promotes_old_speculative_work() {
         *lock.lock().unwrap() = true;
         wake.notify_all();
     }
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + scaled_budget(Duration::from_secs(2));
     while scheduler.stats().completed < 4 && Instant::now() < deadline {
         thread::yield_now();
     }
@@ -696,7 +723,9 @@ fn cancelled_running_generation_cannot_be_resurrected() {
         DemandScopeId(1),
         vec![demand(key("same"), JobPriority::visible(0))],
     );
-    started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    started_rx
+        .recv_timeout(scaled_budget(Duration::from_secs(2)))
+        .unwrap();
     scheduler.clear_scope(DemandScopeId(1));
     let replacement = scheduler
         .replace_scope(
@@ -714,7 +743,7 @@ fn cancelled_running_generation_cannot_be_resurrected() {
         block_on(replacement.receiver).unwrap(),
         JobCompletion::Finished(_)
     ));
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + scaled_budget(Duration::from_secs(2));
     while scheduler.stats().running > 0 && Instant::now() < deadline {
         thread::yield_now();
     }

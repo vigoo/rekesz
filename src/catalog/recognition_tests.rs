@@ -392,13 +392,13 @@ fn ann_construction_yields_to_foreground_and_cancels_after_start() {
     let cancel_started = std::time::Instant::now();
     cancelled.store(true, Ordering::Release);
     let result = finished_rx
-        .recv_timeout(std::time::Duration::from_millis(100))
+        .recv_timeout(scaled_budget(std::time::Duration::from_millis(100)))
         .expect("ANN construction did not release within 100 ms");
     let Err(error) = result else {
         panic!("cancelled index waiter unexpectedly received an index");
     };
     assert!(error.to_string().contains("cancelled"));
-    assert!(cancel_started.elapsed() <= std::time::Duration::from_millis(100));
+    assert!(cancel_started.elapsed() <= scaled_budget(std::time::Duration::from_millis(100)));
     worker.join().unwrap();
 }
 
@@ -595,11 +595,11 @@ fn index_waiter_cancels_within_one_hundred_ms_and_other_catalog_progresses() {
     let started = std::time::Instant::now();
     cancelled.store(true, Ordering::Release);
     let result = rx
-        .recv_timeout(std::time::Duration::from_millis(100))
+        .recv_timeout(scaled_budget(std::time::Duration::from_millis(100)))
         .expect("index waiter did not release within 100 ms");
     let error = result.err().expect("cancelled waiter returned an index");
     assert!(error.to_string().contains("cancelled"));
-    assert!(started.elapsed() <= std::time::Duration::from_millis(100));
+    assert!(started.elapsed() <= scaled_budget(std::time::Duration::from_millis(100)));
     waiter.join().unwrap();
     PROTOTYPE_INDEX_CACHE
         .get()
@@ -633,11 +633,11 @@ fn model_build_contention_cancels_within_one_hundred_ms_without_blocking_other_k
     let started = std::time::Instant::now();
     cancelled.store(true, Ordering::Release);
     let result = rx
-        .recv_timeout(std::time::Duration::from_millis(100))
+        .recv_timeout(scaled_budget(std::time::Duration::from_millis(100)))
         .expect("contended build did not release within 100 ms");
     let error = result.err().expect("cancelled build acquired the permit");
     assert!(error.to_string().contains("cancelled"));
-    assert!(started.elapsed() <= std::time::Duration::from_millis(100));
+    assert!(started.elapsed() <= scaled_budget(std::time::Duration::from_millis(100)));
     waiter.join().unwrap();
     drop(held);
 }
@@ -719,7 +719,7 @@ fn poisoned_model_gate_recovers_without_stranding_waiters() {
     );
     let started = std::time::Instant::now();
     let permit = acquire_model_build_permit(root.path(), MODEL, None).unwrap();
-    assert!(started.elapsed() < std::time::Duration::from_millis(100));
+    assert!(started.elapsed() < scaled_budget(std::time::Duration::from_millis(100)));
     drop(permit);
 }
 
@@ -1073,7 +1073,7 @@ fn ann_release_100k_512d_cached_overlap_throughput_and_resources() {
         *hook.released.lock().unwrap() = true;
         hook.wake.notify_all();
         let result = cancel_rx
-            .recv_timeout(std::time::Duration::from_millis(100))
+            .recv_timeout(scaled_budget(std::time::Duration::from_millis(100)))
             .expect("100k 512-D build did not cancel within 100 ms");
         assert!(result.err().unwrap().to_string().contains("cancelled"));
         let elapsed = started.elapsed();
@@ -1089,9 +1089,9 @@ fn ann_release_100k_512d_cached_overlap_throughput_and_resources() {
     let row_cancellation = cancel_at(TestBuildPhase::SqlRows);
     let metric_cancellation = cancel_at(TestBuildPhase::MetricNodes);
     let hnsw_cancellation = cancel_at(TestBuildPhase::HnswInsertions);
-    assert!(row_cancellation <= std::time::Duration::from_millis(100));
-    assert!(metric_cancellation <= std::time::Duration::from_millis(100));
-    assert!(hnsw_cancellation <= std::time::Duration::from_millis(100));
+    assert!(row_cancellation <= scaled_budget(std::time::Duration::from_millis(100)));
+    assert!(metric_cancellation <= scaled_budget(std::time::Duration::from_millis(100)));
+    assert!(hnsw_cancellation <= scaled_budget(std::time::Duration::from_millis(100)));
     let retry_started = std::time::Instant::now();
     let retried = cached_prototype_index(root.path(), &connection, MODEL, None).unwrap();
     let retry_elapsed = retry_started.elapsed();

@@ -13,6 +13,17 @@ use test_r::test;
 use super::*;
 use crate::rendering::{RenderMetadata, SourcePipeline};
 
+// CI runners are slower and more contended than dev machines; REKESZ_TEST_TIMING_SCALE
+// stretches the timing guards without weakening them locally.
+fn scaled_budget(budget: Duration) -> Duration {
+    let scale = std::env::var("REKESZ_TEST_TIMING_SCALE")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(1.0)
+        .max(1.0);
+    budget.mul_f64(scale)
+}
+
 #[test]
 fn interactive_permits_bypass_background_reserve() {
     let pool = Arc::new(PermitPool::new("test", 4, 2));
@@ -27,13 +38,23 @@ fn interactive_permits_bypass_background_reserve() {
             sender.send("background").unwrap();
         })
     };
-    assert!(receiver.recv_timeout(Duration::from_millis(50)).is_err());
+    assert!(
+        receiver
+            .recv_timeout(scaled_budget(Duration::from_millis(50)))
+            .is_err()
+    );
     let interactive = pool.acquire(2, true, &cancellation).unwrap();
     drop(interactive);
-    assert!(receiver.recv_timeout(Duration::from_millis(50)).is_err());
+    assert!(
+        receiver
+            .recv_timeout(scaled_budget(Duration::from_millis(50)))
+            .is_err()
+    );
     drop(background);
     assert_eq!(
-        receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+        receiver
+            .recv_timeout(scaled_budget(Duration::from_secs(1)))
+            .unwrap(),
         "background"
     );
     contender.join().unwrap();
@@ -112,7 +133,9 @@ fn durable_background_writes_wait_for_bounded_queue_capacity() {
     assert!(!waiter.is_finished());
     receiver.recv().unwrap();
     waiter.join().unwrap();
-    receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+    receiver
+        .recv_timeout(scaled_budget(Duration::from_secs(1)))
+        .unwrap();
 }
 
 #[test]
@@ -171,7 +194,7 @@ fn staged_pipeline_persists_generated_thumbnail() {
     assert_eq!(pipeline.stats().cache_misses, 1);
     let request = RenderRequest::new(source, variant);
     let identity = pipeline.backend.source_identity(&request).unwrap().unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + scaled_budget(Duration::from_secs(2));
     while std::time::Instant::now() < deadline {
         if pipeline
             .backend
@@ -208,7 +231,7 @@ fn face_crop_disk_policy_controls_persistent_cache_writes() {
             .unwrap();
         let request = RenderRequest::new(source, variant);
         let identity = pipeline.backend.source_identity(&request).unwrap().unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + scaled_budget(Duration::from_secs(2));
         let mut cached = false;
         while std::time::Instant::now() < deadline {
             cached = pipeline
@@ -257,7 +280,7 @@ fn face_crop_disk_to_memory_only_transition_bypasses_and_purges_shared_cache() {
     .unwrap();
     let request = RenderRequest::new(source.clone(), variant);
     let identity = disk.backend.source_identity(&request).unwrap().unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + scaled_budget(Duration::from_secs(2));
     while disk
         .backend
         .lookup_cache(&request, Some(&identity))

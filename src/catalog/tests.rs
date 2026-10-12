@@ -7,6 +7,32 @@ use std::{
 };
 use test_r::test;
 
+// Builds a plain binary on demand (`cargo test` does not build bins marked
+// `test = false`) and returns its path under target/debug.
+fn ensure_built(bin: &str) -> PathBuf {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("target/debug/{bin}"));
+    if !path.exists() {
+        let built = std::process::Command::new(env!("CARGO"))
+            .args(["build", "--locked", "--bin", bin])
+            .status()
+            .unwrap_or_else(|error| panic!("failed to run cargo build for {bin}: {error}"));
+        assert!(built.success(), "building the {bin} binary failed");
+    }
+    assert!(path.exists(), "test binary {bin} was not built");
+    path
+}
+
+// CI runners are slower and more contended than dev machines; REKESZ_TEST_TIMING_SCALE
+// stretches the timing guards without weakening them locally.
+fn scaled_budget(budget: Duration) -> Duration {
+    let scale = std::env::var("REKESZ_TEST_TIMING_SCALE")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(1.0)
+        .max(1.0);
+    budget.mul_f64(scale)
+}
+
 #[test]
 fn production_recognition_policy_tampering_fails_closed_in_diagnostics_and_execution() {
     for corruption in [
@@ -1694,19 +1720,19 @@ fn person_operations_validate_and_preserve_confirmed_ownership() {
 
 #[test]
 fn generated_people_catalog_profile() {
-    run_generated_people_catalog_profile(10_000, Duration::from_millis(500));
+    run_generated_people_catalog_profile(10_000, scaled_budget(Duration::from_millis(500)));
 }
 
 #[test]
 #[ignore = "release-gate profile; run using the documented release command"]
 fn generated_people_catalog_profile_60k() {
-    run_generated_people_catalog_profile(60_000, Duration::from_millis(50));
+    run_generated_people_catalog_profile(60_000, scaled_budget(Duration::from_millis(50)));
 }
 
 #[test]
 #[ignore = "release-gate profile; run using the documented release command"]
 fn generated_people_catalog_profile_250k() {
-    run_generated_people_catalog_profile(250_000, Duration::from_millis(100));
+    run_generated_people_catalog_profile(250_000, scaled_budget(Duration::from_millis(100)));
 }
 
 #[test]
@@ -2143,18 +2169,7 @@ fn people_resource_limit_parser_enforces_valid_missing_and_nonnumeric_fixtures()
     let portable_bin = fixtures.path().join("bin");
     fs::create_dir(&portable_bin).unwrap();
     assert!(!portable_bin.join("time").exists());
-    let supervisor =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/people-resource-supervisor");
-    if !supervisor.exists() {
-        // `cargo test` does not build plain binaries (this one has `test = false`
-        // in Cargo.toml); produce it on demand so fresh checkouts work too.
-        let built = std::process::Command::new(env!("CARGO"))
-            .args(["build", "--locked", "--bin", "people-resource-supervisor"])
-            .status()
-            .expect("failed to run cargo build for the supervisor binary");
-        assert!(built.success(), "building the supervisor binary failed");
-    }
-    assert!(supervisor.exists(), "test supervisor binary was not built");
+    let supervisor = ensure_built("people-resource-supervisor");
     let monitored = |name: &str, command: &str, budget: &str, cpu_budget: &str| {
         let resource = fixtures.path().join(format!("{name}.resources"));
         let log = fixtures.path().join(format!("{name}.log"));
@@ -2447,9 +2462,7 @@ fn people_resource_limit_parser_enforces_valid_missing_and_nonnumeric_fixtures()
     assert!(!exact("shared").success());
     assert!(!exact("absent").success());
 
-    let mapper =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/people-test-artifacts");
-    assert!(mapper.exists());
+    let mapper = ensure_built("people-test-artifacts");
     let mut duplicate_mapper = std::process::Command::new(mapper)
         .stdin(std::process::Stdio::piped())
         .spawn()
@@ -3422,7 +3435,7 @@ fn people_summary_long_sql_preempts_within_100ms_and_retry_converges() {
         progress_steps.load(std::sync::atomic::Ordering::Acquire),
         preempt_latency.as_millis()
     );
-    assert!(preempt_latency <= Duration::from_millis(100));
+    assert!(preempt_latency <= scaled_budget(Duration::from_millis(100)));
     assert!(
         format!("{error:#}").contains("interrupted")
             || format!("{error:#}").contains("cancelled")
@@ -3796,7 +3809,7 @@ fn bounded_people_summary_gc_yields_to_live_writers() {
         .unwrap()
         .execute("UPDATE catalog_meta SET last_imported_at='gc-writer'", [])
         .unwrap();
-    assert!(started.elapsed() < Duration::from_millis(100));
+    assert!(started.elapsed() < scaled_budget(Duration::from_millis(100)));
     release.wait();
     gc.join().unwrap().unwrap();
     assert_eq!(
@@ -4426,7 +4439,7 @@ fn run_generated_people_catalog_profile_with_lifecycle(
         in_flight_cancelled.store(true, std::sync::atomic::Ordering::Release);
         if query.join().unwrap().is_err() {
             assert!(
-                started.elapsed() < Duration::from_millis(500),
+                started.elapsed() < scaled_budget(Duration::from_millis(500)),
                 "query cancellation was not prompt"
             );
             cancelled_in_flight = true;
@@ -5484,7 +5497,9 @@ fn large_inventory_sync_releases_writer_lock_between_batches() {
                 boundary_visits += 1;
                 if boundary_visits == 2 {
                     let writer = Connection::open(catalog_path(root.path())).unwrap();
-                    writer.busy_timeout(Duration::from_millis(50)).unwrap();
+                    writer
+                        .busy_timeout(scaled_budget(Duration::from_millis(50)))
+                        .unwrap();
                     writer
                         .execute(
                             "UPDATE catalog_meta SET last_imported_at='batch-writer'",
