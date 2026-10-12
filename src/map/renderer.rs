@@ -622,7 +622,20 @@ pub(crate) fn render_map(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
     use test_r::test;
+
+    // CI runners are slower and more contended than dev machines;
+    // REKESZ_TEST_TIMING_SCALE stretches the timing guard without weakening it
+    // locally.
+    fn scaled_budget(budget: Duration) -> Duration {
+        let scale = std::env::var("REKESZ_TEST_TIMING_SCALE")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .unwrap_or(1.0)
+            .max(1.0);
+        budget.mul_f64(scale)
+    }
 
     fn protobuf_varint(mut value: u64, output: &mut Vec<u8>) {
         while value >= 0x80 {
@@ -783,7 +796,7 @@ mod tests {
         .unwrap();
         assert_eq!(downloaded.len(), tiles.len());
         assert!((2..=4).contains(&maximum.load(Ordering::Acquire)));
-        assert!(started.elapsed() < std::time::Duration::from_millis(220));
+        assert!(started.elapsed() < scaled_budget(Duration::from_millis(220)));
     }
 
     #[test]

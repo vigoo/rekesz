@@ -2143,6 +2143,15 @@ fn people_resource_limit_parser_enforces_valid_missing_and_nonnumeric_fixtures()
     assert!(!portable_bin.join("time").exists());
     let supervisor =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/people-resource-supervisor");
+    if !supervisor.exists() {
+        // `cargo test` does not build plain binaries (this one has `test = false`
+        // in Cargo.toml); produce it on demand so fresh checkouts work too.
+        let built = std::process::Command::new(env!("CARGO"))
+            .args(["build", "--locked", "--bin", "people-resource-supervisor"])
+            .status()
+            .expect("failed to run cargo build for the supervisor binary");
+        assert!(built.success(), "building the supervisor binary failed");
+    }
     assert!(supervisor.exists(), "test supervisor binary was not built");
     let monitored = |name: &str, command: &str, budget: &str, cpu_budget: &str| {
         let resource = fixtures.path().join(format!("{name}.resources"));

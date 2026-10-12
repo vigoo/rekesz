@@ -1,0 +1,7 @@
+# Hash-pinned bundled assets: git must never rewrite their bytes on checkout
+# (Windows autocrlf would turn the text assets into CRLF and break the pinned
+# SHA-256 validation in build.rs).
+assets/** -text
+
+# Shell scripts must keep LF line endings wherever they are checked out.
+*.sh text eol=lf

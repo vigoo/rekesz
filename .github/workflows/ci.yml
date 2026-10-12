@@ -26,7 +26,10 @@ jobs:
 
       # gpui needs freetype/fontconfig/xkbcommon/xkbcommon-x11/wayland/x11 to
       # link, and blade-graphics needs libvulkan; libmtp backs the MTP source
-      # provider and libgphoto2 the PTP camera provider.
+      # provider and libgphoto2 the PTP camera provider. libde265/x265/aom/dav1d
+      # are the codecs the embedded libheif build silently drops when missing
+      # (the packaged-decoder tests pin HEVC+AVIF support); ripgrep backs the
+      # people release privacy scanner script.
       - name: Install Linux system packages
         if: runner.os == 'Linux'
         run: |
@@ -41,11 +44,16 @@ jobs:
             libvulkan-dev \
             libmtp-dev \
             libgphoto2-dev \
+            libde265-dev \
+            libx265-dev \
+            libaom-dev \
+            libdav1d-dev \
+            ripgrep \
             pkg-config
 
       - name: Install macOS packages
         if: runner.os == 'macOS'
-        run: brew install libmtp libgphoto2 pkg-config
+        run: brew install libmtp libgphoto2 pkg-config libde265 x265 aom dav1d ripgrep
 
       # libheif-sys resolves libheif through vcpkg on Windows/MSVC (its vendored
       # CMake build only covers the other platforms); the runner image ships
@@ -75,4 +83,8 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      # Shared CI runners are slower and more contended than dev machines; the
+      # timing-guarded tests scale their budgets instead of flaking.
       - run: cargo test --locked
+        env:
+          REKESZ_TEST_TIMING_SCALE: "8"

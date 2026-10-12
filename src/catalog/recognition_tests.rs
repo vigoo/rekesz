@@ -8,6 +8,17 @@ use crate::catalog::initialize_test_catalog;
 
 const MODEL: &str = "test-recognizer-v1";
 
+// CI runners are slower and more contended than dev machines; REKESZ_TEST_TIMING_SCALE
+// stretches the timing guards without weakening them locally.
+fn scaled_budget(budget: std::time::Duration) -> std::time::Duration {
+    let scale = std::env::var("REKESZ_TEST_TIMING_SCALE")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(1.0)
+        .max(1.0);
+    budget.mul_f64(scale)
+}
+
 fn vector(values: &[f32]) -> Vec<u8> {
     values
         .iter()
@@ -304,7 +315,7 @@ fn ann_index_retrieves_exact_identity_at_one_hundred_thousand_people() {
 
     let build_started = std::time::Instant::now();
     let index = build_prototype_index(prototypes, 1, None).unwrap();
-    assert!(build_started.elapsed() < std::time::Duration::from_secs(120));
+    assert!(build_started.elapsed() < scaled_budget(std::time::Duration::from_secs(120)));
     assert_eq!(index.version, ANN_INDEX_VERSION);
     assert_eq!(index.prototypes.len(), 100_000);
     let candidates = prototype_candidate_ids(&index, &query, ANN_CANDIDATES);

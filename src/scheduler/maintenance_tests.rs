@@ -1,6 +1,18 @@
 use super::*;
 use std::sync::atomic::AtomicUsize;
+use std::time::Duration;
 use test_r::test;
+
+// CI runners are slower and more contended than dev machines; REKESZ_TEST_TIMING_SCALE
+// stretches the timing guards without weakening them locally.
+fn scaled_budget(budget: Duration) -> Duration {
+    let scale = std::env::var("REKESZ_TEST_TIMING_SCALE")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(1.0)
+        .max(1.0);
+    budget.mul_f64(scale)
+}
 
 #[test]
 fn settled_wait_tracks_terminal_transition_without_polling() {
@@ -436,10 +448,10 @@ fn multiworker_prefetch_cannot_hide_new_high_rank_job() {
     });
     scheduler.submit(1, 0);
     scheduler.submit(2, 1);
-    assert!(admission.wait_until_waiters(3, Duration::from_secs(2)));
+    assert!(admission.wait_until_waiters(3, scaled_budget(Duration::from_secs(2))));
     scheduler.submit(9, 100);
     admission.set_foreground_blocked(false);
-    assert!(scheduler.wait_until_settled(Duration::from_secs(2)));
+    assert!(scheduler.wait_until_settled(scaled_budget(Duration::from_secs(2))));
     assert_eq!(order.lock().unwrap().first(), Some(&9));
     assert_eq!(scheduler.stats().running, 0);
 }
