@@ -352,7 +352,11 @@ struct QueuedRequest {
     request: ActionRequest,
 }
 
+// The accesskit_unix adapter is Linux-only; these handlers are only
+// constructed from the adapter setup inside the Linux-gated blocks below.
+#[cfg(target_os = "linux")]
 struct Activation(Arc<Mutex<PeopleAccessibilitySnapshot>>);
+#[cfg(target_os = "linux")]
 impl accesskit::ActivationHandler for Activation {
     fn request_initial_tree(&mut self) -> Option<TreeUpdate> {
         Some(
@@ -365,10 +369,12 @@ impl accesskit::ActivationHandler for Activation {
     }
 }
 
+#[cfg(target_os = "linux")]
 struct Actions {
     latest: Arc<Mutex<PeopleAccessibilitySnapshot>>,
     requests: Arc<Mutex<Vec<QueuedRequest>>>,
 }
+#[cfg(target_os = "linux")]
 impl accesskit::ActionHandler for Actions {
     fn do_action(&mut self, request: ActionRequest) {
         let generation = self
@@ -386,7 +392,9 @@ impl accesskit::ActionHandler for Actions {
     }
 }
 
+#[cfg(target_os = "linux")]
 struct Deactivation;
+#[cfg(target_os = "linux")]
 impl accesskit::DeactivationHandler for Deactivation {
     fn deactivate_accessibility(&mut self) {}
 }
@@ -412,6 +420,10 @@ impl PeopleAccessibilityBridge {
 
     pub fn update(&self, snapshot: PeopleAccessibilitySnapshot, window_focused: bool) {
         *self.latest.lock().expect("accessibility snapshot poisoned") = snapshot.clone();
+        // The focus state only feeds the Linux adapter; keep the parameter
+        // "used" on other platforms.
+        #[cfg(not(target_os = "linux"))]
+        let _ = window_focused;
         #[cfg(target_os = "linux")]
         {
             let mut adapter = self.adapter.lock().expect("accessibility adapter poisoned");

@@ -1,25 +1,51 @@
+// Linux-only release-validation tooling: it samples process-group RSS from
+// /proc and relies on prctl(2) subreaper semantics, neither of which exist on
+// other platforms. The release-validation workflow only runs on Linux.
+use std::process::ExitCode;
+
+#[cfg(target_os = "linux")]
 use std::{
     env,
     ffi::CString,
     fs::File,
     io::{self, Read, Write},
     os::fd::FromRawFd,
-    process::ExitCode,
     sync::atomic::{AtomicI32, Ordering},
     thread,
     time::{Duration, Instant},
 };
 
+fn main() -> ExitCode {
+    #[cfg(not(target_os = "linux"))]
+    {
+        eprintln!("people resource supervisor: only supported on Linux");
+        return ExitCode::FAILURE;
+    }
+
+    #[cfg(target_os = "linux")]
+    match run() {
+        Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
+        Err(error) => {
+            eprintln!("people resource supervisor: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 static FORWARDED_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
+#[cfg(target_os = "linux")]
 extern "C" fn record_signal(signal: libc::c_int) {
     FORWARDED_SIGNAL.store(signal, Ordering::Release);
 }
 
+#[cfg(target_os = "linux")]
 fn usage_seconds(value: libc::timeval) -> f64 {
     value.tv_sec as f64 + value.tv_usec as f64 / 1_000_000.0
 }
 
+#[cfg(target_os = "linux")]
 fn process_group_rss_kib(group: libc::pid_t) -> io::Result<i64> {
     if env::var_os("PEOPLE_SUPERVISOR_FAIL_SAMPLER").is_some() {
         return Err(io::Error::other("injected process-group sampler failure"));
@@ -58,6 +84,7 @@ fn process_group_rss_kib(group: libc::pid_t) -> io::Result<i64> {
     Ok(total)
 }
 
+#[cfg(target_os = "linux")]
 unsafe fn set_signal_mask(how: libc::c_int, mask: &libc::sigset_t) -> io::Result<()> {
     if unsafe { libc::sigprocmask(how, mask, std::ptr::null_mut()) } == 0 {
         Ok(())
@@ -66,16 +93,7 @@ unsafe fn set_signal_mask(how: libc::c_int, mask: &libc::sigset_t) -> io::Result
     }
 }
 
-fn main() -> ExitCode {
-    match run() {
-        Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
-        Err(error) => {
-            eprintln!("people resource supervisor: {error}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
+#[cfg(target_os = "linux")]
 fn run() -> Result<i32, Box<dyn std::error::Error>> {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
     let separator = arguments

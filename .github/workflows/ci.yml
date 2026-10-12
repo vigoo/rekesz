@@ -46,6 +46,27 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install libmtp libgphoto2 pkg-config
 
+      # libheif-sys resolves libheif through vcpkg on Windows/MSVC (its vendored
+      # CMake build only covers the other platforms); the runner image ships
+      # vcpkg at VCPKG_INSTALLATION_ROOT. x64-windows-static-md is the triplet
+      # the vcpkg crate links against by default and matches libheif-sys's own
+      # package metadata (libheif[aom]). The restored installed tree carries
+      # vcpkg's status database, so `vcpkg install` becomes a fast no-op on
+      # cache hits and the fresh install is saved at job end on misses.
+      - name: Restore vcpkg libheif
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: C:\vcpkg\installed
+          key: vcpkg-libheif-aom-x64-windows-static-md
+
+      - name: Install Windows packages (vcpkg)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          vcpkg install "libheif[aom]:x64-windows-static-md"
+          "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
+
       - uses: Swatinem/rust-cache@v2
 
       # Formatting is platform-independent; one pass is enough.

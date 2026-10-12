@@ -1,1 +1,5 @@
 /target/
+
+# Personal Lightroom catalog export (photo album metadata; not for the repo).
+# The phase-D inventory guard test skips itself when this file is absent.
+/lightroom-inventory.json

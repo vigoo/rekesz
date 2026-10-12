@@ -478,8 +478,18 @@ fn singular_homography_is_rejected_by_recipe_validation() {
 
 #[test]
 fn phase_d_inventory_assumptions_are_guarded() {
-    let inventory: serde_json::Value =
-        serde_json::from_str(include_str!("../../lightroom-inventory.json")).unwrap();
+    // The inventory export is derived from a personal Lightroom catalog, so it
+    // stays uncommitted; the guard runs wherever the export is present and
+    // skips on clean checkouts (CI).
+    let inventory_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lightroom-inventory.json");
+    let Ok(inventory_json) = std::fs::read_to_string(&inventory_path) else {
+        eprintln!(
+            "skipping: {} is not present (personal export, intentionally not committed)",
+            inventory_path.display()
+        );
+        return;
+    };
+    let inventory: serde_json::Value = serde_json::from_str(&inventory_json).unwrap();
     let properties = inventory["properties"].as_object().unwrap();
 
     assert_eq!(properties["LensProfileEnable"]["numeric_min"], 0.0);
@@ -2100,6 +2110,8 @@ fn people_release_script_contains_all_mandatory_gates() {
     assert!(resource_helper.contains("--test-threads=1 --nocapture"));
 }
 
+// Runs bash, the Linux-only people-resource-supervisor binary, and /usr/bin/python3.
+#[cfg(target_os = "linux")]
 #[test]
 fn people_resource_limit_parser_enforces_valid_missing_and_nonnumeric_fixtures() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -2441,6 +2453,8 @@ fn people_resource_limit_parser_enforces_valid_missing_and_nonnumeric_fixtures()
     assert!(!duplicate_mapper.wait().unwrap().success());
 }
 
+// Drives bash-only release scripts (git, chmod, the Linux-only supervisor).
+#[cfg(target_os = "linux")]
 #[test]
 fn people_release_privacy_scanner_accepts_aggregates_and_rejects_identifiers() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -2926,6 +2940,8 @@ fn people_release_privacy_gate_runs_on_failure_and_before_upload() {
     assert!(workflow.contains("steps.privacy.outcome == 'success'"));
 }
 
+// Drives the bash-only release artifact preparation script.
+#[cfg(target_os = "linux")]
 #[test]
 fn people_release_artifact_cleanup_rejects_aliases_without_touching_sentinels() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -3038,6 +3054,8 @@ fn people_release_artifact_cleanup_rejects_aliases_without_touching_sentinels() 
     fs::remove_dir(dedicated).unwrap();
 }
 
+// Drives the bash-only privacy scanner script against a symlinked root.
+#[cfg(target_os = "linux")]
 #[test]
 fn people_release_privacy_scanner_rejects_a_symlink_root() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
