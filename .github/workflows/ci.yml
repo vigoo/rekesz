@@ -24,9 +24,9 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      # gpui needs freetype/fontconfig/xkbcommon/wayland/x11 to link, and
-      # blade-graphics needs libvulkan; libmtp backs the MTP source provider
-      # and libgphoto2 the PTP camera provider.
+      # gpui needs freetype/fontconfig/xkbcommon/xkbcommon-x11/wayland/x11 to
+      # link, and blade-graphics needs libvulkan; libmtp backs the MTP source
+      # provider and libgphoto2 the PTP camera provider.
       - name: Install Linux system packages
         if: runner.os == 'Linux'
         run: |
@@ -35,6 +35,7 @@ jobs:
             libfreetype-dev \
             libfontconfig-dev \
             libxkbcommon-dev \
+            libxkbcommon-x11-dev \
             libwayland-dev \
             libx11-dev \
             libvulkan-dev \

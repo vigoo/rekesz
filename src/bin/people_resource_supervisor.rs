@@ -15,14 +15,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(target_os = "linux")]
 fn main() -> ExitCode {
-    #[cfg(not(target_os = "linux"))]
-    {
-        eprintln!("people resource supervisor: only supported on Linux");
-        return ExitCode::FAILURE;
-    }
-
-    #[cfg(target_os = "linux")]
     match run() {
         Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
         Err(error) => {
@@ -30,6 +24,12 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn main() -> ExitCode {
+    eprintln!("people resource supervisor: only supported on Linux");
+    ExitCode::FAILURE
 }
 
 #[cfg(target_os = "linux")]
