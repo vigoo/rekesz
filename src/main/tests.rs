@@ -1386,26 +1386,37 @@ fn gpui_mixed_maintenance_rows_keep_recognition_click_index_and_retryable_work(
             );
             if cancelled {
                 let deadline = Instant::now() + Duration::from_secs(5);
-                let durable_status = loop {
-                    let status: String =
-                        rusqlite::Connection::open(catalog::catalog_path(root.path()))
-                            .unwrap()
-                            .query_row(
-                                "SELECT status FROM recognition_refresh_queue WHERE entity_id=777",
-                                [],
-                                |row| row.get(0),
-                            )
-                            .unwrap();
-                    if status == "pending" || Instant::now() >= deadline {
-                        break status;
+                loop {
+                    let queried = rusqlite::Connection::open(catalog::catalog_path(root.path()))
+                        .unwrap()
+                        .query_row(
+                            "SELECT status FROM recognition_refresh_queue WHERE entity_id=777",
+                            [],
+                            |row| row.get::<_, String>(0),
+                        );
+                    match queried {
+                        // The worker reset the cancelled claim to pending.
+                        Ok(status) => {
+                            if status == "pending" || Instant::now() >= deadline {
+                                assert_eq!(status, "pending");
+                                preserved_retryable_work = true;
+                                break;
+                            }
+                        }
+                        // The cancellation was recorded but the refresh had
+                        // already succeeded, so the worker deleted the row:
+                        // this attempt lost the race, run another one.
+                        Err(rusqlite::Error::QueryReturnedNoRows) => break,
+                        Err(error) => panic!("durable status query failed: {error}"),
+                    }
+                    if Instant::now() >= deadline {
+                        break;
                     }
                     cx.run_until_parked();
                     std::thread::sleep(Duration::from_millis(2));
-                };
-                assert_eq!(durable_status, "pending");
-                preserved_retryable_work = true;
+                }
             }
-            if cancelled || completed {
+            if preserved_retryable_work || cancelled || completed {
                 break;
             }
             assert!(

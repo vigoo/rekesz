@@ -56,6 +56,14 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install libmtp libgphoto2 pkg-config libde265 x265 aom dav1d ripgrep
 
+      # Homebrew installs versioned Cellar paths that end up baked into the
+      # cached libheif build output; bump the cache key whenever the codec
+      # versions move so stale -L paths can never be linked again.
+      - name: Stamp Homebrew codec versions
+        if: runner.os == 'macOS'
+        run: |
+          echo "BREW_CODEC_STAMP=$(brew list --versions libde265 x265 aom dav1d libmtp libgphoto2 | shasum -a 256 | cut -d' ' -f1)" >> "$GITHUB_ENV"
+
       # libheif-sys resolves libheif through vcpkg on Windows/MSVC (its vendored
       # CMake build only covers the other platforms); the runner image ships
       # vcpkg at VCPKG_INSTALLATION_ROOT. x64-windows-static-md is the triplet
@@ -78,6 +86,8 @@ jobs:
           "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ env.BREW_CODEC_STAMP }}
 
       # Formatting is platform-independent; one pass is enough.
       - name: cargo fmt
