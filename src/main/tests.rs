@@ -2729,11 +2729,16 @@ fn gpui_people_accept_reject_and_not_face_persist_across_restart_and_rollback(
         )
     }));
 
-    // A failed save must restore the optimistic row state. The path is moved only
-    // inside this test's temporary directory, never a user catalog.
+    // A failed save must restore the optimistic row state. The sabotage drops
+    // a core table so the save's schema validation fails immediately; this is
+    // confined to the test's temporary catalog, never a user catalog. (It also
+    // avoids renaming the catalog file, which Windows forbids while pooled
+    // handles are open.)
     let catalog_path = catalog::catalog_path(root.path());
-    let held_catalog = root.path().join("held-catalog.sqlite3");
-    std::fs::rename(&catalog_path, &held_catalog).unwrap();
+    rusqlite::Connection::open(&catalog_path)
+        .unwrap()
+        .execute_batch("DROP TABLE catalog_meta")
+        .unwrap();
     cx.update_entity(&view, |view, cx| {
         if let PeoplePageLoad::Loaded(page) = &mut view.people_faces {
             page.items[0].kind = catalog::people::FaceAssignmentKind::Suggested;
@@ -2749,7 +2754,6 @@ fn gpui_people_accept_reject_and_not_face_persist_across_restart_and_rollback(
                     && view.people_decision_error.is_some()
         )
     }));
-    std::fs::rename(held_catalog, catalog_path).unwrap();
 }
 
 #[gpui::test]
