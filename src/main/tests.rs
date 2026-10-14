@@ -4566,13 +4566,20 @@ fn import_footer_progress_counts_each_file_once(cx: &mut gpui::TestAppContext) {
     let (_view, cx) = import_view_with_card(cx, &library, &card);
 
     // Let the whole-directory thumbnail pass (batched on timers) and the
-    // decodes settle. Progress reads sit behind a 250 ms throttle, so every
-    // read below expires it first.
-    for _ in 0..6 {
+    // decodes settle. The listing itself arrives from real background scan
+    // threads, so wait for the target to reach the listing size instead of
+    // assuming a fixed number of timer ticks suffices on a loaded runner.
+    // Progress reads sit behind a 250 ms throttle, so every read below
+    // expires it first.
+    let settle_deadline = Instant::now() + Duration::from_secs(30);
+    let (mut rendered, total) = loop {
         cx.executor().advance_clock(Duration::from_millis(300));
         cx.run_until_parked();
-    }
-    let (mut rendered, total) = _view.read_with(&*cx, |view, _| view.import_thumbnail_progress());
+        let progress = _view.read_with(&*cx, |view, _| view.import_thumbnail_progress());
+        if progress.1 == 3 || Instant::now() >= settle_deadline {
+            break progress;
+        }
+    };
     assert_eq!(total, 3, "target is the listing's file count");
 
     // Repeated scans must neither compound the done counter nor grow the
