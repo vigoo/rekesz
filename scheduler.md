@@ -189,7 +189,7 @@ throughput measurements can tune the formula without changing pipeline APIs.
   retained as an alias) and enforce one shared application-wide admission cap
   across render, directory, and metadata work
 
-On the 515-image `/mnt/pictures/Pictures/2018/Nyaralás/2018-08-06` benchmark,
+On the 515-image `/mnt/reference-pictures/manual-benchmark/2018/vacation` benchmark,
 the old synchronous scan spent 2.24–2.39 seconds extracting capture metadata.
 The two-stage implementation publishes the modification-time grid in about
 21 ms, completes a fresh authoritative-XMP enrichment in about 119 ms, and

@@ -225,12 +225,12 @@ fn reads_capture_time_from_the_cr3_regression_sample() {
 }
 
 #[test]
-#[ignore = "requires the user's external GPS-bearing CR3 sample"]
+#[ignore = "requires an external GPS-bearing CR3 sample; point at one and update the expected coordinate"]
 fn reads_gps_from_the_external_cr3_regression_sample() {
-    let path = Path::new("/mnt/pictures/Pictures/2026/Alpok túra/2026-07-31/IMG_0736.CR3");
+    let path = Path::new("/mnt/reference-pictures/manual/gps-sample.CR3");
     let coordinate = embedded_coordinate(path).unwrap();
-    assert!((coordinate.latitude() - 45.192_905_555_555_56).abs() < 0.000_01);
-    assert!((coordinate.longitude() - 5.730_708_333_333_333).abs() < 0.000_01);
+    assert!((coordinate.latitude() - 1.0).abs() < 0.000_01);
+    assert!((coordinate.longitude() - 2.0).abs() < 0.000_01);
 }
 
 #[test]

@@ -16,7 +16,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 
-const DEFAULT_CATALOG_DIR: &str = "/mnt/pictures/Pictures/Lightroom";
+const DEFAULT_CATALOG_DIR: &str = "./Lightroom";
 const TOP_VALUES: usize = 12;
 
 #[derive(Debug)]

@@ -85,10 +85,11 @@ fn raw_probe_rejects_oversized_and_overflowing_allocations() {
 #[test]
 #[ignore = "manual investigation using external RAW samples"]
 fn report_reference_raw_exposure_and_white_balance() {
+    // Manual investigation: point these at local RAW samples when running.
     let samples = [
-        "/mnt/pictures/Pictures/2020/Szlovénia/2020-07-29/DSC_0546.NEF",
-        "/mnt/pictures/Pictures/2026/Alpok túra/2026-08-03/IMG_0997.CR3",
-        "/mnt/pictures/Pictures/2026/Alpok túra/2026-08-03/IMG_1056.CR3",
+        "/mnt/reference-pictures/manual/2020/DSC_0546.NEF",
+        "/mnt/reference-pictures/manual/2026/IMG_0997.CR3",
+        "/mnt/reference-pictures/manual/2026/IMG_1056.CR3",
     ];
     let cancelled = Arc::new(AtomicBool::new(false));
     for path in samples {

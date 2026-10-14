@@ -600,7 +600,7 @@ fn from_dng(args: &Args) -> anyhow::Result<()> {
                 candidate.is_file().then_some(candidate)
             })
             .or_else(|| {
-                ["cr3", "cr3-alpok"].iter().find_map(|sub| {
+                ["cr3", "cr3-manual"].iter().find_map(|sub| {
                     let candidate = args.dir.join(sub).join(format!("{stem}.CR3"));
                     candidate.is_file().then_some(candidate)
                 })
@@ -618,7 +618,7 @@ fn from_dng(args: &Args) -> anyhow::Result<()> {
                 sibling.is_file().then_some(sibling)
             })
             .or_else(|| {
-                ["cr3", "cr3-alpok"].iter().find_map(|sub| {
+                ["cr3", "cr3-manual"].iter().find_map(|sub| {
                     ["jpg", "jpeg", "JPG", "JPEG"].iter().find_map(|extension| {
                         let candidate = args.dir.join(sub).join(format!("{stem}.{extension}"));
                         candidate.is_file().then_some(candidate)

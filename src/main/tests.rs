@@ -3577,13 +3577,14 @@ fn face_inventory_progress_reports_fraction_stage_and_current_file() {
 #[test]
 #[ignore = "manual investigation using external reference samples"]
 fn export_fixed_reference_renders() {
-    let root = PathBuf::from("/mnt/pictures/Pictures");
+    // Manual investigation: point these at local RAW/JPEG samples when running.
+    let root = PathBuf::from("/mnt/reference-pictures");
     let recipes = catalog::load_recipes(&root).unwrap();
     let samples = [
-        root.join("2020/Szlovénia/2020-07-29/DSC_0546.NEF"),
-        root.join("2026/Alpok túra/2026-07-28/IMG_5639.HEIC"),
-        root.join("2026/Alpok túra/2026-08-03/IMG_0997.CR3"),
-        root.join("2026/Alpok túra/2026-08-03/IMG_1056.CR3"),
+        root.join("manual/2020/DSC_0546.NEF"),
+        root.join("manual/2026/IMG_5639.HEIC"),
+        root.join("manual/2026/IMG_0997.CR3"),
+        root.join("manual/2026/IMG_1056.CR3"),
     ];
     let cache = tempfile::tempdir().unwrap();
     let pipeline = PreviewRenderer::with_source_cache_capacity(
@@ -3928,11 +3929,12 @@ fn virtual_grid_callbacks_merge_fragments_but_replace_a_disjoint_viewport() {
 #[test]
 #[ignore = "manual end-to-end queue benchmark"]
 fn benchmark_all_scheduled_jobs() {
-    let directory = PathBuf::from("/mnt/pictures/Pictures/2018/Nyaralás/2018-08-06");
+    // Manual benchmark: point these at local sample images when running.
+    let directory = PathBuf::from("/mnt/reference-pictures/manual-benchmark/2018/vacation");
     let nef = directory.join("DSC_0389.NEF");
     let jpeg = directory.join("DSC_2587.JPG");
     let cr3 = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test/IMG_0052.CR3");
-    let heic = PathBuf::from("/mnt/pictures/Pictures/2026/Alpok túra/2026-07-25/IMG_5562.HEIC");
+    let heic = PathBuf::from("/mnt/reference-pictures/manual-benchmark/2026/IMG_5562.HEIC");
     for path in [&directory, &nef, &jpeg, &cr3, &heic] {
         assert!(path.exists(), "missing benchmark input: {}", path.display());
     }
@@ -4118,7 +4120,8 @@ fn benchmark_all_scheduled_jobs() {
 #[test]
 #[ignore = "manual cancellation and parallel-throughput benchmark"]
 fn benchmark_scheduler_cancellation_and_parallelism() {
-    let directory = PathBuf::from("/mnt/pictures/Pictures/2018/Nyaralás/2018-08-06");
+    // Manual benchmark: point these at local sample images when running.
+    let directory = PathBuf::from("/mnt/reference-pictures/manual-benchmark/2018/vacation");
     let raw_paths = [
         "DSC_0389.NEF",
         "DSC_0390.NEF",

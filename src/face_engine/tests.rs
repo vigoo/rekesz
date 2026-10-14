@@ -2150,18 +2150,17 @@ fn analysis_completes_under_slow_background_decode_saturation() {
 
 #[test]
 fn analysis_of_the_field_reported_stuck_file_completes() {
-    // Diagnostic for the field report: the app hung in Decoding on this
-    // exact 800x800 JPEG (two sessions in a row). Runs the full analysis of
-    // that file; skips silently when the library is not mounted.
+    // Diagnostic for a field report: the app hung in Decoding on an exact
+    // 800x800 JPEG (two sessions in a row). Runs the full analysis of that
+    // file; skips silently when the sample is not present.
     let _ort = lock_ort();
-    let reported = std::path::PathBuf::from(
-        "/mnt/pictures/Pictures/1997/PIC/Cradle_Of_Filth_-_Cruelty_And_The_Beast-inside.jpg",
-    );
+    let reported =
+        std::path::PathBuf::from("/mnt/reference-pictures/manual/field-report-800x800.jpg");
     if !reported.is_file() {
         return;
     }
     let root = tempfile::tempdir().unwrap();
-    let source = root.path().join("Cradle_Of_Filth-inside.jpg");
+    let source = root.path().join("field-report-800x800.jpg");
     std::fs::copy(&reported, &source).unwrap();
     catalog::initialize_test_catalog(root.path()).unwrap();
     sync_analysis_inventory(root.path(), std::slice::from_ref(&source)).unwrap();
