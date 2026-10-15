@@ -121,7 +121,8 @@ jobs:
         shell: pwsh
         run: |
           $name = "rekesz-$env:VERSION-${{ matrix.target }}"
-          tar -a -cf "$name.zip" -C target\release "rekesz$({{ matrix.extension }})"
+          $binary = "rekesz" + "${{ matrix.extension }}"
+          tar -a -cf "$name.zip" -C target\release $binary
           $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
           "$hash  $name.zip" | Out-File -NoNewline "$name.zip.sha256"
 
