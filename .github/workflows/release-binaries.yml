@@ -1,0 +1,137 @@
+name: Release binaries
+
+# Builds the rekesz binary for every published GitHub release and attaches it
+# to the release as platform archives. The crate version is stamped from the
+# tag (v-prefixed or bare), so `rekesz --version` matches the release.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  binaries:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            extension: ""
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            extension: ""
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            extension: .exe
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    env:
+      TAG: ${{ github.event.release.tag_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux system packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libfreetype-dev \
+            libfontconfig-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libwayland-dev \
+            libx11-dev \
+            libvulkan-dev \
+            libmtp-dev \
+            libgphoto2-dev \
+            libde265-dev \
+            libx265-dev \
+            libnuma-dev \
+            libaom-dev \
+            libdav1d-dev \
+            pkg-config
+
+      - name: Install macOS packages
+        if: runner.os == 'macOS'
+        run: brew install libmtp libgphoto2 pkg-config libde265 x265 aom dav1d
+
+      - name: Stamp Homebrew codec versions
+        if: runner.os == 'macOS'
+        run: |
+          echo "BREW_CODEC_STAMP=$(brew list --versions libde265 x265 aom dav1d libmtp libgphoto2 | shasum -a 256 | cut -d' ' -f1)" >> "$GITHUB_ENV"
+
+      - name: Restore vcpkg libheif
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: C:\vcpkg\installed
+          key: vcpkg-libheif-aom-x64-windows-static-md
+
+      - name: Install Windows packages (vcpkg)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          vcpkg install "libheif[aom]:x64-windows-static-md"
+          "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: release-binaries
+          key: ${{ env.BREW_CODEC_STAMP }}
+
+      # Stamp the crate version from the release tag so the binary's
+      # --version (clap reads CARGO_PKG_VERSION) matches the release.
+      - name: Stamp crate version from the tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          sed -i.bak "s/^version = .*/version = \"$VERSION\"/" Cargo.toml
+          sed -i.bak '/^name = "rekesz"$/{n;s/^version = .*/version = "'"$VERSION"'"/;}' Cargo.lock
+          rm -f Cargo.toml.bak Cargo.lock.bak
+          grep -n "^version" Cargo.toml
+          grep -A1 '^name = "rekesz"$' Cargo.lock
+
+      - name: Build rekesz (release)
+        run: cargo build --release --bin rekesz
+
+      - name: Check the stamped version
+        shell: bash
+        run: ./target/release/rekesz${{ matrix.extension }} --version
+
+      - name: Package (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          NAME="rekesz-$VERSION-${{ matrix.target }}"
+          tar -czf "$NAME.tar.gz" -C target/release rekesz${{ matrix.extension }}
+          sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
+
+      - name: Package (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $name = "rekesz-$env:VERSION-${{ matrix.target }}"
+          tar -a -cf "$name.zip" -C target\release "rekesz$({{ matrix.extension }})"
+          $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Out-File -NoNewline "$name.zip.sha256"
+
+      - name: Attach archives to the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          NAME="rekesz-$VERSION-${{ matrix.target }}"
+          gh release upload "$TAG" \
+            "$NAME.${{ matrix.archive }}" "$NAME.${{ matrix.archive }}.sha256" \
+            --repo "$GITHUB_REPOSITORY" --clobber
