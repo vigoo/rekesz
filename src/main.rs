@@ -501,6 +501,41 @@ enum ZoomLevel {
     ActualSize,
 }
 
+/// Maps a selection from one listing index space onto another by path;
+/// indices whose image is missing from `to` are dropped.
+fn remap_image_selection_to_paths(
+    selection: &ImageSelection,
+    from: &[PathBuf],
+    to: &[PathBuf],
+) -> ImageSelection {
+    let index_of: HashMap<&PathBuf, usize> = to
+        .iter()
+        .enumerate()
+        .map(|(index, path)| (path, index))
+        .collect();
+    ImageSelection {
+        indices: selection
+            .indices
+            .iter()
+            .filter_map(|index| {
+                from.get(*index)
+                    .and_then(|path| index_of.get(path))
+                    .copied()
+            })
+            .collect(),
+        anchor: selection
+            .anchor
+            .and_then(|index| from.get(index))
+            .and_then(|path| index_of.get(path))
+            .copied(),
+        focused: selection
+            .focused
+            .and_then(|index| from.get(index))
+            .and_then(|path| index_of.get(path))
+            .copied(),
+    }
+}
+
 struct ImageViewState {
     path: PathBuf,
     zoom: ZoomLevel,
@@ -543,6 +578,52 @@ enum DirectoryViewMode {
     People,
     Import,
 }
+
+/// The create/rename/delete dialogs for persistent album selections. Rendered
+/// at root level and focused on open, so grid keybindings cannot fire behind
+/// them.
+#[derive(Clone)]
+enum SelectionDialog {
+    Create {
+        input: String,
+    },
+    Rename {
+        directory: PathBuf,
+        name: String,
+        input: String,
+    },
+    DeleteConfirm {
+        directory: PathBuf,
+        name: String,
+    },
+}
+
+struct SelectionContextMenu {
+    directory: PathBuf,
+    name: String,
+    position: (f32, f32),
+}
+
+/// The selection-mode axis of the grid, orthogonal to `DirectoryViewMode`.
+/// Editor mode shows every image with membership toggles; viewer mode
+/// filters the grid to the active selection's members.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+enum GridSelectionMode {
+    #[default]
+    Default,
+    Viewer {
+        name: String,
+    },
+    Editor {
+        name: String,
+    },
+}
+
+/// Selections visible on the toolbar before the overflow menu takes over.
+const SELECTIONS_TOOLBAR_LIMIT: usize = 5;
+/// Timed save retries after a contended save failed, before giving up until
+/// the next user edit.
+const SELECTIONS_SAVE_MAX_RETRIES: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum PeopleDecision {
@@ -1088,6 +1169,25 @@ struct PictureBrowser {
     map_cache_clearing: bool,
     hidden_subtrees_loaded: bool,
     hidden_save_in_flight: bool,
+    selections: BTreeMap<PathBuf, Vec<catalog::selections::AlbumSelection>>,
+    selections_loaded: bool,
+    selections_save_in_flight: bool,
+    selections_save_retries: BTreeMap<PathBuf, u32>,
+    selections_dirty: BTreeSet<PathBuf>,
+    selection_dialog: Option<SelectionDialog>,
+    selection_dialog_error: Option<String>,
+    selection_dialog_focus: FocusHandle,
+    selections_menu_open: bool,
+    selections_menu_scroll: UniformListScrollHandle,
+    selection_context_menu: Option<SelectionContextMenu>,
+    grid_selection_mode: GridSelectionMode,
+    viewer_paths: Option<Vec<PathBuf>>,
+}
+
+/// UTC timestamp in the SQLite `datetime('now')` textual format, matching the
+/// convention of every other TEXT timestamp column in the catalog.
+fn chrono_now_string() -> String {
+    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 fn durable_render_cache_write(
@@ -1167,6 +1267,7 @@ enum ScrollbarTarget {
     Tree,
     Grid,
     Settings,
+    SelectionsMenu,
 }
 
 #[derive(Clone, Copy)]
@@ -1915,6 +2016,19 @@ impl PictureBrowser {
             map_cache_clearing: false,
             hidden_subtrees_loaded: false,
             hidden_save_in_flight: false,
+            selections: BTreeMap::new(),
+            selections_loaded: false,
+            selections_save_in_flight: false,
+            selections_save_retries: BTreeMap::new(),
+            selections_dirty: BTreeSet::new(),
+            selection_dialog: None,
+            selection_dialog_error: None,
+            selection_dialog_focus: cx.focus_handle(),
+            selections_menu_open: false,
+            selections_menu_scroll: UniformListScrollHandle::new(),
+            selection_context_menu: None,
+            grid_selection_mode: GridSelectionMode::Default,
+            viewer_paths: None,
         };
         let catalog_work = this.work.start("Loading develop catalog…");
         let catalog_root = settings.root.clone();
@@ -1922,15 +2036,18 @@ impl PictureBrowser {
             catalog::prepare_existing_catalog(&catalog_root)?;
             let recipes = catalog::load_recipes(&catalog_root)?;
             let hidden = catalog::load_hidden_subtrees(&catalog_root)?;
-            Ok::<_, anyhow::Error>((recipes, hidden))
+            let selections = catalog::selections::load_album_selections(&catalog_root)?;
+            Ok::<_, anyhow::Error>((recipes, hidden, selections))
         });
         cx.spawn(async move |this, cx| {
             let catalog = catalog_loading.await;
             this.update(cx, |this, cx| {
                 this.work.finish(catalog_work);
                 match catalog {
-                    Ok((recipes, hidden)) => {
+                    Ok((recipes, hidden, selections)) => {
                         this.recipes = Some(Arc::new(recipes));
+                        this.selections = selections;
+                        this.selections_loaded = true;
                         for path in &hidden {
                             this.model.ensure_node(path.clone());
                         }
@@ -1971,6 +2088,8 @@ impl PictureBrowser {
                     Err(error) => {
                         eprintln!("cannot prepare Rekesz catalog: {error:#}");
                         this.recipes = Some(Arc::new(HashMap::new()));
+                        this.selections = BTreeMap::new();
+                        this.selections_loaded = true;
                         this.settings_status =
                             Some(format!("Could not prepare Rekesz catalog: {error:#}"));
                     }
@@ -2025,6 +2144,9 @@ impl PictureBrowser {
                                 cached_metadata,
                                 missing_metadata,
                             );
+                            if node == this.selected {
+                                this.rebuild_viewer_paths(cx);
+                            }
                             if node == this.selected
                                 && this.directory_view_mode == DirectoryViewMode::Map
                                 && this.map_pending_fit == Some(node)
@@ -2136,6 +2258,9 @@ impl PictureBrowser {
             .loaded(node)
             .map(|contents| contents.images.as_slice())
             .unwrap_or_default();
+        // In viewer mode the grid selection's indices refer to the filtered
+        // listing, so paths must resolve through that index space.
+        let index_space = self.viewer_paths.clone().unwrap_or_else(|| images.to_vec());
         let selection = match &self.main_view {
             MainView::Dir(_, selection) => selection,
             MainView::Image(_) => &self.saved_selection,
@@ -2143,11 +2268,11 @@ impl PictureBrowser {
         let selected = selection
             .indices
             .iter()
-            .filter_map(|index| images.get(*index).cloned())
+            .filter_map(|index| index_space.get(*index).cloned())
             .collect::<HashSet<_>>();
         let focused = selection
             .focused
-            .and_then(|index| images.get(index).cloned());
+            .and_then(|index| index_space.get(index).cloned());
         if !self.model.apply_pending_capture_order(node) {
             return;
         }
@@ -2170,6 +2295,10 @@ impl PictureBrowser {
         if let MainView::Dir(_, selection) = &mut self.main_view {
             *selection = restored;
         }
+        // `restored` lives in the NEW source index space; dropping the stale
+        // filtered listing makes the rebuild remap from that same space.
+        self.viewer_paths = None;
+        self.rebuild_viewer_paths(cx);
         self.reset_grid_prediction();
         cx.notify();
     }
@@ -2792,11 +2921,15 @@ impl PictureBrowser {
 
     fn select(&mut self, node: NodeId, cx: &mut Context<Self>) {
         self.dismiss_map_card();
+        self.selections_menu_open = false;
+        self.selection_context_menu = None;
         let directory_changed = self.selected != node;
         if !directory_changed {
             cx.notify();
             return;
         }
+        self.grid_selection_mode = GridSelectionMode::Default;
+        self.viewer_paths = None;
         if directory_changed && let Some(recursive) = self.recursive_grid.take() {
             recursive.cancelled.store(true, Ordering::Release);
         }
@@ -3057,6 +3190,19 @@ impl PictureBrowser {
     }
 
     fn close_image(&mut self, _: &CloseImage, _: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.main_view, MainView::Dir(..)) {
+            // Escape in the grid leaves an active viewer/editor mode and
+            // clears floating menus; in the large image view this handler
+            // keeps closing the image. While a modal selection dialog is
+            // open it owns focus, so this binding cannot fire behind it.
+            self.path_context_menu = None;
+            self.selection_context_menu = None;
+            self.selections_menu_open = false;
+            if self.grid_selection_mode != GridSelectionMode::Default {
+                self.exit_grid_selection_mode(cx);
+            }
+            return;
+        }
         if matches!(self.main_view, MainView::Image(_)) {
             self.scheduler.clear_scope(IMAGE_SCOPE);
             self.scheduler.clear_scope(IMAGE_PREFETCH_SCOPE);
@@ -3193,6 +3339,11 @@ impl PictureBrowser {
     }
 
     fn selected_images(&self) -> &[PathBuf] {
+        // The viewer filter shadows both other sources; `viewer_paths` is
+        // kept in the source listing's order by `rebuild_viewer_paths`.
+        if let Some(paths) = &self.viewer_paths {
+            return paths;
+        }
         if let Some(RecursiveGridState {
             root,
             status: RecursiveGridStatus::Loaded(images),
@@ -3408,6 +3559,9 @@ impl PictureBrowser {
 
     fn set_directory_view_mode(&mut self, mode: DirectoryViewMode, cx: &mut Context<Self>) {
         self.dismiss_map_card();
+        self.selections_menu_open = false;
+        self.selection_context_menu = None;
+        self.exit_grid_selection_mode(cx);
         self.directory_view_mode = mode;
         if mode != DirectoryViewMode::Map {
             self.map_render_epoch = self.map_render_epoch.wrapping_add(1);
@@ -7029,6 +7183,8 @@ impl PictureBrowser {
     }
 
     fn start_recursive_grid(&mut self, cx: &mut Context<Self>) {
+        self.grid_selection_mode = GridSelectionMode::Default;
+        self.viewer_paths = None;
         let node = self.selected;
         let Some(contents) = self.model.loaded(node) else {
             return;
@@ -7106,6 +7262,8 @@ impl PictureBrowser {
     }
 
     fn stop_recursive_grid(&mut self, cx: &mut Context<Self>) {
+        self.grid_selection_mode = GridSelectionMode::Default;
+        self.viewer_paths = None;
         if let Some(recursive) = self.recursive_grid.take() {
             recursive.cancelled.store(true, Ordering::Release);
             self.map_fit_node = None;
@@ -7154,6 +7312,7 @@ impl PictureBrowser {
             MainView::Dir(_, selection) => selection.indices.clone(),
             MainView::Image(_) => BTreeSet::new(),
         };
+        let editor_members = self.editor_member_set();
         range
             .map(|row| {
                 let tile_height = self.thumbnail_width as f32 + 48.0;
@@ -7193,6 +7352,7 @@ impl PictureBrowser {
                         div()
                             .id(("thumbnail", index))
                             .debug_selector(move || format!("#thumbnail-{index}"))
+                            .relative()
                             .w(px(self.thumbnail_width as f32))
                             .h(px(tile_height))
                             .flex_none()
@@ -7237,6 +7397,33 @@ impl PictureBrowser {
                                         )
                                     }),
                             )
+                            .when_some(editor_members.as_ref(), |this, members| {
+                                let member = members.contains(&path);
+                                this.child(
+                                    div()
+                                        .id(("selection-badge", index))
+                                        .debug_selector(move || format!("#selection-badge-{index}"))
+                                        .absolute()
+                                        .top(px(6.0))
+                                        .right(px(6.0))
+                                        .size(px(20.0))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_sm()
+                                        .border_1()
+                                        .bg(rgb(if member { 0x36547a } else { 0x1b1f27 }))
+                                        .border_color(rgb(if member { 0x9db8dd } else { 0x8d96a5 }))
+                                        .cursor_pointer()
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                                this.toggle_selection_membership(path.clone(), cx);
+                                                cx.stop_propagation();
+                                            }),
+                                        ),
+                                )
+                            })
                             .on_mouse_down(
                                 MouseButton::Right,
                                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -7807,6 +7994,1225 @@ impl PictureBrowser {
         cx.notify();
     }
 
+    /// The album (directory) whose selections the grid toolbar is showing.
+    fn selection_album(&self) -> PathBuf {
+        self.model.node(self.selected).path.to_path_buf()
+    }
+
+    fn album_selections(&self, directory: &Path) -> Vec<catalog::selections::AlbumSelection> {
+        self.selections.get(directory).cloned().unwrap_or_default()
+    }
+
+    /// First free "Selection N" name for the album.
+    fn auto_selection_name(&self, directory: &Path) -> String {
+        let existing: HashSet<String> = self
+            .album_selections(directory)
+            .into_iter()
+            .map(|selection| selection.name)
+            .collect();
+        for ordinal in 1.. {
+            let name = format!("Selection {ordinal}");
+            if !existing.contains(&name) {
+                return name;
+            }
+        }
+        unreachable!("ordinal loop always returns")
+    }
+
+    /// Trimmed and validated, or a precise error message for the dialog.
+    fn validated_selection_name(
+        &self,
+        directory: &Path,
+        raw: &str,
+        ignore: Option<&str>,
+    ) -> Result<String, String> {
+        const NAME_MAX_CHARS: usize = 64;
+        let name = raw.trim();
+        if name.is_empty() {
+            return Err("Enter a selection name.".to_owned());
+        }
+        if name.chars().count() > NAME_MAX_CHARS {
+            return Err(format!(
+                "Selection names are limited to {NAME_MAX_CHARS} characters."
+            ));
+        }
+        if self
+            .album_selections(directory)
+            .iter()
+            .any(|selection| Some(selection.name.as_str()) != ignore && selection.name == name)
+        {
+            return Err(format!("A selection named “{name}” already exists."));
+        }
+        Ok(name.to_owned())
+    }
+
+    fn replace_album_selections(
+        &mut self,
+        directory: PathBuf,
+        selections: Vec<catalog::selections::AlbumSelection>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.selections_loaded {
+            self.settings_status = Some("Loading selections; try again shortly.".to_owned());
+            cx.notify();
+            return;
+        }
+        self.selections_save_retries.remove(&directory);
+        if selections.is_empty() {
+            self.selections.remove(&directory);
+        } else {
+            self.selections.insert(directory.clone(), selections);
+        }
+        self.selections_dirty.insert(directory);
+        self.flush_selections_saves(cx);
+        cx.notify();
+    }
+
+    /// Coalesced write pipeline: one per-directory snapshot-and-replace save
+    /// at a time; edits during a save queue via `selections_dirty`.
+    fn flush_selections_saves(&mut self, cx: &mut Context<Self>) {
+        self.flush_selections_saves_excluding(None, cx)
+    }
+
+    /// `exclude` keeps a just-failed directory queued for its timed retry
+    /// instead of being re-picked immediately (it sorts first in the dirty
+    /// set, which would starve the other queued directories).
+    fn flush_selections_saves_excluding(&mut self, exclude: Option<&Path>, cx: &mut Context<Self>) {
+        if self.selections_save_in_flight {
+            return;
+        }
+        let Some(directory) = self
+            .selections_dirty
+            .iter()
+            .find(|queued| Some(queued.as_path()) != exclude)
+            .cloned()
+        else {
+            return;
+        };
+        self.selections_dirty.remove(&directory);
+        self.selections_save_in_flight = true;
+        let snapshot = self.selections.get(&directory).cloned().unwrap_or_default();
+        let root = self.model.node(self.model.root()).path.to_path_buf();
+        let directory_for_save = directory.clone();
+        let saving = cx.background_executor().spawn(async move {
+            catalog::selections::save_album_selections(&root, &directory_for_save, &snapshot)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = saving.await;
+            this.update(cx, |this, cx| {
+                this.selections_save_in_flight = false;
+                match result {
+                    Ok(()) => {
+                        this.selections_save_retries.remove(&directory);
+                        this.flush_selections_saves(cx);
+                    }
+                    Err(error) => {
+                        // Keep the failed directory queued for a timed retry
+                        // or the next edit; other queued directories keep
+                        // saving meanwhile. After the budget is exhausted the
+                        // directory is dropped until the next edit re-queues
+                        // it, so a persistent failure cannot spin.
+                        this.selections_dirty.insert(directory.clone());
+                        let retries = this
+                            .selections_save_retries
+                            .get(&directory)
+                            .copied()
+                            .unwrap_or(0)
+                            + 1;
+                        this.selections_save_retries
+                            .insert(directory.clone(), retries);
+                        if retries <= SELECTIONS_SAVE_MAX_RETRIES {
+                            let retry = cx.background_executor().timer(Duration::from_secs(2));
+                            cx.spawn(async move |this, cx| {
+                                retry.await;
+                                this.update(cx, |this, cx| this.flush_selections_saves(cx))
+                                    .ok();
+                            })
+                            .detach();
+                        } else {
+                            this.selections_dirty.remove(&directory);
+                            this.settings_status =
+                                Some(format!("Could not save selection changes: {error:#}"));
+                        }
+                        this.flush_selections_saves_excluding(Some(&directory), cx);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn open_selection_dialog(
+        &mut self,
+        dialog: SelectionDialog,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.selections_loaded {
+            self.settings_status = Some("Loading selections; try again shortly.".to_owned());
+            cx.notify();
+            return;
+        }
+        self.selection_dialog_error = None;
+        self.selection_dialog = Some(dialog);
+        self.selection_dialog_focus.focus(window);
+        cx.notify();
+    }
+
+    fn dismiss_selection_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.selection_dialog = None;
+        self.selection_dialog_error = None;
+        window.focus(&self.main_focus);
+        cx.notify();
+    }
+
+    fn submit_selection_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dialog) = self.selection_dialog.clone() else {
+            return;
+        };
+        match dialog {
+            SelectionDialog::Create { input } => {
+                let directory = self.selection_album();
+                match self.validated_selection_name(&directory, &input, None) {
+                    Ok(name) => {
+                        self.dismiss_selection_dialog(window, cx);
+                        let mut selections = self.album_selections(&directory);
+                        selections.push(catalog::selections::AlbumSelection {
+                            name: name.clone(),
+                            members: Vec::new(),
+                            created_at: chrono_now_string(),
+                        });
+                        self.replace_album_selections(directory, selections, cx);
+                        self.enter_editor_mode(name, cx);
+                    }
+                    Err(message) => {
+                        self.selection_dialog_error = Some(message);
+                        cx.notify();
+                    }
+                }
+            }
+            SelectionDialog::Rename {
+                directory,
+                name,
+                input,
+            } => match self.validated_selection_name(&directory, &input, Some(&name)) {
+                Ok(new_name) => {
+                    self.dismiss_selection_dialog(window, cx);
+                    if new_name == name {
+                        return;
+                    }
+                    // A mode targeting the renamed selection must follow the
+                    // rename, or its rebuild lookup silently empties the grid.
+                    let renamed_active = self.selection_album() == directory
+                        && matches!(
+                            &self.grid_selection_mode,
+                            GridSelectionMode::Viewer { name: active }
+                                | GridSelectionMode::Editor { name: active }
+                                    if *active == name
+                        );
+                    let mut selections = self.album_selections(&directory);
+                    for selection in &mut selections {
+                        if selection.name == name {
+                            selection.name = new_name.clone();
+                        }
+                    }
+                    self.replace_album_selections(directory, selections, cx);
+                    if renamed_active {
+                        match &mut self.grid_selection_mode {
+                            GridSelectionMode::Viewer { name }
+                            | GridSelectionMode::Editor { name } => *name = new_name,
+                            _ => {}
+                        }
+                        self.rebuild_viewer_paths(cx);
+                    }
+                }
+                Err(message) => {
+                    self.selection_dialog_error = Some(message);
+                    cx.notify();
+                }
+            },
+            SelectionDialog::DeleteConfirm { directory, name } => {
+                self.dismiss_selection_dialog(window, cx);
+                if self.selection_album() == directory
+                    && matches!(
+                        &self.grid_selection_mode,
+                        GridSelectionMode::Viewer { name: active }
+                            | GridSelectionMode::Editor { name: active } if *active == name
+                    )
+                {
+                    self.exit_grid_selection_mode(cx);
+                }
+                let selections = self
+                    .album_selections(&directory)
+                    .into_iter()
+                    .filter(|selection| selection.name != name)
+                    .collect();
+                self.replace_album_selections(directory, selections, cx);
+            }
+        }
+    }
+
+    /// Key handling for the modal selection dialog: append/backspace editing
+    /// like the import new-folder input, Escape dismisses, Enter submits.
+    /// The overlay stops propagation for every key, so neither the root
+    /// plain-key listener nor the MainView keymap can react behind the dialog.
+    fn selection_dialog_key_down(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.keystroke.modifiers.control || event.keystroke.modifiers.alt {
+            return;
+        }
+        match event.keystroke.key.as_str() {
+            "escape" => self.dismiss_selection_dialog(window, cx),
+            "enter" => self.submit_selection_dialog(window, cx),
+            "backspace" => {
+                if let Some(dialog) = self.mutable_selection_input() {
+                    dialog.pop();
+                    cx.notify();
+                }
+            }
+            _ => {
+                if let Some(text) = &event.keystroke.key_char {
+                    if text.contains('/') || text.contains('\\') {
+                        self.selection_dialog_error =
+                            Some("Selection names cannot contain “/” or “\\”.".to_owned());
+                        cx.notify();
+                    } else if !text.chars().any(|c| c.is_control())
+                        && let Some(dialog) = self.mutable_selection_input()
+                    {
+                        dialog.push_str(text);
+                        cx.notify();
+                    }
+                }
+            }
+        }
+    }
+
+    fn mutable_selection_input(&mut self) -> Option<&mut String> {
+        match &mut self.selection_dialog {
+            Some(SelectionDialog::Create { input }) => Some(input),
+            Some(SelectionDialog::Rename { input, .. }) => Some(input),
+            Some(SelectionDialog::DeleteConfirm { .. }) => None,
+            None => None,
+        }
+    }
+
+    fn viewer_selection_name(&self) -> Option<&str> {
+        match &self.grid_selection_mode {
+            GridSelectionMode::Viewer { name } => Some(name),
+            _ => None,
+        }
+    }
+
+    /// Distinct selection names across the merged listing whose per-leaf
+    /// selection has at least one member that still exists in the merged
+    /// listing, sorted.
+    fn merged_union_names(&self) -> Vec<String> {
+        let Some(RecursiveGridState {
+            root,
+            status: RecursiveGridStatus::Loaded(images),
+            ..
+        }) = &self.recursive_grid
+        else {
+            return Vec::new();
+        };
+        if *root != self.selected || self.selections.is_empty() {
+            return Vec::new();
+        }
+        let live: HashSet<&PathBuf> = images.paths.iter().collect();
+        let mut names = BTreeSet::new();
+        for path in &images.paths {
+            let Some(directory) = path.parent() else {
+                continue;
+            };
+            if let Some(selections) = self.selections.get(directory) {
+                for selection in selections {
+                    if selection.members.iter().any(|member| live.contains(member)) {
+                        names.insert(selection.name.as_str());
+                    }
+                }
+            }
+        }
+        names.into_iter().map(str::to_owned).collect()
+    }
+
+    /// `(name, shown, total, folders)` for the merged union viewer banner:
+    /// the union filter applied to the merged listing, and the number of
+    /// distinct folders the shown images come from.
+    fn merged_viewer_banner_state(&self) -> Option<(String, usize, usize, usize)> {
+        let name = self.viewer_selection_name()?.to_owned();
+        let shown = self.viewer_paths.as_ref().map(Vec::len).unwrap_or(0);
+        let total = self.selected_images_merged_total()?;
+        let folders = self
+            .viewer_paths
+            .as_ref()?
+            .iter()
+            .filter_map(|path| path.parent())
+            .collect::<HashSet<_>>()
+            .len();
+        Some((name, shown, total, folders))
+    }
+
+    fn selected_images_merged_total(&self) -> Option<usize> {
+        match &self.recursive_grid {
+            Some(RecursiveGridState {
+                root,
+                status: RecursiveGridStatus::Loaded(images),
+                ..
+            }) if *root == self.selected => Some(images.paths.len()),
+            _ => None,
+        }
+    }
+
+    /// `(name, shown, total)` for the viewer banner: members present in the
+    /// album's listing, out of the album's full listing.
+    fn viewer_banner_state(&self) -> Option<(String, usize, usize)> {
+        let name = self.viewer_selection_name()?.to_owned();
+        let shown = self.viewer_paths.as_ref().map(Vec::len).unwrap_or(0);
+        let total = self
+            .model
+            .loaded(self.selected)
+            .map(|contents| contents.images.len())
+            .unwrap_or(0);
+        Some((name, shown, total))
+    }
+
+    fn active_editor_name(&self) -> Option<&str> {
+        match &self.grid_selection_mode {
+            GridSelectionMode::Editor { name } => Some(name),
+            _ => None,
+        }
+    }
+
+    fn editor_member_set(&self) -> Option<HashSet<PathBuf>> {
+        let name = self.active_editor_name()?;
+        let directory = self.selection_album();
+        let selection = self
+            .selections
+            .get(&directory)?
+            .iter()
+            .find(|selection| selection.name == name)?;
+        Some(selection.members.iter().cloned().collect())
+    }
+
+    /// `(name, marked, total)` for the editor banner: members that exist in
+    /// the album's listing (dangling members are not counted), out of the
+    /// album's full listing.
+    fn editor_banner_state(&self) -> Option<(String, usize, usize)> {
+        let name = self.active_editor_name()?.to_owned();
+        let directory = self.selection_album();
+        let listing: HashSet<&PathBuf> = self
+            .model
+            .loaded(self.selected)
+            .map(|contents| contents.images.iter().collect())
+            .unwrap_or_default();
+        let selection = self
+            .selections
+            .get(&directory)?
+            .iter()
+            .find(|selection| selection.name == name)?;
+        let marked = selection
+            .members
+            .iter()
+            .filter(|member| listing.contains(member))
+            .count();
+        Some((name, marked, listing.len()))
+    }
+
+    /// Enters editor mode. Coming from viewer mode, the grid selection is
+    /// remapped from the filtered index space back onto the full listing.
+    fn enter_editor_mode(&mut self, name: String, cx: &mut Context<Self>) {
+        let from = self.viewer_paths.take();
+        self.grid_selection_mode = GridSelectionMode::Editor { name };
+        if let Some(from) = from {
+            let source = self
+                .model
+                .loaded(self.selected)
+                .map(|contents| contents.images.clone())
+                .unwrap_or_default();
+            self.saved_selection =
+                remap_image_selection_to_paths(&self.saved_selection, &from, &source);
+            if let MainView::Dir(_, selection) = &mut self.main_view {
+                *selection = remap_image_selection_to_paths(selection, &from, &source);
+            }
+        }
+        self.reset_grid_prediction();
+        cx.notify();
+    }
+
+    fn toggle_selection_membership(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let Some(name) = self.active_editor_name().map(str::to_owned) else {
+            return;
+        };
+        let directory = self.selection_album();
+        let mut selections = self.album_selections(&directory);
+        let Some(selection) = selections
+            .iter_mut()
+            .find(|selection| selection.name == name)
+        else {
+            return;
+        };
+        if selection.members.contains(&path) {
+            selection.members.retain(|member| *member != path);
+        } else {
+            selection.members.push(path);
+        }
+        self.replace_album_selections(directory, selections, cx);
+        cx.notify();
+    }
+
+    /// The image a Space press would toggle: the focused grid tile while the
+    /// editor is active on the grid.
+    fn editor_focused_path(&self) -> Option<PathBuf> {
+        if !matches!(self.main_view, MainView::Dir(..))
+            || self.directory_view_mode != DirectoryViewMode::Grid
+        {
+            return None;
+        }
+        self.active_editor_name()?;
+        let focused = match &self.main_view {
+            MainView::Dir(_, selection) => selection.focused?,
+            MainView::Image(_) => return None,
+        };
+        self.selected_images().get(focused).cloned()
+    }
+
+    fn enter_viewer_mode(&mut self, name: String, cx: &mut Context<Self>) {
+        self.grid_selection_mode = GridSelectionMode::Viewer { name };
+        self.rebuild_viewer_paths(cx);
+        cx.notify();
+    }
+
+    /// Leaves viewer/editor mode. The listing's index space changes with the
+    /// filter, so the grid selection is reset rather than remapped.
+    fn exit_grid_selection_mode(&mut self, cx: &mut Context<Self>) {
+        if self.grid_selection_mode == GridSelectionMode::Default {
+            return;
+        }
+        self.grid_selection_mode = GridSelectionMode::Default;
+        self.viewer_paths = None;
+        self.saved_selection = ImageSelection::default();
+        if let MainView::Dir(_, selection) = &mut self.main_view {
+            *selection = ImageSelection::default();
+        }
+        self.reset_grid_prediction();
+        cx.notify();
+    }
+
+    /// Recomputes the filtered viewer listing from the UNDERLYING source
+    /// listing — never `selected_images()`, which returns `viewer_paths`
+    /// itself in viewer mode and would re-filter the filtered list. Both the
+    /// live grid selection and `saved_selection` are remapped onto the new
+    /// index space by path.
+    fn rebuild_viewer_paths(&mut self, cx: &mut Context<Self>) {
+        let Some(name) = self.viewer_selection_name().map(str::to_owned) else {
+            return;
+        };
+        let directory = self.selection_album();
+        let merged = self.recursive_grid.is_some();
+        let members: HashSet<PathBuf> = self
+            .album_selections(&directory)
+            .iter()
+            .find(|selection| selection.name == name)
+            .map(|selection| selection.members.iter().cloned().collect())
+            .unwrap_or_default();
+        // In merged mode the source must be read from the recursive listing
+        // EXPLICITLY: `selected_images()` would return the OLD union's
+        // `viewer_paths` here, and switching unions would show their
+        // intersection instead of the target union.
+        let source = if merged {
+            match &self.recursive_grid {
+                Some(RecursiveGridState {
+                    root,
+                    status: RecursiveGridStatus::Loaded(images),
+                    ..
+                }) if *root == self.selected => images.paths.clone(),
+                _ => Vec::new(),
+            }
+        } else {
+            self.model
+                .loaded(self.selected)
+                .map(|contents| contents.images.clone())
+                .unwrap_or_default()
+        };
+        let from = self.viewer_paths.take().unwrap_or_else(|| source.clone());
+        let per_directory = merged;
+        let filtered: Vec<PathBuf> = source
+            .iter()
+            .filter(|path| {
+                if per_directory {
+                    // Union: check against the selection named `name` in the
+                    // image's own directory, not one fixed album.
+                    path.parent()
+                        .and_then(|directory| self.selections.get(directory))
+                        .and_then(|selections| {
+                            selections.iter().find(|selection| selection.name == name)
+                        })
+                        .is_some_and(|selection| selection.members.contains(*path))
+                } else {
+                    members.contains(*path)
+                }
+            })
+            .cloned()
+            .collect();
+        self.viewer_paths = Some(filtered.clone());
+        self.saved_selection =
+            remap_image_selection_to_paths(&self.saved_selection, &from, &filtered);
+        if let MainView::Dir(_, selection) = &mut self.main_view {
+            *selection = remap_image_selection_to_paths(selection, &from, &filtered);
+        }
+        self.reset_grid_prediction();
+        cx.notify();
+    }
+
+    /// The toolbar group for persistent album selections: one swatch button
+    /// per selection, the `+` (named) and `+ Quick` creation buttons, and the
+    /// overflow entry beyond `SELECTIONS_TOOLBAR_LIMIT`. In the merged
+    /// (recursive) view it renders the union names with viewer toggling only.
+    fn render_selections_toolbar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        // In the merged (recursive) view the toolbar shows the union of the
+        // same-named per-leaf selections across the merged listing, with
+        // viewer toggling only: no creation, no overflow, no context menu.
+        let merged = self.recursive_grid.is_some();
+        let directory = self.selection_album();
+        let album: Vec<catalog::selections::AlbumSelection> = if merged {
+            self.merged_union_names()
+                .into_iter()
+                .map(|name| catalog::selections::AlbumSelection {
+                    name,
+                    members: Vec::new(),
+                    created_at: String::new(),
+                })
+                .collect()
+        } else {
+            self.album_selections(&directory)
+        };
+        let overflow = if merged {
+            0
+        } else {
+            album.len().saturating_sub(SELECTIONS_TOOLBAR_LIMIT)
+        };
+        let visible = if merged {
+            album.len()
+        } else {
+            album.len().min(SELECTIONS_TOOLBAR_LIMIT)
+        };
+        let group = div()
+            .flex()
+            .items_center()
+            .mr_3()
+            .rounded_sm()
+            .bg(rgb(0x252932))
+            .children((0..visible).map(|index| {
+                let selection = &album[index];
+                let directory = directory.clone();
+                let name = selection.name.clone();
+                let selector_name = selection.name.clone();
+                let active = matches!(
+                    &self.grid_selection_mode,
+                    GridSelectionMode::Viewer { name: active } | GridSelectionMode::Editor { name: active }
+                        if *active == selection.name
+                );
+                div()
+                    .id(("album-selection", index))
+                    .debug_selector(move || format!("#album-selection-{selector_name}"))
+                    .tab_index(0)
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .bg(rgb(if active { 0x36547a } else { 0x30343d }))
+                    .hover(|this| this.bg(rgb(0x3b4658)))
+                    .cursor_pointer()
+                    .child(if active {
+                        div()
+                            .size(px(10.0))
+                            .flex_shrink_0()
+                            .rounded_xs()
+                            .bg(rgb(0x9db8dd))
+                    } else {
+                        div()
+                            .size(px(10.0))
+                            .flex_shrink_0()
+                            .rounded_xs()
+                            .border_1()
+                            .border_color(rgb(0x8d96a5))
+                    })
+                    .child(
+                        div()
+                            .max_w(px(120.0))
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .text_color(rgb(0xe1e5ec))
+                            .child(selection.name.clone()),
+                    )
+                    .on_click({
+                        let click_name = name.clone();
+                        cx.listener(move |this, _, _, cx| {
+                        let viewing_this = matches!(
+                            &this.grid_selection_mode,
+                            GridSelectionMode::Viewer { name: active } if *active == click_name
+                        );
+                        if viewing_this {
+                            this.exit_grid_selection_mode(cx);
+                        } else {
+                            this.enter_viewer_mode(click_name.clone(), cx);
+                        }
+                        })
+                    })
+                    .when(!merged, |this| {
+                        this.on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                this.selection_context_menu = Some(SelectionContextMenu {
+                                    directory: directory.clone(),
+                                    name: name.clone(),
+                                    position: (
+                                        f32::from(event.position.x),
+                                        f32::from(event.position.y),
+                                    ),
+                                });
+                                this.selections_menu_open = false;
+                                cx.stop_propagation();
+                                cx.notify();
+                            }),
+                        )
+                    })
+            }))
+            .when(overflow > 0, |this| {
+                this.child(
+                    div()
+                        .id("more-selections")
+                        .debug_selector(|| "#more-selections".to_owned())
+                        .tab_index(0)
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .bg(rgb(0x30343d))
+                        .hover(|this| this.bg(rgb(0x3b4658)))
+                        .cursor_pointer()
+                        .text_sm()
+                        .text_color(rgb(0xe1e5ec))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                        )
+                        .child(format!("{overflow} more"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.selections_menu_open = !this.selections_menu_open;
+                            cx.notify();
+                        })),
+                )
+            })
+            .when(!merged, |this| {
+                this.child(
+                    div()
+                        .id("add-selection")
+                        .debug_selector(|| "#add-selection".to_owned())
+                        .tab_index(0)
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .bg(rgb(0x30343d))
+                        .hover(|this| this.bg(rgb(0x3b4658)))
+                        .cursor_pointer()
+                        .text_sm()
+                        .text_color(rgb(0xe1e5ec))
+                        .child("+")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.selections_menu_open = false;
+                            this.open_selection_dialog(
+                                SelectionDialog::Create {
+                                    input: String::new(),
+                                },
+                                window,
+                                cx,
+                            );
+                        })),
+                )
+                .child(
+                    div()
+                        .id("quick-add-selection")
+                        .debug_selector(|| "#quick-add-selection".to_owned())
+                        .tab_index(0)
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .bg(rgb(0x30343d))
+                        .hover(|this| this.bg(rgb(0x3b4658)))
+                        .cursor_pointer()
+                        .text_sm()
+                        .text_color(rgb(0xe1e5ec))
+                        .child("Quick +")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.selections_menu_open = false;
+                            if !this.selections_loaded {
+                                this.settings_status =
+                                    Some("Loading selections; try again shortly.".to_owned());
+                                cx.notify();
+                                return;
+                            }
+                            let directory = this.selection_album();
+                            let name = this.auto_selection_name(&directory);
+                            let mut selections = this.album_selections(&directory);
+                            selections.push(catalog::selections::AlbumSelection {
+                                name: name.clone(),
+                                members: Vec::new(),
+                                created_at: chrono_now_string(),
+                            });
+                            this.replace_album_selections(directory, selections, cx);
+                            this.enter_editor_mode(name.clone(), cx);
+                            this.settings_status = Some(format!("Created selection “{name}”."));
+                            cx.notify();
+                        })),
+                )
+            });
+        Some(group.into_any_element())
+    }
+
+    fn render_selection_context_menu(
+        &self,
+        menu: &SelectionContextMenu,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let viewport = window.viewport_size();
+        let left = menu
+            .position
+            .0
+            .min((f32::from(viewport.width) - 190.0).max(0.0));
+        let top = menu
+            .position
+            .1
+            .min((f32::from(viewport.height) - 106.0).max(0.0));
+        div()
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .w(px(180.0))
+            .rounded_md()
+            .bg(rgb(0x252932))
+            .border_1()
+            .border_color(rgb(0x52749a))
+            .p_1()
+            .child(
+                div()
+                    .id("selection-menu-edit")
+                    .debug_selector(|| "#selection-menu-edit".to_owned())
+                    .h(px(28.0))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .rounded_sm()
+                    .text_sm()
+                    .hover(|this| this.bg(rgb(0x3b4658)))
+                    .child("Edit")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                            let pending = this.selection_context_menu.take();
+                            if let Some(menu) = pending {
+                                this.enter_editor_mode(menu.name, cx);
+                            }
+                            cx.stop_propagation();
+                        }),
+                    ),
+            )
+            .child(
+                div()
+                    .id("selection-menu-rename")
+                    .debug_selector(|| "#selection-menu-rename".to_owned())
+                    .h(px(28.0))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .rounded_sm()
+                    .text_sm()
+                    .hover(|this| this.bg(rgb(0x3b4658)))
+                    .child("Rename…")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                            let pending = this.selection_context_menu.take();
+                            if let Some(menu) = pending {
+                                this.open_selection_dialog(
+                                    SelectionDialog::Rename {
+                                        directory: menu.directory,
+                                        name: menu.name.clone(),
+                                        input: menu.name,
+                                    },
+                                    window,
+                                    cx,
+                                );
+                            }
+                            cx.stop_propagation();
+                        }),
+                    ),
+            )
+            .child(
+                div()
+                    .id("selection-menu-delete")
+                    .debug_selector(|| "#selection-menu-delete".to_owned())
+                    .h(px(28.0))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .rounded_sm()
+                    .text_sm()
+                    .hover(|this| this.bg(rgb(0x3b4658)))
+                    .child("Delete…")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                            let pending = this.selection_context_menu.take();
+                            if let Some(menu) = pending {
+                                this.open_selection_dialog(
+                                    SelectionDialog::DeleteConfirm {
+                                        directory: menu.directory,
+                                        name: menu.name,
+                                    },
+                                    window,
+                                    cx,
+                                );
+                            }
+                            cx.stop_propagation();
+                        }),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Overflow menu for albums with more selections than the toolbar shows.
+    /// Lists the selections beyond the toolbar cap in a scrollable list with a
+    /// visible scrollbar thumb.
+    fn render_selections_overflow_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+        let merged = self.recursive_grid.is_some();
+        let directory = self.selection_album();
+        let count = if merged {
+            self.merged_union_names()
+                .len()
+                .saturating_sub(SELECTIONS_TOOLBAR_LIMIT)
+        } else {
+            self.album_selections(&directory)
+                .len()
+                .saturating_sub(SELECTIONS_TOOLBAR_LIMIT)
+        };
+        let overflow = count;
+        let list_height = px((count as f32 * 30.0).min(300.0));
+        let title = if merged {
+            format!("{overflow} more unions in this view")
+        } else {
+            format!("{overflow} more in this album")
+        };
+        div()
+            .absolute()
+            .top(px(46.0))
+            .right(px(8.0))
+            .w(px(300.0))
+            .rounded_md()
+            .bg(rgb(0x252932))
+            .border_1()
+            .border_color(rgb(0x52749a))
+            .p_2()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| cx.stop_propagation()),
+            )
+            .child(
+                div()
+                    .mb_2()
+                    .text_sm()
+                    .text_color(rgb(0xaeb4bf))
+                    .child(title),
+            )
+            .child(
+                uniform_list(
+                    "selections-overflow-list",
+                    count,
+                    cx.processor(Self::render_selections_overflow_rows),
+                )
+                .h(list_height)
+                .track_scroll(self.selections_menu_scroll.clone())
+                .with_sizing_behavior(ListSizingBehavior::Auto),
+            )
+            .child(self.render_scrollbar(
+                "selections-menu-scrollbar",
+                ScrollbarTarget::SelectionsMenu,
+                &self.selections_menu_scroll,
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    fn render_selections_overflow_rows(
+        &mut self,
+        rows: Range<usize>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let merged = self.recursive_grid.is_some();
+        let directory = self.selection_album();
+        let album: Vec<catalog::selections::AlbumSelection> = if merged {
+            self.merged_union_names()
+                .into_iter()
+                .skip(SELECTIONS_TOOLBAR_LIMIT)
+                .map(|name| catalog::selections::AlbumSelection {
+                    name,
+                    members: Vec::new(),
+                    created_at: String::new(),
+                })
+                .collect()
+        } else {
+            self.album_selections(&directory)
+                .into_iter()
+                .skip(SELECTIONS_TOOLBAR_LIMIT)
+                .collect()
+        };
+        rows.filter_map(|index| {
+            let selection = album.get(index)?;
+            let view_selector = selection.name.clone();
+            let rename_directory = directory.clone();
+            let rename_name = selection.name.clone();
+            let delete_directory = directory.clone();
+            let delete_name = selection.name.clone();
+            let rename_selector = selection.name.clone();
+            let delete_selector = selection.name.clone();
+            let view_row = merged.then(|| {
+                let name = selection.name.clone();
+                div()
+                    .id(("selection-overflow-view", index))
+                    .debug_selector(move || format!("#selection-overflow-view-{view_selector}"))
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .bg(rgb(0x30343d))
+                    .hover(|this| this.bg(rgb(0x3b4658)))
+                    .cursor_pointer()
+                    .text_xs()
+                    .child("View")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                            this.selections_menu_open = false;
+                            this.enter_viewer_mode(name.clone(), cx);
+                            cx.stop_propagation();
+                        }),
+                    )
+            });
+            Some(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .h(px(30.0))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .child(selection.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .children(view_row)
+                            .when(!merged, |this| {
+                                this.child(
+                                    div()
+                                        .id(("selection-overflow-rename", index))
+                                        .debug_selector(move || {
+                                            format!("#selection-overflow-rename-{rename_selector}")
+                                        })
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_sm()
+                                        .bg(rgb(0x30343d))
+                                        .hover(|this| this.bg(rgb(0x3b4658)))
+                                        .cursor_pointer()
+                                        .text_xs()
+                                        .child("Rename")
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(
+                                                move |this, _: &MouseDownEvent, window, cx| {
+                                                    this.selections_menu_open = false;
+                                                    this.open_selection_dialog(
+                                                        SelectionDialog::Rename {
+                                                            directory: rename_directory.clone(),
+                                                            name: rename_name.clone(),
+                                                            input: rename_name.clone(),
+                                                        },
+                                                        window,
+                                                        cx,
+                                                    );
+                                                    cx.stop_propagation();
+                                                },
+                                            ),
+                                        ),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .id(("selection-overflow-delete", index))
+                                    .debug_selector(move || {
+                                        format!("#selection-overflow-delete-{delete_selector}")
+                                    })
+                                    .ml_1()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .bg(rgb(0x30343d))
+                                    .hover(|this| this.bg(rgb(0x3b4658)))
+                                    .cursor_pointer()
+                                    .text_xs()
+                                    .child("Delete")
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                                            this.selections_menu_open = false;
+                                            this.open_selection_dialog(
+                                                SelectionDialog::DeleteConfirm {
+                                                    directory: delete_directory.clone(),
+                                                    name: delete_name.clone(),
+                                                },
+                                                window,
+                                                cx,
+                                            );
+                                            cx.stop_propagation();
+                                        }),
+                                    ),
+                            ),
+                    )
+                    .into_any_element(),
+            )
+        })
+        .collect()
+    }
+
+    fn render_selection_dialog(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(dialog) = self.selection_dialog.as_ref() else {
+            return div().into_any_element();
+        };
+        let (title, hint, input, submit_label) = match dialog {
+            SelectionDialog::Create { input } => (
+                "Create selection",
+                "Name the selection for this album.".to_owned(),
+                Some(input),
+                "Create",
+            ),
+            SelectionDialog::Rename { name, input, .. } => (
+                "Rename selection",
+                format!("Enter a new name for “{name}”."),
+                Some(input),
+                "Rename",
+            ),
+            SelectionDialog::DeleteConfirm { name, .. } => (
+                "Delete selection",
+                format!(
+                    "Delete “{name}” from this album? Its member list is removed. This cannot be undone."
+                ),
+                None,
+                "Delete",
+            ),
+        };
+        let panel = div()
+            .w(px(560.0))
+            .p_5()
+            .rounded_md()
+            .bg(rgb(0x252932))
+            .border_1()
+            .border_color(rgb(0x52749a))
+            .child(div().text_lg().mb_3().child(title))
+            .child(div().mb_3().text_color(rgb(0xaeb4bf)).child(hint))
+            .when_some(input, |panel, input| {
+                panel.child(
+                    div()
+                        .id("selection-name-input")
+                        .debug_selector(|| "#selection-name-input".to_owned())
+                        .track_focus(&self.selection_dialog_focus)
+                        .p_3()
+                        .mb_3()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(rgb(0x6d91b8))
+                        .bg(rgb(0x10131a))
+                        .child(if input.is_empty() {
+                            "Selection name".to_owned()
+                        } else {
+                            input.clone()
+                        }),
+                )
+            })
+            .when_some(self.selection_dialog_error.clone(), |panel, error| {
+                panel.child(
+                    div()
+                        .mb_3()
+                        .text_sm()
+                        .text_color(rgb(0xe0a1a1))
+                        .child(error),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("selection-dialog-cancel")
+                            .debug_selector(|| "#selection-dialog-cancel".to_owned())
+                            .px_3()
+                            .py_1()
+                            .rounded_sm()
+                            .bg(rgb(0x30343d))
+                            .hover(|this| this.bg(rgb(0x3b4658)))
+                            .cursor_pointer()
+                            .child("Cancel")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.dismiss_selection_dialog(window, cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("selection-dialog-submit")
+                            .debug_selector(|| "#selection-dialog-submit".to_owned())
+                            .px_3()
+                            .py_1()
+                            .rounded_sm()
+                            .bg(rgb(0x36547a))
+                            .hover(|this| this.bg(rgb(0x46658c)))
+                            .cursor_pointer()
+                            .child(submit_label)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.submit_selection_dialog(window, cx);
+                            })),
+                    ),
+            );
+        div()
+            .absolute()
+            .inset_0()
+            .occlude()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(gpui::rgba(0x000000aa))
+            .track_focus(&self.selection_dialog_focus)
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                this.selection_dialog_key_down(event, window, cx);
+                cx.stop_propagation();
+            }))
+            .child(panel)
+            .into_any_element()
+    }
+
     fn set_subtree_hidden(&mut self, path: PathBuf, hidden: bool, cx: &mut Context<Self>) {
         self.path_context_menu = None;
         if !self.hidden_subtrees_loaded {
@@ -8002,6 +9408,32 @@ impl PictureBrowser {
             || keystroke.modifiers.platform
             || keystroke.modifiers.shift
         {
+            return;
+        }
+        // Space toggles the focused image's membership while the editor is
+        // active. The root listener has no focus guard, so every modal and
+        // floating menu must gate this branch: otherwise Space mutates
+        // membership behind, e.g., the settings dialog. The focus check also
+        // keeps Space from double-firing when a focusable toolbar control
+        // holds keyboard focus (its own key-up handler activates it).
+        let modal_open = self.selection_dialog.is_some()
+            || self.settings_draft.is_some()
+            || self.lightroom_import_dialog.is_some()
+            || self.show_cache_statistics
+            || self.show_file_menu
+            || self.show_view_menu
+            || self.path_context_menu.is_some()
+            || self.selection_context_menu.is_some()
+            || self.selections_menu_open;
+        let grid_has_focus = window
+            .focused(cx)
+            .is_some_and(|handle| handle == self.main_focus);
+        if keystroke.key == "space"
+            && !modal_open
+            && grid_has_focus
+            && let Some(path) = self.editor_focused_path()
+        {
+            self.toggle_selection_membership(path, cx);
             return;
         }
         if keystroke.key == "d" {
@@ -10057,6 +11489,12 @@ impl Render for PictureBrowser {
                     });
                 let capture_order_available =
                     !recursive_active && self.model.has_pending_capture_order(self.selected);
+                let (viewer_banner, merged_viewer_banner, editor_banner) =
+                    if self.recursive_grid.is_some() {
+                        (None, self.merged_viewer_banner_state(), None)
+                    } else {
+                        (self.viewer_banner_state(), None, self.editor_banner_state())
+                    };
                 let ordering_suffix = if ordering_pending {
                     " · loading capture metadata…"
                 } else {
@@ -10086,11 +11524,25 @@ impl Render for PictureBrowser {
                             .text_color(rgb(0xf2b8b5))
                             .child(format!("Could not load recursive view: {error}"))
                             .into_any_element(),
-                        RecursiveGridStatus::Loaded(_) if count == 0 => div()
-                            .p_6()
-                            .text_sm()
-                            .child("No images in this subtree")
-                            .into_any_element(),
+                        RecursiveGridStatus::Loaded(_) if count == 0 => {
+                            if let Some(name) = self.viewer_selection_name() {
+                                div()
+                                    .id("selection-viewer-empty")
+                                    .debug_selector(|| "#selection-viewer-empty".to_owned())
+                                    .p_6()
+                                    .text_sm()
+                                    .child(format!(
+                                        "Selection “{name}” is empty in this subtree view."
+                                    ))
+                                    .into_any_element()
+                            } else {
+                                div()
+                                    .p_6()
+                                    .text_sm()
+                                    .child("No images in this subtree")
+                                    .into_any_element()
+                            }
+                        }
                         RecursiveGridStatus::Loaded(_) => thumbnail_grid(),
                     }
                 } else {
@@ -10106,7 +11558,9 @@ impl Render for PictureBrowser {
                             .child("Loading directory…")
                             .into_any_element(),
                         DirectoryContents::Loaded(contents)
-                            if count == 0 && !contents.children.is_empty() =>
+                            if count == 0
+                                && self.viewer_selection_name().is_none()
+                                && !contents.children.is_empty() =>
                         {
                             div()
                                 .size_full()
@@ -10134,11 +11588,45 @@ impl Render for PictureBrowser {
                                 )
                                 .into_any_element()
                         }
-                        DirectoryContents::Loaded(_) if count == 0 => div()
-                            .p_6()
-                            .text_sm()
-                            .child("No images in this directory")
-                            .into_any_element(),
+                        DirectoryContents::Loaded(_) if count == 0 => {
+                            if let Some(name) = self.viewer_selection_name() {
+                                let empty_name = name.to_owned();
+                                div()
+                                    .id("selection-viewer-empty")
+                                    .debug_selector(|| "#selection-viewer-empty".to_owned())
+                                    .p_6()
+                                    .flex()
+                                    .flex_col()
+                                    .items_center()
+                                    .gap_3()
+                                    .text_sm()
+                                    .text_color(rgb(0x9fb0b8))
+                                    .child(format!("Selection “{name}” is empty."))
+                                    .child(
+                                        div()
+                                            .id("edit-selection-empty")
+                                            .debug_selector(|| "#edit-selection-empty".to_owned())
+                                            .px_4()
+                                            .py_2()
+                                            .rounded_sm()
+                                            .bg(rgb(0x315b8f))
+                                            .text_color(rgb(0xffffff))
+                                            .hover(|this| this.bg(rgb(0x3d6fa9)))
+                                            .cursor_pointer()
+                                            .child("Edit selection")
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.enter_editor_mode(empty_name.clone(), cx);
+                                            })),
+                                    )
+                                    .into_any_element()
+                            } else {
+                                div()
+                                    .p_6()
+                                    .text_sm()
+                                    .child("No images in this directory")
+                                    .into_any_element()
+                            }
+                        }
                         DirectoryContents::Loaded(_) => thumbnail_grid(),
                     }
                 };
@@ -10216,6 +11704,138 @@ impl Render for PictureBrowser {
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.apply_capture_time_order(cx);
                                         })),
+                                ),
+                        )
+                    })
+                    .when_some(editor_banner, |this, (name, marked, total)| {
+                        this.child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .px_4()
+                                .py_2()
+                                .bg(rgb(0x242b37))
+                                .border_b_1()
+                                .border_color(rgb(0x3b4658))
+                                .text_sm()
+                                .text_color(rgb(0xc8ced8))
+                                .child(format!(
+                                    "Editing selection “{name}” · {marked} of {total} images marked"
+                                ))
+                                .child(
+                                    div()
+                                        .id("done-selection-editor")
+                                        .debug_selector(|| "#done-selection-editor".to_owned())
+                                        .px_3()
+                                        .py_1()
+                                        .rounded_sm()
+                                        .bg(rgb(0x3b4658))
+                                        .hover(|this| this.bg(rgb(0x52617a)))
+                                        .cursor_pointer()
+                                        .child("Done")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.exit_grid_selection_mode(cx);
+                                        })),
+                                ),
+                        )
+                    })
+                    .when_some(
+                        merged_viewer_banner,
+                        |this, (name, shown, total, folders)| {
+                            this.child(
+                                div()
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .px_4()
+                                    .py_2()
+                                    .bg(rgb(0x242b37))
+                                    .border_b_1()
+                                    .border_color(rgb(0x3b4658))
+                                    .text_sm()
+                                    .text_color(rgb(0xc8ced8))
+                                    .child(format!(
+                                        "Viewing selection “{name}” (union) · {shown} of {total} images across {folders} folders"
+                                    ))
+                                    .child(
+                                        div()
+                                            .id("exit-selection-viewer")
+                                            .debug_selector(|| {
+                                                "#exit-selection-viewer".to_owned()
+                                            })
+                                            .px_3()
+                                            .py_1()
+                                            .rounded_sm()
+                                            .bg(rgb(0x3b4658))
+                                            .hover(|this| this.bg(rgb(0x52617a)))
+                                            .cursor_pointer()
+                                            .child("Exit")
+                                            .on_click(cx.listener(|this, _, _, cx| {{
+                                                this.exit_grid_selection_mode(cx);
+                                            }})),
+                                    ),
+                            )
+                        },
+                    )
+                    .when_some(viewer_banner, |this, (name, shown, total)| {
+                        let edit_name = name.clone();
+                        this.child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .px_4()
+                                .py_2()
+                                .bg(rgb(0x242b37))
+                                .border_b_1()
+                                .border_color(rgb(0x3b4658))
+                                .text_sm()
+                                .text_color(rgb(0xc8ced8))
+                                .child(format!(
+                                    "Viewing selection “{name}” · {shown} of {total} images"
+                                ))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .id("edit-selection-viewer")
+                                                .debug_selector(|| {
+                                                    "#edit-selection-viewer".to_owned()
+                                                })
+                                                .px_3()
+                                                .py_1()
+                                                .rounded_sm()
+                                                .bg(rgb(0x3b4658))
+                                                .hover(|this| this.bg(rgb(0x52617a)))
+                                                .cursor_pointer()
+                                                .child("Edit")
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.enter_editor_mode(edit_name.clone(), cx);
+                                                })),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("exit-selection-viewer")
+                                                .debug_selector(|| {
+                                                    "#exit-selection-viewer".to_owned()
+                                                })
+                                                .px_3()
+                                                .py_1()
+                                                .rounded_sm()
+                                                .bg(rgb(0x3b4658))
+                                                .hover(|this| this.bg(rgb(0x52617a)))
+                                                .cursor_pointer()
+                                                .child("Exit")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.exit_grid_selection_mode(cx);
+                                                })),
+                                        ),
                                 ),
                         )
                     })
@@ -10424,6 +12044,11 @@ impl Render for PictureBrowser {
                                         ),
                                 )
                             },
+                        )
+                        .when(
+                            matches!(self.main_view, MainView::Dir(..))
+                                && self.directory_view_mode == DirectoryViewMode::Grid,
+                            |this| this.children(self.render_selections_toolbar(cx)),
                         )
                         .child(
                             div()
@@ -10786,6 +12411,28 @@ impl Render for PictureBrowser {
             .settings_draft
             .clone()
             .map(|draft| self.render_settings_dialog(draft, self.settings_status.clone(), cx));
+        let selection_dialog = self
+            .selection_dialog
+            .is_some()
+            .then(|| self.render_selection_dialog(cx));
+        let selections_ui_visible = matches!(self.main_view, MainView::Dir(..))
+            && self.directory_view_mode == DirectoryViewMode::Grid
+            && self.recursive_grid.is_none();
+        let selection_context_menu = if selections_ui_visible {
+            self.selection_context_menu
+                .as_ref()
+                .map(|menu| self.render_selection_context_menu(menu, window, cx))
+        } else {
+            None
+        };
+        let selections_overflow_menu = if selections_ui_visible
+            && self.selections_menu_open
+            && self.selection_dialog.is_none()
+        {
+            Some(self.render_selections_overflow_menu(cx))
+        } else {
+            None
+        };
         let cache_statistics_dialog = self.show_cache_statistics.then(|| {
             render_cache_statistics_dialog(
                 self.render_pipeline.stats(),
@@ -10822,7 +12469,13 @@ impl Render for PictureBrowser {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
-                    if this.path_context_menu.take().is_some() {
+                    // Bitwise OR: every open menu must be dismissed even
+                    // when more than one survived a stop-propagating setter.
+                    let had_menu = this.path_context_menu.take().is_some()
+                        | this.selection_context_menu.take().is_some()
+                        | this.selections_menu_open;
+                    this.selections_menu_open = false;
+                    if had_menu {
                         cx.notify();
                     }
                 }),
@@ -10830,7 +12483,11 @@ impl Render for PictureBrowser {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|this, _, _, cx| {
-                    if this.path_context_menu.take().is_some() {
+                    let had_menu = this.path_context_menu.take().is_some()
+                        | this.selection_context_menu.take().is_some()
+                        | this.selections_menu_open;
+                    this.selections_menu_open = false;
+                    if had_menu {
                         cx.notify();
                     }
                 }),
@@ -11078,6 +12735,9 @@ impl Render for PictureBrowser {
             .when_some(settings_dialog, |this, dialog| this.child(dialog))
             .when_some(cache_statistics_dialog, |this, dialog| this.child(dialog))
             .when_some(lightroom_import_dialog, |this, dialog| this.child(dialog))
+            .when_some(selection_dialog, |this, dialog| this.child(dialog))
+            .children(selection_context_menu)
+            .when_some(selections_overflow_menu, |this, menu| this.child(menu))
     }
 }
 

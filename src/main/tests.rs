@@ -4883,3 +4883,1628 @@ fn library_grid_learns_cr3_jpeg_pairs_from_the_listing_scan(cx: &mut gpui::TestA
     });
     assert_eq!(resolved, "loaded", "paired tile must render from the JPEG");
 }
+
+#[gpui::test]
+fn gpui_selection_toolbar_creates_validates_and_persists_selections(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write_photo_stub(root.path(), "photo", 47.5, 19.05);
+    let mut config = gpui_test_config(root.path(), cache.path());
+    config.settings.automatic_face_analysis = false;
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+    cx.update(|_, cx| bind_picture_browser_keys(cx));
+    let album = root.path().to_path_buf();
+
+    // Edits are refused while the startup catalog load is in flight.
+    cx.update_entity(&view, |view, _| view.selections_loaded = false);
+    let quick = cx.debug_bounds("#quick-add-selection").unwrap();
+    cx.simulate_click(quick.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.settings_status.clone()),
+        Some("Loading selections; try again shortly.".to_owned())
+    );
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.selections.get(&album).map(Vec::len)),
+        None
+    );
+    cx.update_entity(&view, |view, _| view.selections_loaded = true);
+
+    // Quick-add reports precisely what it created.
+    let quick = cx.debug_bounds("#quick-add-selection").unwrap();
+    cx.simulate_click(quick.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert!(view.read_with(&*cx, |view, _| {
+        view.settings_status
+            .as_deref()
+            .is_some_and(|status| status.starts_with("Created selection"))
+    }));
+
+    // The named create dialog appends to the album instead of replacing it
+    // (regression: it used to wipe the album's existing selections), and
+    // plain keys typed into it cannot leak to the app behind the modal.
+    let add = cx.debug_bounds("#add-selection").unwrap();
+    cx.simulate_click(add.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("#selection-name-input").is_some());
+    cx.simulate_keystrokes("d");
+    cx.run_until_parked();
+    // Developed defaults to true; typing 'd' in the dialog must NOT toggle it.
+    assert!(
+        view.read_with(&*cx, |view, _| view.developed),
+        "typing 'd' in the dialog must not toggle Developed"
+    );
+    cx.simulate_input(" 2024");
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| match &view.selection_dialog {
+            Some(SelectionDialog::Create { input }) => input.clone(),
+            _ => String::new(),
+        }),
+        "d 2024"
+    );
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.selections.get(&album).map(
+            |selections| selections
+                .iter()
+                .map(|s| s.name.clone())
+                .collect::<Vec<_>>()
+        )),
+        Some(vec!["Selection 1".to_owned(), "d 2024".to_owned()])
+    );
+    assert!(cx.debug_bounds("#album-selection-d 2024").is_some());
+
+    // A duplicate name is rejected inline; the dialog stays open.
+    let add = cx.debug_bounds("#add-selection").unwrap();
+    cx.simulate_click(add.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    cx.simulate_input("Selection 1");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(view.read_with(&*cx, |view, _| {
+        view.selection_dialog_error
+            .as_deref()
+            .is_some_and(|message| message.contains("already exists"))
+    }));
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.selections.get(&album).map(Vec::len)),
+        Some(2)
+    );
+
+    // Clear the input and exercise the length limit (65 characters).
+    let clears = "backspace ".repeat("Selection 1".len()).trim().to_string();
+    cx.simulate_keystrokes(&clears);
+    let sixty_five = "a ".repeat(65).trim().to_string();
+    cx.simulate_keystrokes(&sixty_five);
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(view.read_with(&*cx, |view, _| {
+        view.selection_dialog_error
+            .as_deref()
+            .is_some_and(|message| message.contains("64 characters"))
+    }));
+
+    // Path separators are rejected with a precise message, not dropped.
+    let clears = "backspace ".repeat(65).trim().to_string();
+    cx.simulate_keystrokes(&clears);
+    cx.simulate_input("2024/06");
+    cx.run_until_parked();
+    assert!(view.read_with(&*cx, |view, _| {
+        view.selection_dialog_error
+            .as_deref()
+            .is_some_and(|message| message.contains("cannot contain"))
+    }));
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(view.read_with(&*cx, |view, _| view.selection_dialog.is_none()));
+
+    // The save pipeline flushed to the catalog: a restarted browser sees both.
+    cx.run_until_parked();
+    let (restarted, restarted_cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    restarted_cx.run_until_parked();
+    assert_eq!(
+        restarted.read_with(&*restarted_cx, |view, _| view.selections.get(&album).map(
+            |selections| selections
+                .iter()
+                .map(|s| s.name.clone())
+                .collect::<Vec<_>>()
+        )),
+        Some(vec!["Selection 1".to_owned(), "d 2024".to_owned()])
+    );
+}
+
+#[gpui::test]
+fn gpui_selection_quick_add_auto_names_incrementally(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write_photo_stub(root.path(), "photo", 47.5, 19.05);
+    let mut config = gpui_test_config(root.path(), cache.path());
+    config.settings.automatic_face_analysis = false;
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+
+    let quick = cx.debug_bounds("#quick-add-selection").unwrap();
+    cx.simulate_click(quick.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let quick = cx.debug_bounds("#quick-add-selection").unwrap();
+    cx.simulate_click(quick.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+
+    let album = root.path().to_path_buf();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.selections.get(&album).map(
+            |selections| selections
+                .iter()
+                .map(|s| s.name.clone())
+                .collect::<Vec<_>>()
+        )),
+        Some(vec!["Selection 1".to_owned(), "Selection 2".to_owned()])
+    );
+    assert!(cx.debug_bounds("#album-selection-Selection 1").is_some());
+    assert!(cx.debug_bounds("#album-selection-Selection 2").is_some());
+
+    // Clicking a swatch enters viewer mode for it (the editor was active
+    // for Selection 2 after the second quick-add).
+    let swatch = cx.debug_bounds("#album-selection-Selection 1").unwrap();
+    cx.simulate_click(swatch.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert!(
+        view.read_with(&*cx, |view, _| view.selection_dialog.is_none()
+            && view.grid_selection_mode
+                == GridSelectionMode::Viewer {
+                    name: "Selection 1".to_owned()
+                }
+            && view.selections.get(&album).map(Vec::len) == Some(2))
+    );
+}
+
+#[gpui::test]
+fn gpui_selection_rename_and_delete_flow_through_context_menu(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write_photo_stub(root.path(), "photo", 47.5, 19.05);
+    let mut config = gpui_test_config(root.path(), cache.path());
+    config.settings.automatic_face_analysis = false;
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+
+    let quick = cx.debug_bounds("#quick-add-selection").unwrap();
+    cx.simulate_click(quick.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let album = root.path().to_path_buf();
+
+    let swatch = cx.debug_bounds("#album-selection-Selection 1").unwrap();
+    cx.simulate_mouse_down(swatch.center(), MouseButton::Right, gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert!(view.read_with(&*cx, |view, _| view.selection_context_menu.is_some()));
+
+    let rename = cx.debug_bounds("#selection-menu-rename").unwrap();
+    cx.simulate_mouse_down(rename.center(), MouseButton::Left, gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("#selection-name-input").is_some());
+    // The dialog pre-fills the current name; clear exactly that many
+    // characters and type a new one.
+    let prefill = view.read_with(&*cx, |view, _| match &view.selection_dialog {
+        Some(SelectionDialog::Rename { input, .. }) => input.chars().count(),
+        _ => 0,
+    });
+    assert_eq!(prefill, "Selection 1".len());
+    let clears = "backspace ".repeat(prefill).trim().to_string();
+    cx.simulate_keystrokes(&clears);
+    cx.simulate_keystrokes("shift-t r i p s");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view
+            .selections
+            .get(&album)
+            .map(|selections| selections[0].name.clone())),
+        Some("Trips".to_owned())
+    );
+    assert!(cx.debug_bounds("#album-selection-Trips").is_some());
+    // The editor was active for this selection (post-create entry); the
+    // rename must follow it.
+    assert_eq!(
+        view.read_with(&*cx, |view, _| (
+            view.grid_selection_mode.clone(),
+            view.editor_banner_state()
+        )),
+        (
+            GridSelectionMode::Editor {
+                name: "Trips".to_owned()
+            },
+            Some(("Trips".to_owned(), 0, 1))
+        )
+    );
+
+    // Renaming to the unchanged name dismisses without queueing a save (a
+    // completed save would also drain the dirty set, so the dirty check pins
+    // the observable outcome).
+    let swatch = cx.debug_bounds("#album-selection-Trips").unwrap();
+    cx.simulate_mouse_down(swatch.center(), MouseButton::Right, gpui::Modifiers::none());
+    cx.run_until_parked();
+    let rename = cx.debug_bounds("#selection-menu-rename").unwrap();
+    cx.simulate_mouse_down(rename.center(), MouseButton::Left, gpui::Modifiers::none());
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(
+        view.read_with(&*cx, |view, _| view.selection_dialog.is_none()
+            && view.selections_dirty.is_empty())
+    );
+
+    let swatch = cx.debug_bounds("#album-selection-Trips").unwrap();
+    cx.simulate_mouse_down(swatch.center(), MouseButton::Right, gpui::Modifiers::none());
+    cx.run_until_parked();
+    let delete = cx.debug_bounds("#selection-menu-delete").unwrap();
+    cx.simulate_mouse_down(delete.center(), MouseButton::Left, gpui::Modifiers::none());
+    cx.run_until_parked();
+    // The confirmation dialog appears; submit removes the selection.
+    assert!(cx.debug_bounds("#selection-dialog-submit").is_some());
+    let submit = cx.debug_bounds("#selection-dialog-submit").unwrap();
+    cx.simulate_click(submit.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert!(!view.read_with(&*cx, |view, _| view.selections.contains_key(&album)));
+    assert!(view.read_with(&*cx, |view, _| view.selection_dialog.is_none()));
+    // The deleted selection's editor (active since its creation) is gone.
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.grid_selection_mode.clone()),
+        GridSelectionMode::Default
+    );
+
+    // The cancel path keeps the selection.
+    let quick = cx.debug_bounds("#quick-add-selection").unwrap();
+    cx.simulate_click(quick.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let swatch = cx.debug_bounds("#album-selection-Selection 1").unwrap();
+    cx.simulate_mouse_down(swatch.center(), MouseButton::Right, gpui::Modifiers::none());
+    cx.run_until_parked();
+    let delete = cx.debug_bounds("#selection-menu-delete").unwrap();
+    cx.simulate_mouse_down(delete.center(), MouseButton::Left, gpui::Modifiers::none());
+    cx.run_until_parked();
+    let cancel = cx.debug_bounds("#selection-dialog-cancel").unwrap();
+    cx.simulate_click(cancel.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.selections.get(&album).map(Vec::len)),
+        Some(1)
+    );
+}
+
+#[gpui::test]
+fn gpui_selection_overflow_menu_lists_hidden_selections(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write_photo_stub(root.path(), "photo", 47.5, 19.05);
+    let mut config = gpui_test_config(root.path(), cache.path());
+    config.settings.automatic_face_analysis = false;
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+
+    for _ in 0..6 {
+        let quick = cx.debug_bounds("#quick-add-selection").unwrap();
+        cx.simulate_click(quick.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+    }
+    let album = root.path().to_path_buf();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.selections.get(&album).map(Vec::len)),
+        Some(6)
+    );
+    // Only five swatches fit; the rest live behind the overflow menu.
+    assert!(cx.debug_bounds("#album-selection-Selection 5").is_some());
+    // Selection 6's swatch never rendered in this window, so this absence
+    // assert is reliable (no stale entry exists for it).
+    assert!(cx.debug_bounds("#album-selection-Selection 6").is_none());
+    assert!(cx.debug_bounds("#more-selections").is_some());
+
+    let more = cx.debug_bounds("#more-selections").unwrap();
+    cx.simulate_click(more.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert!(view.read_with(&*cx, |view, _| view.selections_menu_open));
+    assert!(
+        cx.debug_bounds("#selection-overflow-rename-Selection 6")
+            .is_some()
+    );
+
+    let rename = cx
+        .debug_bounds("#selection-overflow-rename-Selection 6")
+        .unwrap();
+    cx.simulate_mouse_down(rename.center(), MouseButton::Left, gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert!(view.read_with(&*cx, |view, _| !view.selections_menu_open
+        && matches!(view.selection_dialog, Some(SelectionDialog::Rename { .. }))));
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    // The overflow button toggles: clicking it again closes the menu.
+    let more = cx.debug_bounds("#more-selections").unwrap();
+    cx.simulate_click(more.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert!(view.read_with(&*cx, |view, _| view.selections_menu_open));
+    let more = cx.debug_bounds("#more-selections").unwrap();
+    cx.simulate_click(more.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert!(!view.read_with(&*cx, |view, _| view.selections_menu_open));
+}
+
+#[gpui::test]
+fn gpui_selection_save_failure_retries_then_stops_until_next_edit(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write_photo_stub(root.path(), "photo", 47.5, 19.05);
+    let mut config = gpui_test_config(root.path(), cache.path());
+    config.settings.automatic_face_analysis = false;
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+    catalog::initialize_test_catalog(root.path()).unwrap();
+
+    // Break persistence: the catalog directory is now a regular file, so the
+    // save fails immediately on create_dir_all.
+    let catalog_dir = root.path().join(catalog::CATALOG_DIR);
+    std::fs::remove_dir_all(&catalog_dir).unwrap();
+    std::fs::write(&catalog_dir, b"not a directory").unwrap();
+
+    let quick = cx.debug_bounds("#quick-add-selection").unwrap();
+    cx.simulate_click(quick.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let album = root.path().to_path_buf();
+    // The edit stays in memory while saves fail.
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.selections.get(&album).map(Vec::len)),
+        Some(1)
+    );
+
+    // Bounded timed retries, then a precise give-up status. The directory
+    // leaves the dirty queue, so the pipeline cannot spin.
+    for _ in 0..12 {
+        cx.executor().advance_clock(Duration::from_secs(3));
+        cx.run_until_parked();
+        if view.read_with(&*cx, |view, _| view.selections_dirty.is_empty()) {
+            break;
+        }
+    }
+    assert!(view.read_with(&*cx, |view, _| {
+        view.settings_status
+            .as_deref()
+            .is_some_and(|status| status.starts_with("Could not save selection changes"))
+    }));
+    assert!(view.read_with(&*cx, |view, _| view.selections_dirty.is_empty()));
+
+    // The next edit re-queues with a fresh budget; repairing the catalog lets
+    // it land on disk.
+    std::fs::remove_file(&catalog_dir).unwrap();
+    catalog::initialize_test_catalog(root.path()).unwrap();
+    let quick = cx.debug_bounds("#quick-add-selection").unwrap();
+    cx.simulate_click(quick.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let on_disk = catalog::selections::load_album_selections(root.path()).unwrap();
+    assert_eq!(
+        on_disk.get(&album).map(|selections| selections
+            .iter()
+            .map(|s| s.name.clone())
+            .collect::<Vec<_>>()),
+        Some(vec!["Selection 1".to_owned(), "Selection 2".to_owned()]),
+        "the repaired save lands the whole in-memory snapshot, including the edit whose saves failed"
+    );
+}
+
+#[gpui::test]
+fn gpui_selection_toolbar_hidden_by_view_and_per_album(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write_photo_stub(root.path(), "photo", 47.5, 19.05);
+    std::fs::create_dir(root.path().join("alpha")).unwrap();
+    write_photo_stub(&root.path().join("alpha"), "alpha-photo", 47.6, 19.06);
+    let mut config = gpui_test_config(root.path(), cache.path());
+    config.settings.automatic_face_analysis = false;
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+    let alpha = root.path().join("alpha");
+
+    // A selection exists for the root album only.
+    let quick = cx.debug_bounds("#quick-add-selection").unwrap();
+    cx.simulate_click(quick.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("#album-selection-Selection 1").is_some());
+
+    // The leaf album gets its own selection through its own swatch.
+    let alpha_row = cx.debug_bounds("#directory-1").unwrap();
+    cx.simulate_click(alpha_row.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let quick = cx.debug_bounds("#quick-add-selection").unwrap();
+    cx.simulate_click(quick.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let swatch = cx.debug_bounds("#album-selection-Selection 1").unwrap();
+    cx.simulate_mouse_down(swatch.center(), MouseButton::Right, gpui::Modifiers::none());
+    cx.run_until_parked();
+    let rename = cx.debug_bounds("#selection-menu-rename").unwrap();
+    cx.simulate_mouse_down(rename.center(), MouseButton::Left, gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert!(
+        view.read_with(&*cx, |view, _| match &view.selection_dialog {
+            Some(SelectionDialog::Rename { directory, .. }) => directory == &alpha,
+            _ => false,
+        })
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| (
+            view.selections
+                .get(root.path())
+                .map(|selections| selections.len()),
+            view.selections
+                .get(&alpha)
+                .map(|selections| selections.len())
+        )),
+        (Some(1), Some(1))
+    );
+
+    // Selecting a different album swaps the toolbar's swatches with it.
+    let root_row = cx.debug_bounds("#directory-0").unwrap();
+    cx.simulate_click(root_row.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+
+    // The group is grid-only. In the other views the buttons are gone: the
+    // window is created already in the target mode, so it never renders the
+    // toolbar and its fresh debug-bounds map proves true absence.
+    let hidden_in = |mode: DirectoryViewMode, cx: &mut gpui::TestAppContext| {
+        let (_, other_cx) = cx.add_window_view(|_, cx| {
+            let mut browser = PictureBrowser::new(&config, cx);
+            browser.directory_view_mode = mode;
+            browser
+        });
+        other_cx.run_until_parked();
+        assert!(other_cx.debug_bounds("#add-selection").is_none());
+    };
+    hidden_in(DirectoryViewMode::Map, cx);
+    hidden_in(DirectoryViewMode::People, cx);
+    hidden_in(DirectoryViewMode::Import, cx);
+
+    // Behavioral backstop in the live window: after switching to Map, clicking
+    // where the button used to be must not open the dialog.
+    let add_center = cx.debug_bounds("#add-selection").unwrap().center();
+    let map = cx.debug_bounds("#show-map-view").unwrap();
+    cx.simulate_click(map.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    cx.simulate_click(add_center, gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert!(view.read_with(&*cx, |view, _| view.selection_dialog.is_none()));
+}
+
+#[gpui::test]
+fn gpui_selection_viewer_filters_round_trips_and_resets(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let photos: Vec<PathBuf> = (0..4)
+        .map(|index| write_photo_stub(root.path(), &format!("photo-{index}"), 47.5, 19.05))
+        .collect();
+    let mut config = gpui_test_config(root.path(), cache.path());
+    config.settings.automatic_face_analysis = false;
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+
+    let quick = cx.debug_bounds("#quick-add-selection").unwrap();
+    cx.simulate_click(quick.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let album = root.path().to_path_buf();
+    // Seed members directly as the viewer fixture; the editor's own write
+    // path is covered by its dedicated tests.
+    cx.update_entity(&view, |view, _| {
+        let entry = view.selections.get_mut(&album).unwrap();
+        // Deliberately out of source order: the viewer must emit album order.
+        entry[0].members = vec![photos[2].clone(), photos[0].clone()];
+    });
+
+    let swatch = cx.debug_bounds("#album-selection-Selection 1").unwrap();
+    cx.simulate_click(swatch.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.grid_selection_mode.clone()),
+        GridSelectionMode::Viewer {
+            name: "Selection 1".to_owned()
+        }
+    );
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.selected_images().to_vec()),
+        vec![photos[0].clone(), photos[2].clone()]
+    );
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.viewer_banner_state()),
+        Some(("Selection 1".to_owned(), 2, 4))
+    );
+    assert!(cx.debug_bounds("#exit-selection-viewer").is_some());
+    assert!(cx.debug_bounds("#apply-capture-time-order").is_none());
+
+    // The large-view round trip preserves viewer mode and the filtered set.
+    let member_tile = cx.debug_bounds("#thumbnail-1").unwrap();
+    double_click(cx, member_tile.center());
+    cx.run_until_parked();
+    assert!(view.read_with(&*cx, |view, _| matches!(
+        &view.main_view,
+        MainView::Image(state) if state.path == photos[2]
+    )));
+    cx.dispatch_action(CloseImage);
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| (
+            view.grid_selection_mode.clone(),
+            view.selected_images().len()
+        )),
+        (
+            GridSelectionMode::Viewer {
+                name: "Selection 1".to_owned()
+            },
+            2
+        )
+    );
+
+    // Clicking the active swatch again returns the full listing.
+    let swatch = cx.debug_bounds("#album-selection-Selection 1").unwrap();
+    cx.simulate_click(swatch.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| (
+            view.grid_selection_mode.clone(),
+            view.selected_images().len()
+        )),
+        (GridSelectionMode::Default, 4)
+    );
+
+    // Leaving the grid view resets the mode; returning lands in Default.
+    let swatch = cx.debug_bounds("#album-selection-Selection 1").unwrap();
+    cx.simulate_click(swatch.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let map = cx.debug_bounds("#show-map-view").unwrap();
+    cx.simulate_click(map.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.grid_selection_mode.clone()),
+        GridSelectionMode::Default
+    );
+    let grid = cx.debug_bounds("#show-grid-view").unwrap();
+    cx.simulate_click(grid.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| (
+            view.grid_selection_mode.clone(),
+            view.selected_images().len()
+        )),
+        (GridSelectionMode::Default, 4)
+    );
+
+    // Same via People.
+    let swatch = cx.debug_bounds("#album-selection-Selection 1").unwrap();
+    cx.simulate_click(swatch.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let people = cx.debug_bounds("#show-people-view").unwrap();
+    cx.simulate_click(people.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.grid_selection_mode.clone()),
+        GridSelectionMode::Default
+    );
+    let grid = cx.debug_bounds("#show-grid-view").unwrap();
+    cx.simulate_click(grid.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.selected_images().len()),
+        4
+    );
+}
+
+#[gpui::test]
+fn gpui_selection_viewer_remaps_selection_and_rebuilds_from_source(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let photos: Vec<PathBuf> = (0..4)
+        .map(|index| write_photo_stub(root.path(), &format!("photo-{index}"), 47.5, 19.05))
+        .collect();
+    let mut config = gpui_test_config(root.path(), cache.path());
+    config.settings.automatic_face_analysis = false;
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+    cx.update(|_, cx| bind_picture_browser_keys(cx));
+
+    let quick = cx.debug_bounds("#quick-add-selection").unwrap();
+    cx.simulate_click(quick.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let album = root.path().to_path_buf();
+    cx.update_entity(&view, |view, _| {
+        let entry = view.selections.get_mut(&album).unwrap();
+        entry[0].members = vec![photos[3].clone()];
+    });
+
+    // Select the last image in the base listing, then enter viewer mode: the
+    // selection is remapped onto the filtered index space (photo-3 -> 0).
+    let tile = cx.debug_bounds("#thumbnail-3").unwrap();
+    cx.simulate_click(tile.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let swatch = cx.debug_bounds("#album-selection-Selection 1").unwrap();
+    cx.simulate_click(swatch.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| match &view.main_view {
+            MainView::Dir(_, selection) => (selection.indices.clone(), selection.focused),
+            MainView::Image(_) => unreachable!(),
+        }),
+        (BTreeSet::from([0]), Some(0))
+    );
+
+    // Arrow keys move within the FILTERED listing (photo-3 is its only
+    // member, so the focused index clamps at 0).
+    cx.simulate_keystrokes("right");
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| match &view.main_view {
+            MainView::Dir(_, selection) => selection.focused,
+            MainView::Image(_) => unreachable!(),
+        }),
+        Some(0)
+    );
+
+    // Escape leaves viewer mode (the grid keeps focus from the tile click)
+    // and resets the grid selection, whose index space changed.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| (
+            view.grid_selection_mode.clone(),
+            match &view.main_view {
+                MainView::Dir(_, selection) => {
+                    (selection.indices.is_empty(), selection.focused.is_none())
+                }
+                MainView::Image(_) => unreachable!(),
+            }
+        )),
+        (GridSelectionMode::Default, (true, true))
+    );
+
+    // Re-enter viewer and corrupt the filtered listing: a rebuild must
+    // recompute from the UNDERLYING source listing, not re-filter the
+    // corrupted viewer_paths (which would re-filter the filter).
+    let swatch = cx.debug_bounds("#album-selection-Selection 1").unwrap();
+    cx.simulate_click(swatch.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    cx.update_entity(&view, |view, cx| {
+        view.viewer_paths = Some(vec![photos[0].clone()]);
+        view.rebuild_viewer_paths(cx);
+    });
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.viewer_paths.clone()),
+        Some(vec![photos[3].clone()])
+    );
+
+    // An empty selection views as an empty grid with the empty-state text.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let quick = cx.debug_bounds("#quick-add-selection").unwrap();
+    cx.simulate_click(quick.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let swatch = cx.debug_bounds("#album-selection-Selection 2").unwrap();
+    cx.simulate_click(swatch.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| (
+            view.viewer_paths.clone(),
+            view.selected_images().len()
+        )),
+        (Some(Vec::new()), 0)
+    );
+    assert!(cx.debug_bounds("#selection-viewer-empty").is_some());
+}
+
+fn write_photo_stub_with_capture_time(root: &Path, name: &str, time: &str) -> PathBuf {
+    let path = root.join(format!("{name}.jpg"));
+    image::RgbImage::from_pixel(8, 8, image::Rgb([32, 96, 160]))
+        .save(&path)
+        .unwrap();
+    std::fs::write(
+        root.join(format!("{name}.xmp")),
+        format!("<rdf:Description exif:DateTimeOriginal=\"{time}\"/>"),
+    )
+    .unwrap();
+    path
+}
+
+#[gpui::test]
+fn gpui_selection_viewer_rebuilds_on_capture_time_order(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    // Capture times order b, c, a — different from the name/mtime order.
+    let photo_a = write_photo_stub_with_capture_time(root.path(), "a", "2024:01:03 10:00:00");
+    let _photo_b = write_photo_stub_with_capture_time(root.path(), "b", "2024:01:01 10:00:00");
+    let photo_c = write_photo_stub_with_capture_time(root.path(), "c", "2024:01:02 10:00:00");
+    let mut config = gpui_test_config(root.path(), cache.path());
+    config.settings.automatic_face_analysis = false;
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+
+    let quick = cx.debug_bounds("#quick-add-selection").unwrap();
+    cx.simulate_click(quick.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let album = root.path().to_path_buf();
+    // Members out of order plus a dangling path that must be dropped.
+    cx.update_entity(&view, |view, _| {
+        let entry = view.selections.get_mut(&album).unwrap();
+        entry[0].members = vec![photo_c.clone(), photo_a.clone(), album.join("gone.jpg")];
+    });
+
+    let swatch = cx.debug_bounds("#album-selection-Selection 1").unwrap();
+    cx.simulate_click(swatch.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.selected_images().to_vec()),
+        vec![photo_a.clone(), photo_c.clone()]
+    );
+
+    // Select the first member (t-a, base index 0), then apply the
+    // capture-time ordering once the banner appears.
+    let tile = cx.debug_bounds("#thumbnail-0").unwrap();
+    cx.simulate_click(tile.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    for _ in 0..10 {
+        cx.run_until_parked();
+        if cx.debug_bounds("#apply-capture-time-order").is_some() {
+            break;
+        }
+    }
+    let apply = cx.debug_bounds("#apply-capture-time-order").unwrap();
+    cx.simulate_click(apply.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+
+    // The filtered listing follows the NEW capture-time order (c before a),
+    // the dangling member stays dropped, and the selection is remapped onto
+    // the new index spaces (t-a: base 0 → capture 2 → filtered 1).
+    assert_eq!(
+        view.read_with(&*cx, |view, _| (
+            view.selected_images().to_vec(),
+            view.viewer_paths.clone()
+        )),
+        (
+            vec![photo_c.clone(), photo_a.clone()],
+            Some(vec![photo_c.clone(), photo_a.clone()])
+        )
+    );
+    assert_eq!(
+        view.read_with(&*cx, |view, _| (
+            view.saved_selection.indices.clone(),
+            match &view.main_view {
+                MainView::Dir(_, selection) => selection.indices.clone(),
+                MainView::Image(_) => unreachable!(),
+            }
+        )),
+        (BTreeSet::from([1]), BTreeSet::from([1]))
+    );
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.viewer_banner_state()),
+        Some(("Selection 1".to_owned(), 2, 3))
+    );
+}
+
+#[gpui::test]
+fn gpui_selection_rename_and_delete_follow_the_active_viewer(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let photos: Vec<PathBuf> = (0..3)
+        .map(|index| write_photo_stub(root.path(), &format!("photo-{index}"), 47.5, 19.05))
+        .collect();
+    let mut config = gpui_test_config(root.path(), cache.path());
+    config.settings.automatic_face_analysis = false;
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+
+    let quick = cx.debug_bounds("#quick-add-selection").unwrap();
+    cx.simulate_click(quick.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let album = root.path().to_path_buf();
+    cx.update_entity(&view, |view, _| {
+        let entry = view.selections.get_mut(&album).unwrap();
+        entry[0].members = vec![photos[0].clone(), photos[1].clone()];
+    });
+    let swatch = cx.debug_bounds("#album-selection-Selection 1").unwrap();
+    cx.simulate_click(swatch.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+
+    // Renaming the selection being viewed updates the mode and keeps the
+    // filtered listing alive.
+    let swatch = cx.debug_bounds("#album-selection-Selection 1").unwrap();
+    cx.simulate_mouse_down(swatch.center(), MouseButton::Right, gpui::Modifiers::none());
+    cx.run_until_parked();
+    let rename = cx.debug_bounds("#selection-menu-rename").unwrap();
+    cx.simulate_mouse_down(rename.center(), MouseButton::Left, gpui::Modifiers::none());
+    cx.run_until_parked();
+    let prefill = view.read_with(&*cx, |view, _| match &view.selection_dialog {
+        Some(SelectionDialog::Rename { input, .. }) => input.chars().count(),
+        _ => 0,
+    });
+    let clears = "backspace ".repeat(prefill).trim().to_string();
+    cx.simulate_keystrokes(&clears);
+    cx.simulate_keystrokes("shift-k e p t");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| (
+            view.grid_selection_mode.clone(),
+            view.selected_images().to_vec(),
+            view.viewer_banner_state()
+        )),
+        (
+            GridSelectionMode::Viewer {
+                name: "Kept".to_owned()
+            },
+            vec![photos[0].clone(), photos[1].clone()],
+            Some(("Kept".to_owned(), 2, 3))
+        )
+    );
+
+    // Deleting the selection being viewed leaves the mode entirely.
+    let swatch = cx.debug_bounds("#album-selection-Kept").unwrap();
+    cx.simulate_mouse_down(swatch.center(), MouseButton::Right, gpui::Modifiers::none());
+    cx.run_until_parked();
+    let delete = cx.debug_bounds("#selection-menu-delete").unwrap();
+    cx.simulate_mouse_down(delete.center(), MouseButton::Left, gpui::Modifiers::none());
+    cx.run_until_parked();
+    let submit = cx.debug_bounds("#selection-dialog-submit").unwrap();
+    cx.simulate_click(submit.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| (
+            view.grid_selection_mode.clone(),
+            view.selected_images().len(),
+            view.viewer_banner_state()
+        )),
+        (GridSelectionMode::Default, 3, None)
+    );
+}
+
+#[gpui::test]
+fn gpui_selection_escape_inside_dialog_does_not_exit_viewer(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write_photo_stub(root.path(), "photo", 47.5, 19.05);
+    let mut config = gpui_test_config(root.path(), cache.path());
+    config.settings.automatic_face_analysis = false;
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+    cx.update(|_, cx| bind_picture_browser_keys(cx));
+
+    let quick = cx.debug_bounds("#quick-add-selection").unwrap();
+    cx.simulate_click(quick.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let swatch = cx.debug_bounds("#album-selection-Selection 1").unwrap();
+    cx.simulate_click(swatch.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.grid_selection_mode.clone()),
+        GridSelectionMode::Viewer {
+            name: "Selection 1".to_owned()
+        }
+    );
+
+    // Open the rename dialog, then press Escape: the dialog owns focus, so
+    // the dialog closes and the viewer mode must survive underneath.
+    let swatch = cx.debug_bounds("#album-selection-Selection 1").unwrap();
+    cx.simulate_mouse_down(swatch.center(), MouseButton::Right, gpui::Modifiers::none());
+    cx.run_until_parked();
+    let rename = cx.debug_bounds("#selection-menu-rename").unwrap();
+    cx.simulate_mouse_down(rename.center(), MouseButton::Left, gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert!(view.read_with(&*cx, |view, _| view.selection_dialog.is_some()));
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| (
+            view.selection_dialog.is_none(),
+            view.grid_selection_mode.clone()
+        )),
+        (
+            true,
+            GridSelectionMode::Viewer {
+                name: "Selection 1".to_owned()
+            }
+        )
+    );
+}
+
+#[gpui::test]
+fn gpui_selection_editor_toggles_membership_and_persists(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let photos: Vec<PathBuf> = (0..4)
+        .map(|index| write_photo_stub(root.path(), &format!("photo-{index}"), 47.5, 19.05))
+        .collect();
+    let mut config = gpui_test_config(root.path(), cache.path());
+    config.settings.automatic_face_analysis = false;
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+    cx.update(|_, cx| bind_picture_browser_keys(cx));
+    let album = root.path().to_path_buf();
+
+    // Creating a selection enters its editor: all images stay visible and
+    // every tile shows a membership badge.
+    let quick = cx.debug_bounds("#quick-add-selection").unwrap();
+    cx.simulate_click(quick.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.grid_selection_mode.clone()),
+        GridSelectionMode::Editor {
+            name: "Selection 1".to_owned()
+        }
+    );
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.selected_images().len()),
+        4
+    );
+    for selector in [
+        "#selection-badge-0",
+        "#selection-badge-1",
+        "#selection-badge-2",
+        "#selection-badge-3",
+    ] {
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "badge missing: {selector}"
+        );
+    }
+
+    // Badge click toggles membership without changing the grid selection.
+    let badge = cx.debug_bounds("#selection-badge-0").unwrap();
+    cx.simulate_mouse_down(badge.center(), MouseButton::Left, gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view
+            .selections
+            .get(&album)
+            .map(|selections| selections[0].members.clone())),
+        Some(vec![photos[0].clone()])
+    );
+    // The badge toggled membership WITHOUT touching the grid selection.
+    assert_eq!(
+        view.read_with(&*cx, |view, _| match &view.main_view {
+            MainView::Dir(_, selection) => {
+                (selection.indices.is_empty(), selection.focused.is_none())
+            }
+            MainView::Image(_) => unreachable!(),
+        }),
+        (true, true)
+    );
+    let badge = cx.debug_bounds("#selection-badge-0").unwrap();
+    cx.simulate_mouse_down(badge.center(), MouseButton::Left, gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view
+            .selections
+            .get(&album)
+            .map(|selections| selections[0].members.len())),
+        Some(0)
+    );
+
+    // Space toggles the focused tile's membership.
+    let tile = cx.debug_bounds("#thumbnail-2").unwrap();
+    cx.simulate_click(tile.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    // Modifiered Space must not toggle.
+    cx.simulate_keystrokes("shift-space");
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view
+            .selections
+            .get(&album)
+            .map(|selections| selections[0].members.len())),
+        Some(0)
+    );
+    // Space inside a modal must not toggle either: the rename dialog owns
+    // focus and the key edits the dialog input only.
+    let swatch = cx.debug_bounds("#album-selection-Selection 1").unwrap();
+    cx.simulate_mouse_down(swatch.center(), MouseButton::Right, gpui::Modifiers::none());
+    cx.run_until_parked();
+    let rename = cx.debug_bounds("#selection-menu-rename").unwrap();
+    cx.simulate_mouse_down(rename.center(), MouseButton::Left, gpui::Modifiers::none());
+    cx.run_until_parked();
+    cx.simulate_keystrokes("space");
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view
+            .selections
+            .get(&album)
+            .map(|selections| selections[0].members.len())),
+        Some(0)
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("space");
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view
+            .selections
+            .get(&album)
+            .map(|selections| selections[0].members.clone())),
+        Some(vec![photos[2].clone()])
+    );
+    cx.simulate_keystrokes("space");
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view
+            .selections
+            .get(&album)
+            .map(|selections| selections[0].members.len())),
+        Some(0)
+    );
+
+    // Toggles land on disk through the save pipeline.
+    let badge = cx.debug_bounds("#selection-badge-2").unwrap();
+    cx.simulate_mouse_down(badge.center(), MouseButton::Left, gpui::Modifiers::none());
+    cx.run_until_parked();
+    let on_disk = catalog::selections::load_album_selections(root.path()).unwrap();
+    assert_eq!(
+        on_disk
+            .get(&album)
+            .map(|selections| selections[0].members.clone()),
+        Some(vec![photos[2].clone()])
+    );
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.editor_banner_state()),
+        Some(("Selection 1".to_owned(), 1, 4))
+    );
+
+    // A toggle landing while a save is in flight is queued, not lost: the
+    // next flush carries it (and the whole snapshot) to disk. The disk state
+    // before the queued toggle is captured, since earlier edits of this test
+    // settle asynchronously.
+    let before = catalog::selections::load_album_selections(root.path())
+        .unwrap()
+        .get(&album)
+        .map(|selections| selections[0].members.clone());
+    cx.update_entity(&view, |view, cx| {
+        view.selections_save_in_flight = true;
+        view.toggle_selection_membership(photos[0].clone(), cx);
+    });
+    assert_eq!(
+        view.read_with(&*cx, |view, _| (
+            view.selections_save_in_flight,
+            view.selections_dirty.contains(&album)
+        )),
+        (true, true)
+    );
+    cx.run_until_parked();
+    let on_disk = catalog::selections::load_album_selections(root.path()).unwrap();
+    assert_eq!(
+        on_disk
+            .get(&album)
+            .map(|selections| selections[0].members.clone()),
+        before,
+        "the in-flight toggle must not be flushed yet"
+    );
+    cx.update_entity(&view, |view, cx| {
+        view.selections_save_in_flight = false;
+        view.flush_selections_saves(cx);
+    });
+    cx.run_until_parked();
+    let on_disk = catalog::selections::load_album_selections(root.path()).unwrap();
+    assert_eq!(
+        on_disk
+            .get(&album)
+            .map(|selections| selections[0].members.clone()),
+        Some(vec![photos[2].clone(), photos[0].clone()])
+    );
+
+    // The large-view round trip preserves editor mode and membership.
+    let tile = cx.debug_bounds("#thumbnail-1").unwrap();
+    double_click(cx, tile.center());
+    cx.run_until_parked();
+    assert!(view.read_with(&*cx, |view, _| matches!(
+        &view.main_view,
+        MainView::Image(state) if state.path == photos[1]
+    )));
+    // Space inside the large view must not toggle membership.
+    cx.simulate_keystrokes("space");
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view
+            .selections
+            .get(&album)
+            .map(|selections| selections[0].members.clone())),
+        Some(vec![photos[2].clone(), photos[0].clone()])
+    );
+    cx.dispatch_action(CloseImage);
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| (
+            view.grid_selection_mode.clone(),
+            view.selections
+                .get(&album)
+                .map(|selections| selections[0].members.clone()),
+            match &view.main_view {
+                MainView::Dir(_, selection) => {
+                    (selection.focused, selection.indices.clone())
+                }
+                MainView::Image(_) => unreachable!(),
+            }
+        )),
+        (
+            GridSelectionMode::Editor {
+                name: "Selection 1".to_owned()
+            },
+            Some(vec![photos[2].clone(), photos[0].clone()]),
+            (Some(1), BTreeSet::from([1]))
+        )
+    );
+
+    // Done leaves the mode; the viewer then shows the edited membership.
+    let done = cx.debug_bounds("#done-selection-editor").unwrap();
+    cx.simulate_click(done.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.grid_selection_mode.clone()),
+        GridSelectionMode::Default
+    );
+    let swatch = cx.debug_bounds("#album-selection-Selection 1").unwrap();
+    cx.simulate_click(swatch.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| (
+            view.selected_images().to_vec(),
+            view.viewer_banner_state()
+        )),
+        // The viewer emits album order, not member insertion order.
+        (
+            vec![photos[0].clone(), photos[2].clone()],
+            Some(("Selection 1".to_owned(), 2, 4))
+        )
+    );
+
+    // Restart: membership crosses the save/load boundary.
+    let (restarted, restarted_cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    restarted_cx.run_until_parked();
+    assert_eq!(
+        restarted.read_with(&*restarted_cx, |view, _| view
+            .selections
+            .get(&album)
+            .map(|selections| selections[0].members.clone())),
+        Some(vec![photos[2].clone(), photos[0].clone()])
+    );
+}
+
+#[gpui::test]
+fn gpui_selection_editor_entry_points(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write_photo_stub(root.path(), "photo", 47.5, 19.05);
+    let mut config = gpui_test_config(root.path(), cache.path());
+    config.settings.automatic_face_analysis = false;
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+
+    // The named + dialog enters the editor for the created selection.
+    let add = cx.debug_bounds("#add-selection").unwrap();
+    cx.simulate_click(add.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    cx.simulate_input("Manual");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.grid_selection_mode.clone()),
+        GridSelectionMode::Editor {
+            name: "Manual".to_owned()
+        }
+    );
+    let done = cx.debug_bounds("#done-selection-editor").unwrap();
+    cx.simulate_click(done.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.grid_selection_mode.clone()),
+        GridSelectionMode::Default
+    );
+    // Space after Done must not toggle: the editor gate no longer matches.
+    let tile = cx.debug_bounds("#thumbnail-0").unwrap();
+    cx.simulate_click(tile.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    cx.simulate_keystrokes("space");
+    cx.run_until_parked();
+    let album = root.path().to_path_buf();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view
+            .selections
+            .get(&album)
+            .map(|selections| selections[0].members.len())),
+        Some(0)
+    );
+
+    // Context menu Edit.
+    let swatch = cx.debug_bounds("#album-selection-Manual").unwrap();
+    cx.simulate_mouse_down(swatch.center(), MouseButton::Right, gpui::Modifiers::none());
+    cx.run_until_parked();
+    let edit = cx.debug_bounds("#selection-menu-edit").unwrap();
+    cx.simulate_mouse_down(edit.center(), MouseButton::Left, gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.grid_selection_mode.clone()),
+        GridSelectionMode::Editor {
+            name: "Manual".to_owned()
+        }
+    );
+
+    // Viewer banner Edit: exit to default, view, then edit from the banner.
+    let done = cx.debug_bounds("#done-selection-editor").unwrap();
+    cx.simulate_click(done.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let swatch = cx.debug_bounds("#album-selection-Manual").unwrap();
+    cx.simulate_click(swatch.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let edit = cx.debug_bounds("#edit-selection-viewer").unwrap();
+    cx.simulate_click(edit.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.grid_selection_mode.clone()),
+        GridSelectionMode::Editor {
+            name: "Manual".to_owned()
+        }
+    );
+
+    // Empty-viewer CTA: a second (empty) selection views as empty, and its
+    // Edit button opens the editor for THAT selection.
+    let done = cx.debug_bounds("#done-selection-editor").unwrap();
+    cx.simulate_click(done.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let quick = cx.debug_bounds("#quick-add-selection").unwrap();
+    cx.simulate_click(quick.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    // Quick + entered the editor for Selection 1; switch to viewing it via
+    // the swatch, which shows the empty state with the Edit CTA.
+    let done = cx.debug_bounds("#done-selection-editor").unwrap();
+    cx.simulate_click(done.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let swatch = cx.debug_bounds("#album-selection-Selection 1").unwrap();
+    cx.simulate_click(swatch.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("#selection-viewer-empty").is_some());
+    let edit = cx.debug_bounds("#edit-selection-empty").unwrap();
+    cx.simulate_click(edit.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.grid_selection_mode.clone()),
+        GridSelectionMode::Editor {
+            name: "Selection 1".to_owned()
+        }
+    );
+}
+#[gpui::test]
+fn gpui_selection_union_viewer_in_recursive_mode(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("alpha")).unwrap();
+    std::fs::create_dir(root.path().join("beta")).unwrap();
+    std::fs::create_dir(root.path().join("gamma")).unwrap();
+    let a1 = write_photo_stub(&root.path().join("alpha"), "a1", 47.5, 19.05);
+    write_photo_stub(&root.path().join("alpha"), "a2", 47.5, 19.06);
+    let b1 = write_photo_stub(&root.path().join("beta"), "b1", 47.5, 19.07);
+    let c1 = write_photo_stub(&root.path().join("gamma"), "c1", 47.5, 19.08);
+    // Explicit mtimes so the merged listing order (capture-time absent ->
+    // modified time, then name) puts beta's member BEFORE alpha's, distinct
+    // from both name order and member insertion order.
+    for (path, seconds) in [(&a1, 2_000_000), (&b1, 1_000_000)] {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(seconds),
+            ))
+            .unwrap();
+    }
+    let mut config = gpui_test_config(root.path(), cache.path());
+    config.settings.automatic_face_analysis = false;
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+    let beta = root.path().join("beta");
+
+    // Per-leaf creation: "Selection 1" in alpha (a1) and beta (b1); gamma
+    // gets a named but EMPTY selection, which must not appear as a union.
+    let alpha_row = cx.debug_bounds("#directory-1").unwrap();
+    cx.simulate_click(alpha_row.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let quick = cx.debug_bounds("#quick-add-selection").unwrap();
+    cx.simulate_click(quick.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let badge = cx.debug_bounds("#selection-badge-0").unwrap();
+    cx.simulate_mouse_down(badge.center(), MouseButton::Left, gpui::Modifiers::none());
+    cx.run_until_parked();
+    let done = cx.debug_bounds("#done-selection-editor").unwrap();
+    cx.simulate_click(done.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+
+    let beta_row = cx.debug_bounds("#directory-2").unwrap();
+    cx.simulate_click(beta_row.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let quick = cx.debug_bounds("#quick-add-selection").unwrap();
+    cx.simulate_click(quick.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let badge = cx.debug_bounds("#selection-badge-0").unwrap();
+    cx.simulate_mouse_down(badge.center(), MouseButton::Left, gpui::Modifiers::none());
+    cx.run_until_parked();
+    let done = cx.debug_bounds("#done-selection-editor").unwrap();
+    cx.simulate_click(done.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+
+    let gamma_row = cx.debug_bounds("#directory-3").unwrap();
+    cx.simulate_click(gamma_row.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let add = cx.debug_bounds("#add-selection").unwrap();
+    cx.simulate_click(add.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    cx.simulate_input("Empty");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    let done = cx.debug_bounds("#done-selection-editor").unwrap();
+    cx.simulate_click(done.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    // A second, distinct union name with c1 as its member.
+    let add = cx.debug_bounds("#add-selection").unwrap();
+    cx.simulate_click(add.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    cx.simulate_input("Selection 2");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    let badge = cx.debug_bounds("#selection-badge-0").unwrap();
+    cx.simulate_mouse_down(badge.center(), MouseButton::Left, gpui::Modifiers::none());
+    cx.run_until_parked();
+    let done = cx.debug_bounds("#done-selection-editor").unwrap();
+    cx.simulate_click(done.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+
+    // Merged view from the empty root.
+    let root_row = cx.debug_bounds("#directory-0").unwrap();
+    cx.simulate_click(root_row.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let recursive_cta = cx.debug_bounds("#show-images-recursively").unwrap();
+    cx.simulate_click(recursive_cta.center(), gpui::Modifiers::none());
+    // The merged listing loads asynchronously; poll until it is Loaded. The
+    // debug_bounds query flushes the pending frame (bare parking does not
+    // draw), so the merged toolbar is actually on screen afterwards.
+    for _ in 0..20 {
+        cx.run_until_parked();
+        let banner_drawn = cx.debug_bounds("#exit-recursive-grid").is_some();
+        let loaded = view.read_with(&*cx, |view, _| {
+            matches!(
+                view.recursive_grid,
+                Some(RecursiveGridState {
+                    status: RecursiveGridStatus::Loaded(_),
+                    ..
+                })
+            )
+        });
+        if banner_drawn && loaded {
+            break;
+        }
+    }
+    let _ = cx.debug_bounds("#exit-recursive-grid");
+    assert!(view.read_with(&*cx, |view, _| matches!(
+        view.recursive_grid,
+        Some(RecursiveGridState {
+            status: RecursiveGridStatus::Loaded(_),
+            ..
+        })
+    )));
+    assert!(cx.debug_bounds("#album-selection-Selection 1").is_some());
+    // Sorted distinct union names; the empty selection must NOT appear
+    // (>= 1 existing member).
+    let union_names = view.read_with(&*cx, |view, _| view.merged_union_names());
+    assert_eq!(
+        union_names,
+        vec!["Selection 1".to_owned(), "Selection 2".to_owned()]
+    );
+
+    // Editing affordances are gone in merged mode. Absence is asserted
+    // behaviorally: clicking where the + / Quick + buttons sat in the leaf
+    // phases must not open the create dialog or create a selection (the
+    // debug-bounds map is insert-only, so bounds-based absence would be
+    // unreliable in this window).
+    let add_center = cx.debug_bounds("#add-selection").unwrap().center();
+    let quick_center = cx.debug_bounds("#quick-add-selection").unwrap().center();
+    cx.simulate_click(add_center, gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert!(view.read_with(&*cx, |view, _| view.selection_dialog.is_none()));
+    cx.simulate_click(quick_center, gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert!(
+        view.read_with(&*cx, |view, _| view.selection_dialog.is_none()
+            && !view.selections.contains_key(root.path()))
+    );
+    // The probe clicks may have landed on the union swatch (the merged
+    // toolbar is narrower than the leaf one); restore Default before the
+    // next step.
+    cx.update_entity(&view, |view, cx| view.exit_grid_selection_mode(cx));
+    cx.run_until_parked();
+
+    // Right-click on the union swatch opens no context menu.
+    let swatch = cx.debug_bounds("#album-selection-Selection 1").unwrap();
+    // The long merged title pushes the group against the window edge; click
+    // a point inside the swatch's on-screen strip, not its (off-window)
+    // center.
+    let click_point = swatch.origin + gpui::point(px(30.0), px(4.0));
+    cx.simulate_mouse_down(click_point, MouseButton::Right, gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert!(view.read_with(&*cx, |view, _| view.selection_context_menu.is_none()));
+
+    // The union viewer shows both leaves' members in the MERGED listing's
+    // global order (beta's member has the earlier mtime).
+    let swatch = cx.debug_bounds("#album-selection-Selection 1").unwrap();
+    let click_point = swatch.origin + gpui::point(px(30.0), px(4.0));
+    cx.simulate_click(click_point, gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| (
+            view.grid_selection_mode.clone(),
+            view.selected_images().to_vec(),
+            view.merged_viewer_banner_state()
+        )),
+        (
+            GridSelectionMode::Viewer {
+                name: "Selection 1".to_owned()
+            },
+            vec![b1.clone(), a1.clone()],
+            Some(("Selection 1".to_owned(), 2, 4, 2))
+        )
+    );
+    assert!(cx.debug_bounds("#exit-selection-viewer").is_some());
+    // The merged banner ships no Edit button (editing is per-leaf).
+    assert!(cx.debug_bounds("#edit-selection-viewer").is_none());
+
+    // Switching unions DIRECTLY (viewer still active) must show exactly the
+    // new union's members — not the intersection with the previous one.
+    let swatch = cx.debug_bounds("#album-selection-Selection 2").unwrap();
+    let click_point = swatch.origin + gpui::point(px(30.0), px(4.0));
+    cx.simulate_click(click_point, gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| (
+            view.grid_selection_mode.clone(),
+            view.selected_images().to_vec(),
+            view.merged_viewer_banner_state()
+        )),
+        (
+            GridSelectionMode::Viewer {
+                name: "Selection 2".to_owned()
+            },
+            vec![c1.clone()],
+            Some(("Selection 2".to_owned(), 1, 4, 1))
+        )
+    );
+    // ...and switching back re-expands to the first union.
+    let swatch = cx.debug_bounds("#album-selection-Selection 1").unwrap();
+    let click_point = swatch.origin + gpui::point(px(30.0), px(4.0));
+    cx.simulate_click(click_point, gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.selected_images().to_vec()),
+        vec![b1.clone(), a1.clone()]
+    );
+
+    // Exiting the merged view lands in Default with the root leaf listing
+    // intact.
+    let exit = cx.debug_bounds("#exit-recursive-grid").unwrap();
+    cx.simulate_click(exit.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| (
+            view.grid_selection_mode.clone(),
+            view.recursive_grid.is_some()
+        )),
+        (GridSelectionMode::Default, false)
+    );
+    assert!(cx.debug_bounds("#show-images-recursively").is_some());
+
+    // Hiding a subtree while a union viewer is active lands in Default (the
+    // recursive restart reset), with beta gone from the merge.
+    let root_row = cx.debug_bounds("#directory-0").unwrap();
+    cx.simulate_click(root_row.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let recursive_cta = cx.debug_bounds("#show-images-recursively").unwrap();
+    cx.simulate_click(recursive_cta.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let swatch = cx.debug_bounds("#album-selection-Selection 1").unwrap();
+    let click_point = swatch.origin + gpui::point(px(30.0), px(4.0));
+    cx.simulate_click(click_point, gpui::Modifiers::none());
+    cx.run_until_parked();
+    cx.update_entity(&view, |view, cx| {
+        view.set_subtree_hidden(beta.clone(), true, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.grid_selection_mode.clone()),
+        GridSelectionMode::Default
+    );
+    assert!(
+        view.read_with(&*cx, |view, _| view.recursive_grid.as_ref().is_some_and(
+            |recursive| match &recursive.status {
+                RecursiveGridStatus::Loaded(images) => {
+                    images.paths.iter().all(|path| !path.starts_with(&beta))
+                }
+                _ => false,
+            }
+        ))
+    );
+}
+
+#[gpui::test]
+fn gpui_selection_merged_overflow_views_hidden_unions(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("alpha")).unwrap();
+    std::fs::create_dir(root.path().join("beta")).unwrap();
+    let _a1 = write_photo_stub(&root.path().join("alpha"), "a1", 47.5, 19.05);
+    write_photo_stub(&root.path().join("beta"), "b1", 47.5, 19.06);
+    let mut config = gpui_test_config(root.path(), cache.path());
+    config.settings.automatic_face_analysis = false;
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+
+    // Six selections in alpha, all containing a1; beta holds a same-named one.
+    let alpha_row = cx.debug_bounds("#directory-1").unwrap();
+    cx.simulate_click(alpha_row.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    for _ in 0..6 {
+        let quick = cx.debug_bounds("#quick-add-selection").unwrap();
+        cx.simulate_click(quick.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        let badge = cx.debug_bounds("#selection-badge-0").unwrap();
+        cx.simulate_mouse_down(badge.center(), MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        let done = cx.debug_bounds("#done-selection-editor").unwrap();
+        cx.simulate_click(done.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+    }
+    let beta_row = cx.debug_bounds("#directory-2").unwrap();
+    cx.simulate_click(beta_row.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let quick = cx.debug_bounds("#quick-add-selection").unwrap();
+    cx.simulate_click(quick.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let badge = cx.debug_bounds("#selection-badge-0").unwrap();
+    cx.simulate_mouse_down(badge.center(), MouseButton::Left, gpui::Modifiers::none());
+    cx.run_until_parked();
+    let done = cx.debug_bounds("#done-selection-editor").unwrap();
+    cx.simulate_click(done.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+
+    // Merged view: six distinct union names, only five on the toolbar.
+    let root_row = cx.debug_bounds("#directory-0").unwrap();
+    cx.simulate_click(root_row.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let recursive_cta = cx.debug_bounds("#show-images-recursively").unwrap();
+    cx.simulate_click(recursive_cta.center(), gpui::Modifiers::none());
+    for _ in 0..20 {
+        cx.run_until_parked();
+        let banner_drawn = cx.debug_bounds("#exit-recursive-grid").is_some();
+        let loaded = view.read_with(&*cx, |view, _| {
+            matches!(
+                view.recursive_grid,
+                Some(RecursiveGridState {
+                    status: RecursiveGridStatus::Loaded(_),
+                    ..
+                })
+            )
+        });
+        if banner_drawn && loaded {
+            break;
+        }
+    }
+    let _ = cx.debug_bounds("#exit-recursive-grid");
+    // Six unions exceed the toolbar cap: the overflow affordance exists and
+    // the hidden union is reachable through it. Interactive row clicking in
+    // the merged overflow is covered by the manual acceptance matrix — the
+    // harness only draws frames on real clicks, which dismiss this menu.
+    assert!(cx.debug_bounds("#more-selections").is_some());
+    assert_eq!(
+        view.read_with(&*cx, |view, _| (
+            view.merged_union_names().len(),
+            SELECTIONS_TOOLBAR_LIMIT,
+        )),
+        (6, 5)
+    );
+}

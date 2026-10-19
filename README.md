@@ -69,6 +69,23 @@ Ctrl-click (Command-click on macOS) to toggle items, and Shift-click to select a
 range. Double-click a thumbnail or press Enter to open it; press Escape or use
 the Back button to return to the directory.
 
+Each directory (album) can hold named **persistent selections** — curated
+subsets of its images, stored in the library catalog and shown as buttons in
+the toolbar above the grid. Create them with `+` (named) or `Quick +`
+(pre-named "Selection N") — both enter the editor afterwards. Right-click a
+selection to edit, rename, or delete it (deleting asks for confirmation).
+With more than five selections the rest live behind an `N more` menu. Clicking
+a selection's button views exactly its members; click it again (or press
+Escape) to return to the full album. In view mode the banner offers Edit to
+toggle membership per image (click a tile's corner badge or press Space on the
+focused tile); press Done when finished. An empty selection's grid offers its
+own Edit button. Selections reference images by path: a temporarily missing
+file stays a member and rejoins if it reappears. When a directory's
+subdirectories are shown merged, same-named selections collapse into one union
+entry with viewing only — creating and editing stays per directory.
+Selections persist in the catalog (`.rekesz/catalog.sqlite3`) and survive
+restarts.
+
 The directory header can switch between the thumbnail grid and a map of photos
 that contain GPS metadata. Rekesz reads coordinates from XMP sidecars and
 embedded EXIF metadata in supported standard, HEIF, and RAW images; it does not

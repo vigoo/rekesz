@@ -12,10 +12,11 @@ use serde::{Deserialize, Serialize};
 pub(crate) mod people;
 pub(crate) mod recognition;
 mod recognition_policy;
+pub(crate) mod selections;
 
 pub const CATALOG_DIR: &str = ".rekesz";
 const CATALOG_FILE: &str = "catalog.sqlite3";
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const CONTENT_IDENTITY_BUFFER_BYTES: usize = 64 * 1024;
 const SQLITE_APPLICATION_ID: i64 = 0x5049_4353;
 pub const RENDERER_MODEL_VERSION: u32 = 12;
@@ -840,6 +841,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<()> {
                 migrate_v3_to_v4(connection)?;
                 migrate_v4_to_v5(connection)?;
                 migrate_v5_to_v6(connection)?;
+                migrate_v6_to_v7(connection)?;
             }
             2 => {
                 backup_catalog_before_migration(connection, version)?;
@@ -847,21 +849,29 @@ fn initialize_schema(connection: &mut Connection) -> Result<()> {
                 migrate_v3_to_v4(connection)?;
                 migrate_v4_to_v5(connection)?;
                 migrate_v5_to_v6(connection)?;
+                migrate_v6_to_v7(connection)?;
             }
             3 => {
                 backup_catalog_before_migration(connection, version)?;
                 migrate_v3_to_v4(connection)?;
                 migrate_v4_to_v5(connection)?;
                 migrate_v5_to_v6(connection)?;
+                migrate_v6_to_v7(connection)?;
             }
             4 => {
                 backup_catalog_before_migration(connection, version)?;
                 migrate_v4_to_v5(connection)?;
                 migrate_v5_to_v6(connection)?;
+                migrate_v6_to_v7(connection)?;
             }
             5 => {
                 backup_catalog_before_migration(connection, version)?;
                 migrate_v5_to_v6(connection)?;
+                migrate_v6_to_v7(connection)?;
+            }
+            6 => {
+                backup_catalog_before_migration(connection, version)?;
+                migrate_v6_to_v7(connection)?;
             }
             _ => {
                 bail!("unsupported Rekesz catalog schema {version}; expected {SCHEMA_VERSION}")
@@ -900,6 +910,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<()> {
              relative_path BLOB PRIMARY KEY,
              hidden_at TEXT NOT NULL
          );
+         {selections_schema}
          {people_schema}
          {people_summary_schema}
          INSERT INTO catalog_meta(id, schema_version, renderer_model, created_at)
@@ -908,7 +919,8 @@ fn initialize_schema(connection: &mut Connection) -> Result<()> {
          PRAGMA user_version={SCHEMA_VERSION};",
         people_schema = people_schema(),
         people_summary_schema = people_summary_schema(),
-        asset_inventory_schema = asset_inventory_schema()
+        asset_inventory_schema = asset_inventory_schema(),
+        selections_schema = selections_schema()
     ))?;
     validate_schema(connection)
 }
@@ -1013,6 +1025,22 @@ fn asset_inventory_schema() -> &'static str {
          source_fingerprint BLOB NOT NULL DEFAULT X'',
          decoder_model_id TEXT NOT NULL DEFAULT 'renderer-6',
          discovered_at TEXT NOT NULL
+     );"
+}
+
+fn selections_schema() -> &'static str {
+    "CREATE TABLE IF NOT EXISTS album_selections(
+         id INTEGER PRIMARY KEY,
+         directory_relative_path BLOB NOT NULL,
+         name TEXT NOT NULL,
+         created_at TEXT NOT NULL,
+         UNIQUE(directory_relative_path, name)
+     );
+     CREATE TABLE IF NOT EXISTS album_selection_members(
+         selection_id INTEGER NOT NULL REFERENCES album_selections(id) ON DELETE CASCADE,
+         asset_relative_path BLOB NOT NULL,
+         added_at TEXT NOT NULL,
+         PRIMARY KEY(selection_id, asset_relative_path)
      );"
 }
 
@@ -1790,6 +1818,22 @@ fn migrate_v5_to_v6(connection: &mut Connection) -> Result<()> {
         bail!("Rekesz catalog metadata changed during v6 migration");
     }
     transaction.pragma_update(None, "user_version", 6)?;
+    ensure_foreign_keys_valid(&transaction)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v6_to_v7(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(selections_schema())?;
+    let updated = transaction.execute(
+        "UPDATE catalog_meta SET schema_version=7 WHERE id=1 AND schema_version=6",
+        [],
+    )?;
+    if updated != 1 {
+        bail!("Rekesz catalog metadata changed during v7 migration");
+    }
+    transaction.pragma_update(None, "user_version", 7)?;
     ensure_foreign_keys_valid(&transaction)?;
     transaction.commit()?;
     Ok(())

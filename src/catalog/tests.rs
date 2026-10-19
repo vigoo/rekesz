@@ -4104,7 +4104,7 @@ fn v4_people_summary_migration_failure_rolls_back_and_retries_cleanly() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        6
+        7
     );
     let state: (i64, i64, String) = connection
         .query_row(
@@ -4476,7 +4476,7 @@ fn people_diagnostics_are_aggregate_and_failed_jobs_are_retryable() {
         .unwrap();
     drop(connection);
     let diagnostics = people::diagnostics(root.path()).unwrap();
-    assert_eq!(diagnostics.schema_version, 6);
+    assert_eq!(diagnostics.schema_version, 7);
     assert_eq!(diagnostics.detector_model_id, "detector-test");
     assert_eq!(diagnostics.recognizer_model_id, "recognizer-test");
     assert_eq!(diagnostics.analysis_errors, 1);
@@ -5084,7 +5084,7 @@ fn v3_recognition_migration_rolls_back_all_columns_on_failure() {
         restored
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        6
+        7
     );
     assert_eq!(
         restored
@@ -5141,7 +5141,7 @@ fn v1_catalog_migrates_to_current_with_path_backup_and_ann_schema() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        6
+        7
     );
     assert_eq!(
         connection
@@ -5307,7 +5307,7 @@ fn v2_catalog_migrates_to_v3_with_paths_and_effective_views() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        6
+        7
     );
     assert_eq!(
         connection
@@ -5652,7 +5652,7 @@ fn v5_identity_migration_returns_analysis_to_pending_and_discards_derived_vector
             },
         )
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     assert_eq!(
         (status.as_str(), attempts, fingerprint, embeddings),
         ("pending", 0, Some(Vec::new()), 0)
@@ -6358,4 +6358,533 @@ fn stable_identity_retries_a_file_mutated_during_chunked_hashing() {
         "identity reader must retry after mid-hash mutation"
     );
     assert_eq!(observed, stable);
+}
+
+#[test]
+fn v6_catalog_migrates_to_v7_with_backup_and_selections_tables() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join(CATALOG_DIR);
+    fs::create_dir(&directory).unwrap();
+    let path = directory.join(CATALOG_FILE);
+    let mut connection = Connection::open(&path).unwrap();
+    initialize_schema(&mut connection).unwrap();
+    connection
+        .execute(
+            "INSERT INTO assets(id, relative_path, scope_key) VALUES(901, ?1, ?2)",
+            params![
+                encode_relative_path(Path::new("legacy/photo.jpg")).unwrap(),
+                scope_key(Path::new("legacy/photo.jpg")).unwrap()
+            ],
+        )
+        .unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             DROP TABLE album_selection_members;
+             DROP TABLE album_selections;
+             UPDATE catalog_meta SET schema_version=6 WHERE id=1;
+             PRAGMA user_version=6;
+             PRAGMA foreign_keys=ON;",
+        )
+        .unwrap();
+
+    initialize_schema(&mut connection).unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        7
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT schema_version FROM catalog_meta WHERE id=1",
+                [],
+                |row| { row.get::<_, i64>(0) }
+            )
+            .unwrap(),
+        7
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM assets", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    for table in ["album_selections", "album_selection_members"] {
+        let present: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(present, "migration did not create {table}");
+    }
+    assert!(
+        connection
+            .query_row("PRAGMA foreign_key_check", [], |row| row
+                .get::<_, Option<String>>(0))
+            .optional()
+            .unwrap()
+            .is_none()
+    );
+
+    let backup = fs::read_dir(&directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name().is_some_and(|name| {
+                name.to_string_lossy()
+                    .starts_with(&format!("{CATALOG_FILE}.pre-v6-"))
+                    && name.to_string_lossy().ends_with("-backup.sqlite3")
+            })
+        })
+        .expect("v7 migration leaves a pre-migration backup");
+    let backup = Connection::open_with_flags(
+        backup,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .unwrap();
+    assert_eq!(
+        backup
+            .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+            .unwrap(),
+        "ok"
+    );
+    assert_eq!(
+        backup
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        6
+    );
+    assert_eq!(
+        backup
+            .query_row(
+                "SELECT schema_version FROM catalog_meta WHERE id=1",
+                [],
+                |row| { row.get::<_, i64>(0) }
+            )
+            .unwrap(),
+        6
+    );
+    assert_eq!(
+        backup
+            .query_row("SELECT relative_path FROM assets WHERE id=901", [], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })
+            .unwrap(),
+        encode_relative_path(Path::new("legacy/photo.jpg")).unwrap()
+    );
+    let backup_selections_table: bool = backup
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='album_selections')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!backup_selections_table, "backup preserves the v6 shape");
+}
+
+#[test]
+fn album_selections_round_trip_root_album_and_dangling_members() {
+    let root = tempfile::tempdir().unwrap();
+    initialize_test_catalog(root.path()).unwrap();
+    let trip = root.path().join("2024/Trip");
+    let created_at = "2026-10-17T10:00:00Z";
+    let keepers = selections::AlbumSelection {
+        name: "Keepers".to_string(),
+        // None of these files exist on disk; load must return them raw.
+        members: vec![trip.join("a.jpg"), root.path().join("loose.jpg")],
+        created_at: created_at.to_string(),
+    };
+    let maybe = selections::AlbumSelection {
+        name: "Maybe".to_string(),
+        members: Vec::new(),
+        created_at: created_at.to_string(),
+    };
+    // An earlier creation timestamp must sort first on load (toolbar order),
+    // and a non-ASCII name must round-trip.
+    let older = selections::AlbumSelection {
+        name: "Év_retro".to_string(),
+        members: vec![trip.join("old.jpg")],
+        created_at: "2026-10-16T08:00:00Z".to_string(),
+    };
+    selections::save_album_selections(
+        root.path(),
+        &trip,
+        &[keepers.clone(), maybe.clone(), older.clone()],
+    )
+    .unwrap();
+    let root_selection = selections::AlbumSelection {
+        name: "Root picks".to_string(),
+        members: vec![root.path().join("loose.jpg")],
+        created_at: created_at.to_string(),
+    };
+    selections::save_album_selections(
+        root.path(),
+        root.path(),
+        std::slice::from_ref(&root_selection),
+    )
+    .unwrap();
+
+    let loaded = selections::load_album_selections(root.path()).unwrap();
+    assert_eq!(loaded.len(), 2);
+    assert_eq!(loaded.get(&trip).unwrap(), &[older, keepers, maybe]);
+    assert_eq!(loaded.get(root.path()).unwrap(), &[root_selection]);
+
+    // The root album is keyed by the empty portable relative path.
+    let connection = Connection::open(catalog_path(root.path())).unwrap();
+    let root_key: Vec<u8> = connection
+        .query_row(
+            "SELECT directory_relative_path FROM album_selections WHERE name='Root picks'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(root_key, b"p[]");
+}
+
+#[test]
+fn album_selections_snapshot_replace_updates_and_removes_members_explicitly() {
+    let root = tempfile::tempdir().unwrap();
+    initialize_test_catalog(root.path()).unwrap();
+    // Rebuild the members table WITHOUT its foreign key: if the save relied
+    // on ON DELETE CASCADE (a per-connection pragma) instead of its explicit
+    // member DELETE, the member rows below would survive and fail the counts.
+    {
+        let connection = Connection::open(catalog_path(root.path())).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys=OFF;
+                 DROP TABLE album_selection_members;
+                 CREATE TABLE album_selection_members(
+                     selection_id INTEGER NOT NULL,
+                     asset_relative_path BLOB NOT NULL,
+                     added_at TEXT NOT NULL,
+                     PRIMARY KEY(selection_id, asset_relative_path)
+                 );
+                 PRAGMA foreign_keys=ON;",
+            )
+            .unwrap();
+    }
+    let trip = root.path().join("2024/Trip");
+    let selection = |name: &str, members: &[&str]| selections::AlbumSelection {
+        name: name.to_string(),
+        members: members.iter().map(|file| trip.join(file)).collect(),
+        created_at: "2026-10-17T10:00:00Z".to_string(),
+    };
+
+    selections::save_album_selections(
+        root.path(),
+        &trip,
+        &[
+            selection("Keepers", &["a.jpg", "b.jpg"]),
+            selection("Maybe", &["m.jpg"]),
+        ],
+    )
+    .unwrap();
+    // Removing one selection while a sibling survives must remove exactly its
+    // member rows.
+    selections::save_album_selections(
+        root.path(),
+        &trip,
+        &[selection("Keepers", &["b.jpg", "c.jpg"])],
+    )
+    .unwrap();
+    let loaded = selections::load_album_selections(root.path()).unwrap();
+    let trip_selections = loaded.get(&trip).unwrap();
+    assert_eq!(trip_selections.len(), 1);
+    assert_eq!(trip_selections[0].name, "Keepers");
+    assert_eq!(
+        trip_selections[0].members,
+        vec![trip.join("b.jpg"), trip.join("c.jpg")]
+    );
+
+    selections::save_album_selections(root.path(), &trip, &[]).unwrap();
+    let loaded = selections::load_album_selections(root.path()).unwrap();
+    assert!(!loaded.contains_key(&trip));
+    let connection = Connection::open(catalog_path(root.path())).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM album_selections", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM album_selection_members", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0,
+        "member rows must be deleted explicitly with their selection"
+    );
+}
+
+#[test]
+fn album_selections_reject_invalid_and_duplicate_names() {
+    let root = tempfile::tempdir().unwrap();
+    initialize_test_catalog(root.path()).unwrap();
+    let trip = root.path().join("2024/Trip");
+    let named = |name: &str| selections::AlbumSelection {
+        name: name.to_string(),
+        members: Vec::new(),
+        created_at: "2026-10-17T10:00:00Z".to_string(),
+    };
+    for invalid in ["", " padded", "tab\t"] {
+        assert!(
+            selections::save_album_selections(root.path(), &trip, &[named(invalid)]).is_err(),
+            "invalid name {invalid:?} must be rejected"
+        );
+    }
+    let long = "a".repeat(65);
+    assert!(
+        selections::save_album_selections(root.path(), &trip, &[named(&long)]).is_err(),
+        "names over 64 characters must be rejected"
+    );
+    assert!(
+        selections::save_album_selections(root.path(), &trip, &[named("A"), named("A")]).is_err(),
+        "duplicate names must be rejected"
+    );
+    // Character-count semantics: 33 é characters are 66 bytes but 33 chars.
+    let multibyte = "é".repeat(33);
+    selections::save_album_selections(root.path(), &trip, &[named(&multibyte)]).unwrap();
+    let multibyte_long = "é".repeat(65);
+    assert!(
+        selections::save_album_selections(root.path(), &trip, &[named(&multibyte_long)]).is_err(),
+        "65 multibyte characters must be rejected"
+    );
+    let boundary = "a".repeat(64);
+    selections::save_album_selections(root.path(), &trip, &[named(&boundary)]).unwrap();
+
+    // The UNIQUE constraint remains as the database-level backstop.
+    let connection = Connection::open(catalog_path(root.path())).unwrap();
+    let directory = encode_relative_path(Path::new("2024/Trip")).expect("test path is portable");
+    assert!(
+        connection
+            .execute(
+                "INSERT INTO album_selections(directory_relative_path, name, created_at) \
+                 VALUES (?1, ?2, datetime('now'))",
+                params![&directory, boundary.as_str()],
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn album_selections_save_fails_under_contention_and_a_later_save_succeeds() {
+    let root = tempfile::tempdir().unwrap();
+    initialize_test_catalog(root.path()).unwrap();
+    let trip = root.path().join("2024/Trip");
+    let selection = selections::AlbumSelection {
+        name: "Keepers".to_string(),
+        members: vec![trip.join("a.jpg")],
+        created_at: "2026-10-17T10:00:00Z".to_string(),
+    };
+    selections::save_album_selections(root.path(), &trip, std::slice::from_ref(&selection))
+        .unwrap();
+
+    // The contended attempt targets a DIFFERENT snapshot, so the test can tell
+    // "failed cleanly" apart from "skipped as a no-op".
+    let contended = selections::AlbumSelection {
+        members: vec![trip.join("a.jpg"), trip.join("b.jpg")],
+        ..selection.clone()
+    };
+    let locker = Connection::open(catalog_path(root.path())).unwrap();
+    locker
+        .execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE lock_probe(value TEXT);
+             INSERT INTO lock_probe VALUES('held');",
+        )
+        .unwrap();
+    let busy = selections::save_album_selections_with_busy_timeout(
+        root.path(),
+        &trip,
+        std::slice::from_ref(&contended),
+        Duration::from_millis(100),
+    );
+    assert!(busy.is_err(), "a contended save must fail, not hang");
+    locker.execute_batch("COMMIT").unwrap();
+
+    // The failed save committed nothing: the disk still holds the old snapshot.
+    let loaded = selections::load_album_selections(root.path()).unwrap();
+    assert_eq!(loaded.get(&trip).unwrap(), std::slice::from_ref(&selection));
+    // The retry lands the new snapshot.
+    selections::save_album_selections(root.path(), &trip, std::slice::from_ref(&contended))
+        .unwrap();
+    let loaded = selections::load_album_selections(root.path()).unwrap();
+    assert_eq!(loaded.get(&trip).unwrap(), std::slice::from_ref(&contended));
+}
+
+#[test]
+fn album_selections_load_fails_loudly_on_undecodable_member_path() {
+    let root = tempfile::tempdir().unwrap();
+    initialize_test_catalog(root.path()).unwrap();
+    let trip = root.path().join("2024/Trip");
+    selections::save_album_selections(
+        root.path(),
+        &trip,
+        &[selections::AlbumSelection {
+            name: "Keepers".to_string(),
+            members: vec![trip.join("a.jpg")],
+            created_at: "2026-10-17T10:00:00Z".to_string(),
+        }],
+    )
+    .unwrap();
+    let connection = Connection::open(catalog_path(root.path())).unwrap();
+    connection
+        .execute(
+            "UPDATE album_selection_members SET asset_relative_path=X'7861'",
+            [],
+        )
+        .unwrap();
+    let failure = selections::load_album_selections(root.path()).unwrap_err();
+    assert!(format!("{failure:#}").contains("cannot decode member"));
+}
+
+#[test]
+fn album_selections_saving_one_directory_leaves_other_rows_untouched() {
+    let root = tempfile::tempdir().unwrap();
+    initialize_test_catalog(root.path()).unwrap();
+    let album_a = root.path().join("2024/A");
+    let album_b = root.path().join("2024/B");
+    let selection = |name: &str, member: &str, directory: &Path| selections::AlbumSelection {
+        name: name.to_string(),
+        members: vec![directory.join(member)],
+        created_at: "2026-10-17T10:00:00Z".to_string(),
+    };
+    selections::save_album_selections(
+        root.path(),
+        &album_a,
+        &[selection("Keepers", "a.jpg", &album_a)],
+    )
+    .unwrap();
+
+    let encoded_a = encode_relative_path(Path::new("2024/A")).unwrap();
+    let album_a_rows = |root: &Path| {
+        let connection = Connection::open(catalog_path(root)).unwrap();
+        let mut query = connection
+            .prepare(
+                "SELECT s.directory_relative_path, s.name, s.created_at, m.asset_relative_path
+                 FROM album_selections s
+                 JOIN album_selection_members m ON m.selection_id = s.id
+                 WHERE s.directory_relative_path = ?1
+                 ORDER BY s.id, m.asset_relative_path",
+            )
+            .unwrap();
+        query
+            .query_map([&encoded_a], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    let before = album_a_rows(root.path());
+    assert_eq!(before.len(), 1);
+
+    selections::save_album_selections(
+        root.path(),
+        &album_b,
+        &[selection("Keepers", "b.jpg", &album_b)],
+    )
+    .unwrap();
+    let after = album_a_rows(root.path());
+    assert_eq!(before, after, "album A rows must be byte-identical");
+
+    let loaded = selections::load_album_selections(root.path()).unwrap();
+    assert_eq!(loaded.len(), 2);
+    assert_eq!(
+        loaded.get(&album_a).unwrap()[0].members,
+        vec![album_a.join("a.jpg")]
+    );
+    assert_eq!(
+        loaded.get(&album_b).unwrap()[0].members,
+        vec![album_b.join("b.jpg")]
+    );
+}
+
+#[test]
+fn fresh_catalog_creates_the_selections_schema_at_v7() {
+    let root = tempfile::tempdir().unwrap();
+    initialize_test_catalog(root.path()).unwrap();
+    let connection = Connection::open(catalog_path(root.path())).unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        7
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT schema_version FROM catalog_meta WHERE id=1",
+                [],
+                |row| { row.get::<_, i64>(0) }
+            )
+            .unwrap(),
+        7
+    );
+    for table in ["album_selections", "album_selection_members"] {
+        let present: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(present, "fresh catalog must create {table}");
+    }
+}
+
+#[test]
+fn v7_migration_rejects_disagreeing_version_markers_without_changes() {
+    let root = tempfile::tempdir().unwrap();
+    initialize_test_catalog(root.path()).unwrap();
+    let mut connection = Connection::open(catalog_path(root.path())).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA user_version=6;
+             UPDATE catalog_meta SET schema_version=5 WHERE id=1;",
+        )
+        .unwrap();
+
+    let failure = initialize_schema(&mut connection).unwrap_err();
+    assert!(format!("{failure:#}").contains("markers disagree"));
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        6
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT schema_version FROM catalog_meta WHERE id=1",
+                [],
+                |row| { row.get::<_, i64>(0) }
+            )
+            .unwrap(),
+        5
+    );
+    let selections_table: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='album_selections')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        selections_table,
+        "the rejected attempt must not change the schema"
+    );
 }
