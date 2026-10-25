@@ -101,10 +101,21 @@ fn decode_scaled_jpeg(
     if let Some(orientation) = orientation {
         image.apply_orientation(orientation);
     }
+    // source_dimensions is in display space everywhere else, so transpose the
+    // sensor dimensions for orientations that rotate by ±90°.
+    let source_dimensions = match orientation {
+        Some(
+            image::metadata::Orientation::Rotate90FlipH
+            | image::metadata::Orientation::Rotate90
+            | image::metadata::Orientation::Rotate270FlipH
+            | image::metadata::Orientation::Rotate270,
+        ) => (u32::from(original.height), u32::from(original.width)),
+        _ => (u32::from(original.width), u32::from(original.height)),
+    };
     Ok(DecodedSource {
         image,
         raw_linear: None,
-        source_dimensions: (original.width.into(), original.height.into()),
+        source_dimensions,
         source_pipeline: SourcePipeline::Standard,
         photographic: None,
         orientation_applied: orientation.map(image::metadata::Orientation::to_exif),

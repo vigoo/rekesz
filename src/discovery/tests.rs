@@ -409,3 +409,33 @@ fn cancelled_library_inventory_is_an_error_not_a_destructive_partial_snapshot() 
     .unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
 }
+
+#[test]
+fn capture_time_prefers_exif_time_and_falls_back_to_file_time() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("photo.jpg"), b"jpeg").unwrap();
+    let mut model = DirectoryModel::new(root.path().to_path_buf());
+    let id = model.ensure_node(root.path().to_path_buf());
+    let (request, _) = model.begin_load(id).unwrap();
+    let scan = scan_directory(root.path(), RawJpegPreference::Raw).unwrap();
+    assert!(model.finish_load(id, request, Ok(scan)));
+
+    let path = root.path().join("photo.jpg");
+    let capture = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let fallback = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    let entry = |capture_time: Option<SystemTime>| ImageOrderingMetadata {
+        path: path.clone(),
+        capture_time,
+        fallback_time: Some(fallback),
+        coordinate: None,
+    };
+    model.apply_cached_metadata(id, vec![entry(Some(capture))], vec![]);
+    assert_eq!(model.capture_time(id, &path), Some(capture));
+
+    model.apply_cached_metadata(id, vec![entry(None)], vec![]);
+    assert_eq!(model.capture_time(id, &path), Some(fallback));
+    assert_eq!(
+        model.capture_time(id, &root.path().join("absent.jpg")),
+        None
+    );
+}

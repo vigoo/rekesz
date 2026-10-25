@@ -204,6 +204,7 @@ pub struct AppliedPhotographicTransform {
 pub struct RenderMetadata {
     pub source_pipeline: SourcePipeline,
     pub photographic: Option<AppliedPhotographicTransform>,
+    /// Display-space (orientation-applied) dimensions of the decoded source.
     pub source_dimensions: (u32, u32),
     pub output_dimensions: (u32, u32),
     pub variant: RenderVariant,
@@ -214,6 +215,36 @@ pub struct RenderMetadata {
     #[serde(default)]
     pub face_transform: Option<FaceTransform>,
     pub develop: Option<DevelopRenderMetadata>,
+}
+
+impl RenderMetadata {
+    /// Source dimensions with the orientation applied, for display. Decoders
+    /// record these directly. Disk-cache entries written before the scaled-JPEG
+    /// decoder was corrected still carry pre-rotation sensor dimensions; their
+    /// output aspect ratio — which undeveloped resize variants preserve —
+    /// exposes the swap. Developed renders never went through the scaled
+    /// decoder and may legitimately change the aspect ratio (recipes crop), so
+    /// they are never reconciled.
+    pub fn display_source_dimensions(&self) -> (u32, u32) {
+        let (width, height) = self.source_dimensions;
+        let transposed = matches!(self.orientation_applied, Some(5..=8));
+        let resize_variant = matches!(
+            self.variant,
+            RenderVariant::Thumbnail { .. } | RenderVariant::Preview { .. }
+        );
+        let (output_width, output_height) = self.output_dimensions;
+        let source_aspect = f64::from(width) / f64::from(height.max(1));
+        let output_aspect = f64::from(output_width) / f64::from(output_height.max(1));
+        let swapped = transposed
+            && resize_variant
+            && self.develop.is_none()
+            && (source_aspect - output_aspect).abs() / source_aspect.max(output_aspect) > 0.05;
+        if swapped {
+            (height, width)
+        } else {
+            (width, height)
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -7663,3 +7663,31 @@ fn import_double_click_opens_viewer_and_round_trips(cx: &mut gpui::TestAppContex
         assert_eq!(view.import_view.photos.len(), 2);
     });
 }
+
+#[test]
+fn tooltip_resolution_includes_megapixels() {
+    assert_eq!(
+        format_tooltip_resolution((6720, 4480)),
+        "6720 × 4480 (30.1 MP)"
+    );
+    assert_eq!(
+        format_tooltip_resolution((1920, 1080)),
+        "1920 × 1080 (2.1 MP)"
+    );
+}
+
+#[test]
+fn tooltip_format_uses_uppercase_extension_and_skips_empty_names() {
+    assert_eq!(
+        format_tooltip_format(Path::new("IMG_0052.cr3")),
+        Some("CR3".to_owned())
+    );
+    assert_eq!(format_tooltip_format(Path::new("image")), None);
+    assert_eq!(format_tooltip_format(Path::new("image.")), None);
+}
+
+#[test]
+fn tooltip_capture_time_is_formatted_to_the_minute() {
+    let formatted = format_tooltip_capture_time(std::time::SystemTime::UNIX_EPOCH);
+    assert!(chrono::NaiveDateTime::parse_from_str(&formatted, "%Y-%m-%d %H:%M").is_ok());
+}

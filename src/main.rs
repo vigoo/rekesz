@@ -1321,6 +1321,22 @@ fn path_display_name(path: &std::path::Path) -> String {
         .into_owned()
 }
 
+fn format_tooltip_resolution(dimensions: (u32, u32)) -> String {
+    let megapixels = f64::from(dimensions.0) * f64::from(dimensions.1) / 1_000_000.0;
+    format!("{} × {} ({:.1} MP)", dimensions.0, dimensions.1, megapixels)
+}
+
+fn format_tooltip_capture_time(time: std::time::SystemTime) -> String {
+    chrono::DateTime::<chrono::Local>::from(time)
+        .format("%Y-%m-%d %H:%M")
+        .to_string()
+}
+
+fn format_tooltip_format(path: &Path) -> Option<String> {
+    let extension = path.extension()?.to_str()?;
+    (!extension.is_empty()).then(|| extension.to_uppercase())
+}
+
 fn map_screen_position(
     coordinate: metadata::GeoCoordinate,
     camera: map::Camera,
@@ -1751,6 +1767,7 @@ enum RecursiveGridStatus {
 struct RecursiveImages {
     paths: Vec<PathBuf>,
     coordinates: HashMap<PathBuf, metadata::GeoCoordinate>,
+    capture_times: HashMap<PathBuf, std::time::SystemTime>,
     companions: HashMap<PathBuf, PathBuf>,
 }
 
@@ -1759,6 +1776,49 @@ struct PathContextMenu {
     position: (f32, f32),
     exportable: bool,
     directory: Option<NodeId>,
+}
+
+/// Hover tooltip for main-grid thumbnails: the fields that cannot be read off
+/// the tile itself at a glance.
+#[derive(Clone)]
+struct ThumbnailTooltip {
+    filename: SharedString,
+    resolution: Option<String>,
+    capture_time: Option<String>,
+    format: Option<String>,
+    developed: bool,
+}
+
+impl Render for ThumbnailTooltip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        fn detail_line(text: String) -> AnyElement {
+            div()
+                .text_color(rgb(0xaeb4bf))
+                .child(text)
+                .into_any_element()
+        }
+        div()
+            .max_w(px(280.0))
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .p_2()
+            .rounded_sm()
+            .bg(rgb(0x252932))
+            .border_1()
+            .border_color(rgb(0x414754))
+            .text_xs()
+            .text_color(rgb(0xd8dde7))
+            .child(self.filename.clone())
+            .children(self.resolution.clone().map(detail_line))
+            .children(self.capture_time.clone().map(detail_line))
+            .children(self.format.clone().map(detail_line))
+            .child(detail_line(if self.developed {
+                "Developed".to_owned()
+            } else {
+                "Not developed".to_owned()
+            }))
+    }
 }
 
 fn merge_grid_demand(slot: &mut Option<PendingGridDemand>, next: PendingGridDemand) {
@@ -3357,6 +3417,23 @@ impl PictureBrowser {
         self.model
             .loaded(self.selected)
             .map_or(&[], |contents| contents.images.as_slice())
+    }
+
+    /// Capture time for a path currently shown in the grid, mirroring the
+    /// source precedence of `selected_images`. The recursive grid keeps its
+    /// own times because its subdirectories are not loaded model nodes.
+    fn capture_time_for(&self, path: &Path) -> Option<std::time::SystemTime> {
+        if let Some(RecursiveGridState {
+            root,
+            status: RecursiveGridStatus::Loaded(images),
+            ..
+        }) = &self.recursive_grid
+            && *root == self.selected
+            && let Some(time) = images.capture_times.get(path)
+        {
+            return Some(*time);
+        }
+        self.model.capture_time(self.selected, path)
     }
 
     fn selected_coordinates(&self) -> Vec<metadata::GeoCoordinate> {
@@ -7356,6 +7433,23 @@ impl PictureBrowser {
                         .into_owned()
                         .into();
                     let has_develop_data = has_develop_recipe(self.recipes.as_deref(), &path);
+                    // Render metadata is recorded under the demand path, which
+                    // is the thumbnail display path (the JPEG companion for a
+                    // RAW pair), not the grid's original path.
+                    let display_dimensions = self
+                        .model
+                        .image_metadata(&display)
+                        .and_then(|metadata| metadata.renders.values().next())
+                        .map(rendering::RenderMetadata::display_source_dimensions);
+                    let tooltip = ThumbnailTooltip {
+                        filename: name.clone(),
+                        resolution: display_dimensions.map(format_tooltip_resolution),
+                        capture_time: self
+                            .capture_time_for(&path)
+                            .map(format_tooltip_capture_time),
+                        format: format_tooltip_format(&path),
+                        developed: has_develop_data,
+                    };
                     let open_path = path.clone();
                     let context_path = path.clone();
                     row_element = row_element.child(
@@ -7376,6 +7470,7 @@ impl PictureBrowser {
                                     .border_color(rgb(0x6f9ddd))
                             })
                             .hover(|this| this.bg(rgb(0x292d36)))
+                            .tooltip(move |_, cx| cx.new(|_| tooltip.clone()).into())
                             .child(
                                 div()
                                     .w_full()
@@ -11156,9 +11251,19 @@ fn collect_recursive_images(
                 .map(|coordinate| (entry.path.clone(), coordinate))
         })
         .collect();
+    let capture_times = metadata
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .capture_time
+                .or(entry.fallback_time)
+                .map(|time| (entry.path.clone(), time))
+        })
+        .collect();
     Ok(RecursiveImages {
         paths: metadata.into_iter().map(|entry| entry.path).collect(),
         coordinates,
+        capture_times,
         companions,
     })
 }

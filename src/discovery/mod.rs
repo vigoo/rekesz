@@ -270,9 +270,17 @@ impl DirectoryModel {
             .insert(metadata.variant, metadata);
     }
 
-    #[allow(dead_code)]
     pub fn image_metadata(&self, path: &Path) -> Option<&ImageMetadata> {
         self.image_metadata.get(path)
+    }
+
+    /// Best known capture instant for an image: the EXIF capture time, or the
+    /// file fallback time when no embedded time exists.
+    pub fn capture_time(&self, id: NodeId, path: &Path) -> Option<std::time::SystemTime> {
+        self.loaded(id)?
+            .ordering_metadata
+            .get(path)
+            .and_then(|metadata| metadata.capture_time.or(metadata.fallback_time))
     }
 
     pub fn finish_load(

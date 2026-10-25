@@ -172,3 +172,77 @@ fn rotated_heif_reports_the_transform_applied_by_libheif() {
         "canonical left region should remain red"
     );
 }
+
+fn exif_orientation_tiff(orientation: u16) -> Vec<u8> {
+    fn short(value: u16, output: &mut Vec<u8>) {
+        output.extend_from_slice(&value.to_le_bytes());
+    }
+    fn long(value: u32, output: &mut Vec<u8>) {
+        output.extend_from_slice(&value.to_le_bytes());
+    }
+    let mut bytes = b"II".to_vec();
+    short(42, &mut bytes);
+    long(8, &mut bytes);
+    short(1, &mut bytes);
+    short(0x0112, &mut bytes);
+    short(3, &mut bytes);
+    long(1, &mut bytes);
+    short(orientation, &mut bytes);
+    short(0, &mut bytes);
+    long(0, &mut bytes);
+    bytes
+}
+
+fn jpeg_with_exif(mut jpeg: Vec<u8>, tiff: &[u8]) -> Vec<u8> {
+    let app1_length = u16::try_from(2 + 6 + tiff.len()).unwrap();
+    let mut segment = vec![0xff, 0xe1];
+    segment.extend_from_slice(&app1_length.to_be_bytes());
+    segment.extend_from_slice(b"Exif\0\0");
+    segment.extend_from_slice(tiff);
+    jpeg.splice(2..2, segment);
+    jpeg
+}
+
+#[test]
+fn rotated_jpeg_thumbnails_report_oriented_source_dimensions() {
+    // EXIF orientations 5-8 all transpose the sensor dimensions; 1 does not.
+    for orientation in [1u8, 5, 6, 7, 8] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rotated.jpg");
+        DynamicImage::ImageRgb8(ImageBuffer::from_pixel(800, 600, Rgb([1, 2, 3])))
+            .save(&path)
+            .unwrap();
+        let plain = std::fs::read(&path).unwrap();
+        std::fs::write(
+            &path,
+            jpeg_with_exif(plain, &exif_orientation_tiff(u16::from(orientation))),
+        )
+        .unwrap();
+        let plan = super::super::plan::RenderPlan::compile(
+            path,
+            RenderVariant::Thumbnail { width: 100 },
+            super::super::RenderIdentity::default(),
+            None,
+        )
+        .unwrap();
+        let decoded = decode(&plan, &Arc::new(AtomicBool::new(false))).unwrap();
+
+        let transposed = matches!(orientation, 5..=8);
+        let expected = if transposed { (600, 800) } else { (800, 600) };
+        assert_eq!(
+            decoded.orientation_applied,
+            Some(orientation),
+            "{orientation}"
+        );
+        assert_eq!(decoded.source_dimensions, expected, "{orientation}");
+        // The buffer is reduced to the thumbnail box before the orientation is
+        // applied: 800×600 scales to 100×75, a transposing rotation makes it
+        // 75×100.
+        let expected_buffer = if transposed { (75, 100) } else { (100, 75) };
+        assert_eq!(
+            (decoded.image.width(), decoded.image.height()),
+            expected_buffer,
+            "{orientation}"
+        );
+    }
+}

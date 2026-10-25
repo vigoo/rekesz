@@ -255,3 +255,69 @@ fn default_render_identity_carries_the_renderer_model_version() {
     assert_eq!(identity.mode, RenderMode::Baseline);
     assert_eq!(identity.recipe_digest, [0; 32]);
 }
+
+#[test]
+fn display_source_dimensions_reconciles_legacy_rotated_cache_entries() {
+    fn metadata(
+        variant: RenderVariant,
+        orientation_applied: Option<u8>,
+        source: (u32, u32),
+        output: (u32, u32),
+    ) -> RenderMetadata {
+        RenderMetadata {
+            source_pipeline: SourcePipeline::Standard,
+            photographic: None,
+            source_dimensions: source,
+            output_dimensions: output,
+            variant,
+            orientation_applied,
+            face_transform: None,
+            develop: None,
+        }
+    }
+    let preview = RenderVariant::Preview {
+        max_width: 1920,
+        max_height: 1080,
+    };
+    // Legacy scaled-JPEG entries recorded pre-rotation sensor dimensions.
+    let legacy = metadata(preview, Some(6), (4032, 3024), (1512, 2016));
+    assert_eq!(legacy.display_source_dimensions(), (3024, 4032));
+    // Current decoders record oriented dimensions directly.
+    let current = metadata(
+        RenderVariant::Thumbnail { width: 300 },
+        Some(6),
+        (3024, 4032),
+        (300, 400),
+    );
+    assert_eq!(current.display_source_dimensions(), (3024, 4032));
+    // Without a transposing orientation nothing is ever swapped.
+    let landscape = metadata(preview, None, (4032, 3024), (2016, 1512));
+    assert_eq!(landscape.display_source_dimensions(), (4032, 3024));
+    // Crops legitimately change the aspect ratio and must not be reconciled.
+    let cropped = metadata(
+        RenderVariant::FaceCrop {
+            face_id: 1,
+            face_revision: 1,
+            left_millionths: 0,
+            top_millionths: 0,
+            right_millionths: 500_000,
+            bottom_millionths: 1_000_000,
+            width: 512,
+            padding_percent: 0,
+        },
+        Some(6),
+        (4032, 3024),
+        (512, 512),
+    );
+    assert_eq!(cropped.display_source_dimensions(), (4032, 3024));
+    // Developed renders never went through the scaled decoder and recipes may
+    // crop, so their aspect deviation must not trigger a swap.
+    let mut developed = metadata(preview, Some(6), (3024, 4032), (1512, 1512));
+    developed.develop = Some(DevelopRenderMetadata {
+        identity: RenderIdentity::default(),
+        recipe: DevelopRecipe::default(),
+        applied_actions: 0,
+        fidelity_warnings: 0,
+    });
+    assert_eq!(developed.display_source_dimensions(), (3024, 4032));
+}
