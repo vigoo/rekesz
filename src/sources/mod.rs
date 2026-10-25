@@ -8,6 +8,7 @@ use std::sync::atomic::AtomicBool;
 
 pub mod mtp;
 pub mod ptp;
+pub mod scanner;
 pub mod volumes;
 
 /// Stable identifier for a source across refreshes.
@@ -18,6 +19,11 @@ impl SourceId {
     pub(crate) fn new(id: impl Into<Arc<str>>) -> Self {
         Self(id.into())
     }
+
+    /// The identifier's string form (`scanner:<uuid>`, `folder:<path>`, …).
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -26,6 +32,9 @@ pub enum SourceKind {
     Volume { removable: bool },
     /// A connected media device (phone, camera) accessed over MTP.
     Device { vendor: String, model: String },
+    /// A network scanner discovered over eSCL (AirScan / Mopria Scan). The
+    /// backing is the scanner's per-session scan output directory.
+    Scanner { vendor: String, model: String },
     /// An arbitrary directory chosen by the user.
     Folder,
 }
@@ -273,14 +282,15 @@ impl SourceRegistry {
     }
 
     /// Volumes and devices come first (removable volumes before fixed ones),
-    /// then user folders. This performs filesystem and device enumeration and
-    /// must not be called on the UI thread.
-    pub fn refresh(&self, folders: &[PathBuf]) -> Vec<SourceEntry> {
+    /// then discovered scanners, then user folders. This performs filesystem
+    /// and device enumeration and must not be called on the UI thread.
+    pub fn refresh(&self, folders: &[PathBuf], cache_root: &Path) -> Vec<SourceEntry> {
         let raw_volumes = volumes::VolumeProvider::raw_volumes();
         let mut entries = volumes::VolumeProvider::entries_from(&raw_volumes);
         entries.extend(mtp::DeviceProvider.collect());
         entries.extend(ptp::DeviceProvider.collect());
-        let entries = dedup_device_entries(entries);
+        let mut entries = dedup_device_entries(entries);
+        entries.extend(scanner::ScannerProvider.collect(cache_root));
         merge_folder_entries(entries, folders, &raw_volumes)
     }
 

@@ -1268,6 +1268,7 @@ enum ScrollbarTarget {
     Grid,
     Settings,
     SelectionsMenu,
+    ImportRows,
 }
 
 #[derive(Clone, Copy)]
@@ -3611,6 +3612,15 @@ impl PictureBrowser {
         } else {
             self.scheduler.clear_scope(IMPORT_SCOPE);
             self.import_view.report = None;
+            // Leaving Import through the view switcher must stop device
+            // work the same way `exit_import_view` does — a running scanner
+            // job in particular would otherwise keep its device session
+            // (and its exclusive eSCL slot) with nobody watching. The copy
+            // job intentionally keeps running; its progress stays in the
+            // global work strip.
+            self.import_view
+                .scan_job_cancel
+                .store(true, Ordering::Release);
         }
         cx.notify();
     }

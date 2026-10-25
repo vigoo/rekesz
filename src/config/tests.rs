@@ -12,6 +12,8 @@ fn persisted_settings_are_loaded_and_cli_values_override_them() {
     let (_temp, dirs) = dirs();
     let path = dirs.config_dir().join("settings.json");
     let stored = AppSettings {
+        import_scan_dpi: 300,
+        import_scan_color: crate::config::ScanColorMode::Rgb,
         root: "/stored".into(),
         image_cache_size: 12,
         pair_preference: PairPreference::Raw,

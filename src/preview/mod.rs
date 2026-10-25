@@ -95,7 +95,7 @@ impl PreviewRenderer {
     }
 }
 
-fn render_image(decoded: &DynamicImage) -> RenderImage {
+pub(crate) fn render_image(decoded: &DynamicImage) -> RenderImage {
     let mut buffer = decoded.to_rgba8();
     for pixel in buffer.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);

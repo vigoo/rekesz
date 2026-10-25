@@ -51,6 +51,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
 tempfile = "3"
+# Driverless eSCL scanner discovery (mDNS) and device-XML parsing.
+# Exactly pinned: the discovery daemon API and the event-reader API are
+# hand-matched to these releases (see src/sources/scanner/).
+mdns-sd = "=0.21.6"
+quick-xml = "=0.42.0"
 
 # Face-model inference uses the CUDA execution provider where the bundled
 # ONNX Runtime binaries ship one (x86_64 Linux and Windows). Other targets,
@@ -111,6 +116,12 @@ test = false
 [[bin]]
 name = "sface-calibration-embeddings"
 path = "src/bin/sface_calibration_embeddings.rs"
+harness = false
+test = false
+
+[[bin]]
+name = "scanner-probe"
+path = "src/bin/scanner_probe.rs"
 harness = false
 test = false
 

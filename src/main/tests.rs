@@ -301,6 +301,8 @@ fn gpui_test_config(root: &Path, cache: &Path) -> Config {
             image_cache_size: 2,
             pair_preference: config::PairPreference::Raw,
             cache_root: cache.to_path_buf(),
+            import_scan_dpi: 300,
+            import_scan_color: config::ScanColorMode::Rgb,
             job_parallelism: 1,
             raw_parallelism: 1,
             online_map_permission: config::OnlineMapPermission::Disabled,
@@ -4288,6 +4290,9 @@ fn import_view_with_card<'a>(
     gpui::Entity<PictureBrowser>,
     &'a mut gpui::VisualTestContext,
 ) {
+    // Opening the import view refreshes sources, which would start the
+    // mDNS discovery daemon — network access no test may make.
+    crate::sources::scanner::set_daemon_enabled(false);
     let cache = library.parent().unwrap().join("cache");
     let mut config = gpui_test_config(library, &cache);
     config.settings.automatic_face_analysis = false;
@@ -6507,4 +6512,1154 @@ fn gpui_selection_merged_overflow_views_hidden_unions(cx: &mut gpui::TestAppCont
         )),
         (6, 5)
     );
+}
+
+// ---------------------------------------------------------------------------
+// Scanner sources (scanner-support-plan.md, Stage 2)
+// ---------------------------------------------------------------------------
+
+/// Opens the app directly in the import view with a scanner source already
+/// selected — inside the build closure, so the first frame is already in the
+/// scanner state (keeping fresh-window absence assertions sound). Writes
+/// `preexisting_scans` scan JPEGs into the session directory before the
+/// listing loads. `library` is the (separate) library root.
+fn import_view_with_scanner<'a>(
+    cx: &'a mut gpui::TestAppContext,
+    library: &Path,
+    preexisting_scans: usize,
+) -> (
+    gpui::Entity<PictureBrowser>,
+    &'a mut gpui::VisualTestContext,
+    std::path::PathBuf,
+) {
+    crate::sources::scanner::set_daemon_enabled(false);
+    let cache = library.parent().unwrap().join("cache");
+    let session_dir = sources::scanner::session_scan_dir(&cache, "test-scanner");
+    let mut config = gpui_test_config(library, &cache);
+    config.settings.automatic_face_analysis = false;
+    let (view, cx) = cx.add_window_view(|_, cx| {
+        for index in 0..preexisting_scans {
+            std::fs::create_dir_all(&session_dir).unwrap();
+            image::RgbImage::from_pixel(8, 8, image::Rgb([10, 20, 30]))
+                .save(session_dir.join(format!("scan-{index:03}.jpg")))
+                .unwrap();
+        }
+        let mut view = PictureBrowser::new(&config, cx);
+        view.set_directory_view_mode(DirectoryViewMode::Import, cx);
+        let id = sources::SourceId::new("scanner:test-scanner");
+        view.import_view.sources.push(sources::SourceEntry {
+            id: id.clone(),
+            label: "EPSON L3160 Series".to_owned(),
+            kind: sources::SourceKind::Scanner {
+                vendor: "EPSON".to_owned(),
+                model: "L3160 Series".to_owned(),
+            },
+            backing: sources::SourceBacking::Path(session_dir.clone()),
+            capacity: None,
+        });
+        view.select_import_source(id, cx);
+        view
+    });
+    cx.run_until_parked();
+    assert!(view.read_with(&*cx, |view, _| view.import_view.listing_loaded()));
+    (view, cx, session_dir)
+}
+
+#[gpui::test]
+fn import_scanner_source_hides_the_recursive_toggle(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let library = root.path().join("library");
+    std::fs::create_dir(&library).unwrap();
+    let card = write_import_source(root.path(), "card", 0, 1);
+    let (_view, cx) = import_view_with_card(cx, &library, &card);
+    assert!(
+        cx.debug_bounds("#import-recursive").is_some(),
+        "folder sources keep the recursive toggle"
+    );
+
+    // The scanner window is built already selected, so the toggle never
+    // paints there and absence is sound on this fresh window's map.
+    let (_view, cx, _) = import_view_with_scanner(cx, &library, 0);
+    assert!(
+        cx.debug_bounds("#import-recursive").is_none(),
+        "scanner sources must not offer the recursive toggle: toggling it \
+         reloads the listing and would wipe the scan batch"
+    );
+}
+
+#[gpui::test]
+fn import_scanner_append_selects_and_preserves_deselection(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let library = root.path().join("library");
+    std::fs::create_dir(&library).unwrap();
+    let (view, cx, session_dir) = import_view_with_scanner(cx, &library, 2);
+    view.update(&mut *cx, |view, _| {
+        assert_eq!(view.import_view.photos.len(), 2);
+        assert_eq!(
+            view.import_view.selection.len(),
+            2,
+            "both scans preselected"
+        );
+    });
+
+    // The user deliberately deselects the first scan of the batch.
+    let first_key = view.read_with(&*cx, |view, _| view.import_view.photos[0].key());
+    view.update(&mut *cx, |view, cx| {
+        view.import_toggle_photo(&first_key, cx)
+    });
+
+    let (generation, done_before) = view.read_with(&*cx, |view, _| {
+        (
+            view.import_view.directory_pass_generation,
+            view.import_view.directory_pass_done.borrow().clone(),
+        )
+    });
+
+    // A third scan finishes on disk and is appended incrementally.
+    let third = session_dir.join("scan-002.jpg");
+    image::RgbImage::from_pixel(8, 8, image::Rgb([40, 50, 60]))
+        .save(&third)
+        .unwrap();
+    view.update(&mut *cx, |view, cx| view.import_add_scanned_file(third, cx));
+    view.update(&mut *cx, |view, _| {
+        assert_eq!(view.import_view.photos.len(), 3);
+        assert!(
+            view.import_view.selection.contains("scan-002.jpg"),
+            "the appended scan is selected"
+        );
+        assert!(
+            !view.import_view.selection.contains(&first_key),
+            "a deliberate deselection must survive the append"
+        );
+        assert!(view.import_view.selection.contains("scan-001.jpg"));
+        assert_eq!(
+            view.import_view.directory_pass_generation, generation,
+            "the append must not restart the thumbnail pass"
+        );
+        let done = view.import_view.directory_pass_done.borrow();
+        assert!(
+            done.len() >= done_before.len() && done_before.iter().all(|path| done.contains(path)),
+            "the append must not clear the pass's done set"
+        );
+    });
+}
+
+#[gpui::test]
+fn import_scanner_append_keeps_thumbnail_progress_reachable(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let library = root.path().join("library");
+    std::fs::create_dir(&library).unwrap();
+    let (view, cx, session_dir) = import_view_with_scanner(cx, &library, 1);
+    let complete = |view: &PictureBrowser, _: &gpui::App| {
+        let (rendered, total) = view.import_thumbnail_progress_uncached();
+        total == 0 || rendered >= total
+    };
+    // The pre-existing scan's thumbnail finishes (the pass yields on batch
+    // timers, so advance the clock and park repeatedly).
+    let mut done = false;
+    for _ in 0..50 {
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        done = view.read_with(&*cx, complete);
+        if done {
+            break;
+        }
+    }
+    assert!(done, "the first scan's thumbnail must complete");
+
+    // The append grows the target by one; the re-invoked pass must render
+    // the new row so completion — and the footer's disappearance — stay
+    // reachable. This is the regression for the wedged "Rendering
+    // thumbnails · N / N+1" footer.
+    let second = session_dir.join("scan-001.jpg");
+    image::RgbImage::from_pixel(8, 8, image::Rgb([1, 2, 3]))
+        .save(&second)
+        .unwrap();
+    view.update(&mut *cx, |view, cx| {
+        view.import_add_scanned_file(second, cx)
+    });
+    let mut done = false;
+    for _ in 0..50 {
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        done = view.read_with(&*cx, complete);
+        if done {
+            break;
+        }
+    }
+    assert!(
+        done,
+        "the appended scan must render; otherwise the thumbnail footer wedges"
+    );
+    view.update(&mut *cx, |view, _| {
+        assert_eq!(
+            view.import_thumbnail_progress_uncached(),
+            (2, 2),
+            "both scans rendered; no decode was cancelled by the append"
+        );
+        assert!(
+            !view.import_view.directory_pass_loop_alive.get(),
+            "the pass loop must clear its alive flag on exit, or every \
+             future pass is silently skipped"
+        );
+    });
+}
+
+#[test]
+fn import_refresh_keeps_a_scanner_batch_when_the_device_leaves() {
+    let root = tempfile::tempdir().unwrap();
+    let session_dir = root.path().join("scan-staging").join("dev").join("session");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let scanner = sources::SourceEntry {
+        id: sources::SourceId::new("scanner:dev"),
+        label: "EPSON L3160 Series".to_owned(),
+        kind: sources::SourceKind::Scanner {
+            vendor: "EPSON".to_owned(),
+            model: "L3160 Series".to_owned(),
+        },
+        backing: sources::SourceBacking::Path(session_dir.clone()),
+        capacity: None,
+    };
+
+    // Still listed: unchanged.
+    let (sources, kept) =
+        import_view::retain_selected_source(vec![scanner.clone()], Some(&scanner));
+    assert!(kept);
+    assert_eq!(sources.len(), 1);
+
+    // The device left the discovery snapshot, but the session directory —
+    // and with it the accumulated batch — persists: the selection survives.
+    let (sources, kept) = import_view::retain_selected_source(Vec::new(), Some(&scanner));
+    assert!(kept, "a path-backed scanner survives leaving the snapshot");
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0].id, scanner.id);
+
+    // A folder whose directory is gone is dropped, selection included.
+    let folder = sources::SourceEntry {
+        id: sources::SourceId::new("folder:gone"),
+        label: "Gone".to_owned(),
+        kind: sources::SourceKind::Folder,
+        backing: sources::SourceBacking::Path(root.path().join("vanished")),
+        capacity: None,
+    };
+    let (sources, kept) = import_view::retain_selected_source(Vec::new(), Some(&folder));
+    assert!(!kept);
+    assert!(sources.is_empty());
+}
+
+#[gpui::test]
+fn import_scanner_job_is_cancelled_on_exit_and_source_switch(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let library = root.path().join("library");
+    std::fs::create_dir(&library).unwrap();
+    let (view, cx, session_dir) = import_view_with_scanner(cx, &library, 0);
+
+    // A scan job against a device that never delivers; cancellation must
+    // reach it through the view and DELETE the job on the device.
+    let deleted = Arc::new(AtomicBool::new(false));
+    let deleted_clone = Arc::clone(&deleted);
+    let (base, recorded) = crate::sources::scanner::mock::spawn_mock(Box::new(
+        move |method, path, _host, _body| match (method, path) {
+            ("POST", "/eSCL/ScanJobs") => {
+                crate::sources::scanner::mock::MockReply::created("/eSCL/ScanJobs/cx")
+            }
+            ("GET", "/eSCL/ScanJobs/cx/NextDocument") => {
+                crate::sources::scanner::mock::MockReply::status(503)
+            }
+            ("DELETE", "/eSCL/ScanJobs/cx") => {
+                deleted_clone.store(true, Ordering::Release);
+                crate::sources::scanner::mock::MockReply::status(200)
+            }
+            _ => crate::sources::scanner::mock::MockReply::status(404),
+        },
+    ));
+    let client = crate::sources::scanner::escl::EsclClient::new(&base).unwrap();
+    // The job starter hands the runner a fresh flag (the select in the
+    // helper left the previous one set) — this is the real Stage 3 seam.
+    let cancel = view.update(&mut *cx, |view, _| view.begin_scanner_job());
+    let destination = session_dir.join("scan-never.jpg");
+    let settings = crate::sources::scanner::escl::ScanSettings {
+        region: crate::sources::scanner::escl::ScanRegion {
+            x_offset: 0,
+            y_offset: 0,
+            width: 100,
+            height: 100,
+        },
+        color_mode: crate::sources::scanner::escl::ColorMode::Rgb24,
+        document_format: "image/jpeg".to_owned(),
+        resolution: 100,
+    };
+    let timings = crate::sources::scanner::escl::ScanJobTimings {
+        guard: Duration::from_secs(30),
+        total: Duration::from_secs(60),
+        post_retry_pause: Duration::from_millis(1),
+        poll_pause: Duration::from_millis(5),
+    };
+    let runner = {
+        let settings = settings.clone();
+        std::thread::spawn(move || {
+            crate::sources::scanner::escl::run_scan_job(
+                &client,
+                &settings,
+                &destination,
+                &cancel,
+                &timings,
+                &mut |_| {},
+            )
+        })
+    };
+    // Wait until the job is actually polling (under load the runner thread
+    // may start late; cancelling before the POST would legitimately skip
+    // the DELETE, since no job exists on the device yet).
+    let mut job_started = false;
+    for _ in 0..200 {
+        std::thread::sleep(Duration::from_millis(10));
+        if recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(method, _, _)| method == "POST")
+        {
+            job_started = true;
+            break;
+        }
+    }
+    assert!(job_started, "the runner must reach the device");
+
+    // Leaving the import view cancels the job.
+    view.update(&mut *cx, |view, cx| view.exit_import_view(cx));
+    let outcome = runner.join().unwrap();
+    assert!(
+        matches!(
+            outcome,
+            Err(crate::sources::scanner::escl::ScanJobError::Canceled)
+        ),
+        "exit must cancel the running scan job, got {outcome:?}"
+    );
+    assert!(deleted.load(Ordering::Acquire), "exit must DELETE the job");
+
+    // Selecting a different source cancels a job too. The selection is made
+    // first (it cancels whatever ran), and the flag is then reset the way
+    // the Stage 3 job starter will reset it before each job.
+    view.update(&mut *cx, |view, cx| {
+        let id = sources::SourceId::new("folder:elsewhere");
+        view.import_view.sources.push(sources::SourceEntry {
+            id: id.clone(),
+            label: "Elsewhere".to_owned(),
+            kind: sources::SourceKind::Folder,
+            backing: sources::SourceBacking::Path(library.to_path_buf()),
+            capacity: None,
+        });
+        view.select_import_source(id, cx);
+    });
+    let cancel = view.update(&mut *cx, |view, _| view.begin_scanner_job());
+    let client = crate::sources::scanner::escl::EsclClient::new(&base).unwrap();
+    let destination = session_dir.join("scan-never-2.jpg");
+    let runner = {
+        let settings = settings.clone();
+        std::thread::spawn(move || {
+            crate::sources::scanner::escl::run_scan_job(
+                &client,
+                &settings,
+                &destination,
+                &cancel,
+                &timings,
+                &mut |_| {},
+            )
+        })
+    };
+    // Wait until the retried job is actually polling before cancelling
+    // (under load the runner may start late; cancelling before the POST
+    // legitimately skips the DELETE — no job exists on the device yet).
+    let mut second_job_polling = false;
+    for _ in 0..200 {
+        std::thread::sleep(Duration::from_millis(10));
+        let posts = recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(method, _, _)| method == "POST")
+            .count();
+        if posts >= 2 {
+            second_job_polling = true;
+            break;
+        }
+    }
+    assert!(second_job_polling, "the retried job must reach the device");
+    let deletes_before = recorded
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(method, _, _)| method == "DELETE")
+        .count();
+    // Switching to a DIFFERENT source triggers the cancellation path
+    // (re-selecting the same source is a no-op by design).
+    view.update(&mut *cx, |view, cx| {
+        let id = sources::SourceId::new("folder:another");
+        view.import_view.sources.push(sources::SourceEntry {
+            id: id.clone(),
+            label: "Another".to_owned(),
+            kind: sources::SourceKind::Folder,
+            backing: sources::SourceBacking::Path(library.to_path_buf()),
+            capacity: None,
+        });
+        view.select_import_source(id, cx);
+    });
+    let outcome = runner.join().unwrap();
+    assert!(matches!(
+        outcome,
+        Err(crate::sources::scanner::escl::ScanJobError::Canceled)
+    ));
+    let deletes_after = recorded
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(method, _, _)| method == "DELETE")
+        .count();
+    assert!(
+        deletes_after > deletes_before,
+        "a source switch must DELETE the job it interrupts"
+    );
+}
+
+#[gpui::test]
+fn import_scanner_entry_appears_on_source_refresh(cx: &mut gpui::TestAppContext) {
+    // The discovery daemon is off in tests; the snapshot is seeded directly,
+    // so this exercises the real refresh path (provider collect + registry
+    // merge + rail list) with no network.
+    crate::sources::scanner::set_daemon_enabled(false);
+    const KEY: &str = "poll-test";
+    crate::sources::scanner::discover::note_service(
+        &mut crate::sources::scanner::discover::SCANNERS.lock().unwrap(),
+        &crate::sources::scanner::discover::DiscoveredService {
+            service_type: crate::sources::scanner::discover::SERVICE_TLS.to_string(),
+            instance_name: "EPSON L3160 Series".to_string(),
+            port: 443,
+            addresses: vec!["192.0.2.10".parse().unwrap()],
+            txt: vec![
+                ("rs".to_string(), "eSCL".to_string()),
+                ("ty".to_string(), "EPSON L3160 Series".to_string()),
+                ("uuid".to_string(), format!("uuid:{KEY}")),
+            ],
+        },
+        std::time::Instant::now(),
+    );
+
+    let root = tempfile::tempdir().unwrap();
+    let library = root.path().join("library");
+    std::fs::create_dir(&library).unwrap();
+    let card = write_import_source(root.path(), "card", 0, 1);
+    let (view, cx) = import_view_with_card(cx, &library, &card);
+
+    // Building the import view already refreshed the sources.
+    let has_scanner = view.read_with(&*cx, |view, _| {
+        view.import_view
+            .sources
+            .iter()
+            .any(|entry| entry.id == sources::SourceId::new(format!("scanner:{KEY}")))
+    });
+    // The selected folder source keeps its listing alongside the scanner.
+    let listing_ok = view.read_with(&*cx, |view, _| view.import_view.listing_loaded());
+
+    // Cleanup before asserts so a failure cannot leak global state.
+    crate::sources::scanner::discover::SCANNERS
+        .lock()
+        .unwrap()
+        .remove(KEY);
+    assert!(has_scanner, "the seeded scanner must appear in the rail");
+    assert!(
+        listing_ok,
+        "the selected folder source must keep its listing"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Scan panel (scanner-support-plan.md, Stage 3)
+// ---------------------------------------------------------------------------
+
+use std::path::PathBuf;
+
+use crate::import_view::{
+    ScanCapsState, ScanJobHandle, ScanJobKind, ScanJobOutcome, ScanJobRun, ScanPreviewState,
+};
+
+/// Device capabilities matching the captured L3160 fixture.
+fn test_scanner_caps() -> Arc<sources::scanner::escl::ScannerCapabilities> {
+    Arc::new(sources::scanner::escl::ScannerCapabilities {
+        platen: sources::scanner::escl::InputCaps {
+            min_width: 96,
+            max_width: 2550,
+            min_height: 96,
+            max_height: 3510,
+        },
+        max_scan_regions: 1,
+        color_modes: vec![
+            "BlackAndWhite1".to_owned(),
+            "Grayscale8".to_owned(),
+            "RGB24".to_owned(),
+        ],
+        document_formats: vec!["application/pdf".to_owned(), "image/jpeg".to_owned()],
+        resolutions: vec![100, 200, 300, 600, 1200],
+    })
+}
+
+/// Puts the panel into a reachable-ready state against a fake device: the
+/// tests inject endpoint and capabilities directly, so no mDNS daemon and
+/// no network is involved.
+fn ready_scan_panel(
+    view: &gpui::Entity<PictureBrowser>,
+    cx: &mut gpui::VisualTestContext,
+    endpoint: &str,
+) {
+    // Seed the discovery snapshot for the selected scanner so the panel's
+    // refresh keeps it online (the daemon itself never runs in tests).
+    let port: u16 = endpoint
+        .split("://")
+        .nth(1)
+        .and_then(|rest| rest.split('/').next())
+        .and_then(|host| host.split(':').nth(1))
+        .and_then(|port| port.parse().ok())
+        .unwrap_or(80);
+    crate::sources::scanner::discover::note_service(
+        &mut crate::sources::scanner::discover::SCANNERS.lock().unwrap(),
+        &crate::sources::scanner::discover::DiscoveredService {
+            service_type: crate::sources::scanner::discover::SERVICE_PLAIN.to_string(),
+            instance_name: "EPSON L3160 Series".to_string(),
+            port,
+            addresses: vec!["127.0.0.1".parse().unwrap()],
+            txt: vec![
+                ("rs".to_string(), "eSCL".to_string()),
+                ("ty".to_string(), "EPSON L3160 Series".to_string()),
+                ("uuid".to_string(), "test-scanner".to_string()),
+            ],
+        },
+        std::time::Instant::now(),
+    );
+    let base = crate::sources::scanner::discover::endpoint_base_url(
+        false,
+        &["127.0.0.1".parse().unwrap()],
+        port,
+        "eSCL",
+    )
+    .unwrap();
+    view.update(cx, |view, _| {
+        let panel = &mut view.import_view.scan_panel;
+        panel.endpoint = Some(base.clone());
+        panel.endpoints = vec![base];
+        panel.offline = false;
+        panel.caps = ScanCapsState::Loaded(test_scanner_caps());
+        // The runner sleeps in real time; tests use micro-budgets so jobs
+        // end promptly instead of running out the 600 s device budget.
+        panel.timings = sources::scanner::escl::ScanJobTimings {
+            guard: Duration::from_millis(500),
+            total: Duration::from_secs(2),
+            post_retry_pause: Duration::from_millis(1),
+            poll_pause: Duration::from_millis(5),
+        };
+    });
+    let _ = cx.refresh();
+}
+
+fn fake_preview_image(width: u32, height: u32) -> Arc<gpui::RenderImage> {
+    let decoded = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        width,
+        height,
+        image::Rgba([10, 20, 30, 255]),
+    ));
+    Arc::new(crate::preview::render_image(&decoded))
+}
+
+#[gpui::test]
+fn scan_panel_renders_empty_and_offline(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let library = root.path().join("library");
+    std::fs::create_dir(&library).unwrap();
+    let (view, cx, _) = import_view_with_scanner(cx, &library, 0);
+    // The offline state, injected: the discovery snapshot is process-global
+    // and parallel tests may seed other devices, so the state is set
+    // directly instead of relying on the snapshot being empty.
+    view.update(&mut *cx, |view, _| {
+        view.import_view.scan_panel.offline = true;
+    });
+
+    let (status, blocked) = view.read_with(&*cx, |view, _| {
+        (view.scan_status_line(), view.scan_start_blocked())
+    });
+    assert!(
+        status.contains("Scanner offline — waiting…"),
+        "got: {status}"
+    );
+    assert!(blocked, "offline scanners cannot start a scan");
+
+    // Fixed layout, no flex shrink: the panel keeps its prescribed height
+    // and the preview box its own (the max_h trap cannot hide here).
+    let panel = cx.debug_bounds("#scan-panel").expect("panel renders");
+    assert!(
+        (panel.size.height - px(444.0)).abs() < px(1.5),
+        "panel height {:?} must stay at the fixed 444px",
+        panel.size.height
+    );
+    let preview_box = cx.debug_bounds("#scan-preview-box").unwrap();
+    assert!(
+        (preview_box.size.height - px(408.0)).abs() < px(1.5),
+        "preview box height {:?} must stay at 408px",
+        preview_box.size.height
+    );
+    assert!(cx.debug_bounds("#scan-batch-chip").is_some());
+}
+
+#[gpui::test]
+fn scan_panel_folder_sources_have_no_panel(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let library = root.path().join("library");
+    std::fs::create_dir(&library).unwrap();
+    let card = write_import_source(root.path(), "card", 0, 1);
+    let (_view, cx) = import_view_with_card(cx, &library, &card);
+    assert!(
+        cx.debug_bounds("#scan-panel").is_none(),
+        "folder sources must not render the scan panel"
+    );
+    // Positive control: the folder window renders the destination toggle in
+    // the same frame, so the absence above is not an undrawn window.
+    assert!(cx.debug_bounds("#import-destination-picker").is_some());
+}
+
+#[gpui::test]
+fn scan_panel_drag_selects_region_and_full_area_resets(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let library = root.path().join("library");
+    std::fs::create_dir(&library).unwrap();
+    let (view, cx, _) = import_view_with_scanner(cx, &library, 0);
+    ready_scan_panel(&view, cx, "http://127.0.0.1:1/eSCL");
+    view.update(&mut *cx, |view, _| {
+        view.import_view.scan_panel.preview = ScanPreviewState::Loaded {
+            image: fake_preview_image(727, 1000),
+            width: 727,
+            height: 1000,
+        };
+    });
+    let _ = cx.refresh();
+
+    let full_label = view.read_with(&*cx, |view, _| view.scan_region_mm_label());
+    assert_eq!(
+        full_label, "region 216×297 mm",
+        "default region is the full platen"
+    );
+
+    // P0 regression: the paint-pass-recorded geometry must match the box's
+    // rendered bounds. The recorder once ran as a second in-flow child of a
+    // block box and recorded a position one box-height too low, collapsing
+    // every y fraction to 0 — invisible to fractions-only assertions.
+    let box_bounds = cx.debug_bounds("#scan-preview-box").expect("box renders");
+    let ((recorded_x, recorded_y), _) =
+        view.read_with(&*cx, |view, _| view.import_view.scan_panel.preview_bounds);
+    assert!(
+        (recorded_x - f64::from(box_bounds.origin.x)).abs() <= 2.0
+            && (recorded_y - f64::from(box_bounds.origin.y)).abs() <= 2.0,
+        "recorded preview bounds ({recorded_x}, {recorded_y}) must match the rendered box at ({}, {})",
+        f64::from(box_bounds.origin.x),
+        f64::from(box_bounds.origin.y),
+    );
+
+    // The full-platen region covers everything, so the first interaction is
+    // a RESIZE from its bottom-right handle (handle tolerance is ~9 px in
+    // view units). Shrink to half width / 60% height.
+    let ((origin_x, origin_y), (size_w, size_h)) =
+        view.read_with(&*cx, |view, _| view.import_view.scan_panel.preview_bounds);
+    let at = |fx: f64, fy: f64| {
+        gpui::point(
+            px((origin_x + size_w * fx) as f32),
+            px((origin_y + size_h * fy) as f32),
+        )
+    };
+    view.update(&mut *cx, |view, cx| {
+        view.scan_drag_down(at(0.985, 0.985), cx);
+        view.scan_drag_move(at(0.5, 0.6), true, cx);
+        view.scan_drag_up(cx);
+    });
+    cx.run_until_parked();
+    let (region, label) = view.read_with(&*cx, |view, _| {
+        (
+            view.import_view.scan_panel.region.normalized(),
+            view.scan_region_mm_label(),
+        )
+    });
+    let near = |a: f64, b: f64| (a - b).abs() < 0.005;
+    assert!(
+        near(region.x0, 0.0)
+            && near(region.y0, 0.0)
+            && near(region.x1, 0.5)
+            && near(region.y1, 0.6),
+        "the handle drag resizes the region: {region:?}"
+    );
+    assert_eq!(label, "region 108×178 mm", "mm label follows the resize");
+
+    // Press inside the region: MOVE by +0.1/+0.1, clamped onto the platen.
+    view.update(&mut *cx, |view, cx| {
+        view.scan_drag_down(at(0.25, 0.25), cx);
+        view.scan_drag_move(at(0.35, 0.35), true, cx);
+        view.scan_drag_up(cx);
+    });
+    let region = view.read_with(&*cx, |view, _| {
+        view.import_view.scan_panel.region.normalized()
+    });
+    assert!(
+        near(region.x0, 0.1)
+            && near(region.y0, 0.1)
+            && near(region.x1, 0.6)
+            && near(region.y1, 0.7),
+        "an interior press moves the region: {region:?}"
+    );
+
+    // Press outside the region: DRAW a new rectangle.
+    view.update(&mut *cx, |view, cx| {
+        view.scan_drag_down(at(0.8, 0.8), cx);
+        view.scan_drag_move(at(0.95, 0.95), true, cx);
+        view.scan_drag_up(cx);
+    });
+    let region = view.read_with(&*cx, |view, _| {
+        view.import_view.scan_panel.region.normalized()
+    });
+    assert!(
+        near(region.x0, 0.8)
+            && near(region.y0, 0.8)
+            && near(region.x1, 0.95)
+            && near(region.y1, 0.95),
+        "an exterior press draws a new region: {region:?}"
+    );
+
+    // A stray bare click (press without movement) keeps the region.
+    view.update(&mut *cx, |view, cx| {
+        view.scan_drag_down(at(0.1, 0.1), cx);
+        view.scan_drag_up(cx);
+    });
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view
+            .import_view
+            .scan_panel
+            .region
+            .normalized()),
+        region,
+        "a bare click must not wipe the region"
+    );
+
+    // Full area resets both the region and its label.
+    let reset = cx.debug_bounds("#scan-full-area").unwrap();
+    cx.simulate_click(reset.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.scan_region_mm_label()),
+        full_label
+    );
+}
+
+#[gpui::test]
+fn scan_panel_settings_flow_into_the_scan_xml(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let library = root.path().join("library");
+    std::fs::create_dir(&library).unwrap();
+    let (view, cx, _) = import_view_with_scanner(cx, &library, 0);
+    ready_scan_panel(&view, cx, "http://127.0.0.1:1/eSCL");
+
+    // Resolution combobox: options follow the device's advertised list.
+    let button = cx.debug_bounds("#scan-dpi-button").unwrap();
+    cx.simulate_click(button.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let option = cx
+        .debug_bounds("#scan-dpi-option-3")
+        .expect("600 dpi option");
+    cx.simulate_click(option.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+
+    // Color mode combobox.
+    let button = cx.debug_bounds("#scan-color-button").unwrap();
+    cx.simulate_click(button.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let option = cx
+        .debug_bounds("#scan-color-option-1")
+        .expect("grayscale option");
+    cx.simulate_click(option.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+
+    let (xml, dpi, color) = view.read_with(&*cx, |view, _| {
+        (
+            view.scan_settings_xml().expect("settings build"),
+            view.settings.import_scan_dpi,
+            view.settings.import_scan_color,
+        )
+    });
+    assert!(
+        xml.contains("<scan:XResolution>600</scan:XResolution>"),
+        "the picked dpi must reach the settings: {xml}"
+    );
+    assert!(
+        xml.contains("<scan:ColorMode>Grayscale8</scan:ColorMode>"),
+        "the picked color mode must reach the settings: {xml}"
+    );
+    assert_eq!(dpi, 600, "the pick persists into the app settings");
+    assert_eq!(color, config::ScanColorMode::Gray);
+}
+
+#[gpui::test]
+fn scan_panel_shows_job_state_and_blocks_actions(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let library = root.path().join("library");
+    std::fs::create_dir(&library).unwrap();
+    let (view, cx, _) = import_view_with_scanner(cx, &library, 0);
+    ready_scan_panel(&view, cx, "http://127.0.0.1:1/eSCL");
+    assert!(!view.read_with(&*cx, |view, _| view.scan_start_blocked()));
+
+    view.update(&mut *cx, |view, _| {
+        view.import_view.scan_panel.job = Some(ScanJobHandle {
+            cancel: Arc::new(AtomicBool::new(false)),
+            state: Arc::new(Mutex::new(ScanJobRun {
+                phase: sources::scanner::escl::ScanJobPhase::Transferring,
+                started: std::time::Instant::now(),
+                result: None,
+            })),
+            kind: ScanJobKind::Preview,
+        });
+    });
+    let _ = cx.refresh();
+
+    assert!(view.read_with(&*cx, |view, _| view.scan_start_blocked()));
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.scan_status_line()),
+        "Transferring image…"
+    );
+    assert!(cx.debug_bounds("#scan-cancel-btn").is_some());
+}
+
+#[gpui::test]
+fn scan_panel_finish_appends_and_selects(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let library = root.path().join("library");
+    std::fs::create_dir(&library).unwrap();
+    let (view, cx, session_dir) = import_view_with_scanner(cx, &library, 0);
+    let scan_path = session_dir.join("scan-001.jpg");
+    image::RgbImage::from_pixel(8, 8, image::Rgb([1, 2, 3]))
+        .save(&scan_path)
+        .unwrap();
+
+    view.update(&mut *cx, |view, _| {
+        view.import_view.scan_panel.job = Some(ScanJobHandle {
+            cancel: Arc::new(AtomicBool::new(false)),
+            state: Arc::new(Mutex::new(ScanJobRun {
+                phase: sources::scanner::escl::ScanJobPhase::Transferring,
+                started: std::time::Instant::now(),
+                result: Some(Ok(ScanJobOutcome::Saved(4096))),
+            })),
+            kind: ScanJobKind::Scan(scan_path),
+        });
+    });
+    view.update(&mut *cx, |view, cx| view.finish_scan_job(cx));
+
+    // The appended scan's thumbnail renders via the whole-directory pass,
+    // which yields on batch timers — advance and park until done.
+    let mut done = false;
+    for _ in 0..50 {
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        done = view.read_with(&*cx, |view, _| {
+            let (rendered, total) = view.import_thumbnail_progress_uncached();
+            total > 0 && rendered >= total
+        });
+        if done {
+            break;
+        }
+    }
+    assert!(done, "the appended scan must render");
+
+    view.update(&mut *cx, |view, _| {
+        assert_eq!(view.import_view.photos.len(), 1);
+        assert!(view.import_view.selection.contains("scan-001.jpg"));
+        assert!(view.import_view.scan_panel.job.is_none());
+        assert!(
+            !view.import_view.directory_pass_loop_alive.get(),
+            "the pass loop must clear its alive flag on exit"
+        );
+    });
+    // Regression: the scans list once collapsed to zero height (its column
+    // used flex_1 inside a plain block wrapper), leaving finished scans
+    // invisible while everything else claimed success.
+    let tile = cx
+        .debug_bounds("#import-tile-0")
+        .expect("the scanned photo must render as a tile");
+    assert!(
+        tile.size.height > px(50.0),
+        "tile has real height: {tile:?}"
+    );
+    let list_area = cx
+        .debug_bounds("#scan-list")
+        .expect("the scans list renders");
+    assert!(
+        list_area.size.height > px(100.0),
+        "the scans list must have height, got {list_area:?}"
+    );
+}
+
+#[gpui::test]
+fn scan_panel_scan_press_produces_a_scan(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let library = root.path().join("library");
+    std::fs::create_dir(&library).unwrap();
+    let (view, cx, session_dir) = import_view_with_scanner(cx, &library, 0);
+
+    let deleted = Arc::new(AtomicBool::new(false));
+    let deleted_clone = Arc::clone(&deleted);
+    let (base, _recorded) = crate::sources::scanner::mock::spawn_mock(Box::new(
+        move |method, path, _host, _body| match (method, path) {
+            ("POST", "/eSCL/ScanJobs") => {
+                crate::sources::scanner::mock::MockReply::created("/eSCL/ScanJobs/cx")
+            }
+            ("GET", "/eSCL/ScanJobs/cx/NextDocument") => {
+                crate::sources::scanner::mock::MockReply::image("image/jpeg", vec![1, 2, 3, 4])
+            }
+            ("DELETE", "/eSCL/ScanJobs/cx") => {
+                deleted_clone.store(true, Ordering::Release);
+                crate::sources::scanner::mock::MockReply::status(200)
+            }
+            _ => crate::sources::scanner::mock::MockReply::status(404),
+        },
+    ));
+    ready_scan_panel(&view, cx, &base);
+
+    // Scan against a device that delivers on the first poll: the press
+    // produces a real scan end to end. The 250 ms panel poll finalizes the
+    // finished job.
+    view.update(&mut *cx, |view, cx| view.start_scan(cx));
+    cx.executor().advance_clock(Duration::from_millis(300));
+    cx.run_until_parked();
+
+    view.update(&mut *cx, |view, _| {
+        assert_eq!(
+            view.import_view.photos.len(),
+            1,
+            "the scan landed in the batch"
+        );
+        assert!(
+            view.import_view
+                .selection
+                .contains(&view.import_view.photos[0].key()),
+            "the scan is auto-selected"
+        );
+        assert!(view.import_view.scan_panel.job.is_none());
+        assert!(
+            view.import_view
+                .scan_panel
+                .last_result
+                .as_deref()
+                .is_some_and(|result| result.contains("Scan saved")),
+            "the status line reports the saved scan, got {:?}",
+            view.import_view.scan_panel.last_result
+        );
+    });
+    assert!(
+        deleted.load(Ordering::Acquire),
+        "success must DELETE the job"
+    );
+    assert!(!session_dir.join("scan-001.jpg.rekesz-part").exists());
+    let scan_name = view.read_with(&*cx, |view, _| {
+        view.import_view.photos[0].primary.name.clone()
+    });
+
+    // Cancelling a job trips its flag (the runner-side DELETE-on-cancel is
+    // covered by the Stage 2 exit/switch test with the same machinery).
+    let (view, cx, _) = import_view_with_scanner(cx, &library, 0);
+    ready_scan_panel(&view, cx, &base);
+    let cancel = view.update(&mut *cx, |view, _| view.begin_scanner_job());
+    view.update(&mut *cx, |view, _| {
+        view.import_view.scan_panel.job = Some(ScanJobHandle {
+            cancel: Arc::clone(&cancel),
+            state: Arc::new(Mutex::new(ScanJobRun {
+                phase: sources::scanner::escl::ScanJobPhase::Scanning,
+                started: std::time::Instant::now(),
+                result: None,
+            })),
+            kind: ScanJobKind::Preview,
+        });
+    });
+    view.update(&mut *cx, |view, cx| view.cancel_scan_job(cx));
+    assert!(
+        cancel.load(Ordering::Acquire),
+        "cancel must trip the job flag"
+    );
+    let _ = scan_name;
+}
+
+#[gpui::test]
+fn scan_panel_busy_recovers_automatically(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let library = root.path().join("library");
+    std::fs::create_dir(&library).unwrap();
+    let (view, cx, session_dir) = import_view_with_scanner(cx, &library, 0);
+    let polls = Arc::new(AtomicUsize::new(0));
+    let polls_clone = Arc::clone(&polls);
+    let (base, _recorded) = crate::sources::scanner::mock::spawn_mock(Box::new(
+        move |method, path, _host, _body| match (method, path) {
+            ("POST", "/eSCL/ScanJobs") => {
+                crate::sources::scanner::mock::MockReply::created("/eSCL/ScanJobs/busy")
+            }
+            ("GET", "/eSCL/ScanJobs/busy/NextDocument") => {
+                // One busy answer, then a document: the auto-retried scan
+                // completes, which is the observable recovery.
+                let attempt = polls_clone.fetch_add(1, Ordering::AcqRel);
+                if attempt < 1 {
+                    crate::sources::scanner::mock::MockReply::status(503)
+                } else {
+                    crate::sources::scanner::mock::MockReply::image("image/jpeg", vec![1, 2, 3])
+                }
+            }
+            _ => crate::sources::scanner::mock::MockReply::status(404),
+        },
+    ));
+    ready_scan_panel(&view, cx, &base);
+    // The previous scan hit a busy device (the runner gave up with Busy).
+    // The timestamp is backdated past the 2 s retry threshold: the retry
+    // gate reads the real clock, which advance_clock cannot move.
+    view.update(&mut *cx, |view, _| {
+        view.import_view.scan_panel.busy_since = Some((
+            std::time::Instant::now() - Duration::from_secs(3),
+            ScanJobKind::Scan(PathBuf::new()),
+        ));
+    });
+
+    // The retry fires on the panel poll chain; the mock then delivers, so
+    // the recovered scan lands in the batch. Retry + completion + finalize
+    // each ride a 250 ms chain tick — advance and park until they land.
+    let mut recovered = false;
+    for _ in 0..20 {
+        cx.executor().advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+        recovered = view.read_with(&*cx, |view, _| {
+            view.import_view.photos.len() == 1 && view.import_view.scan_panel.job.is_none()
+        });
+        if recovered {
+            break;
+        }
+    }
+    assert!(
+        recovered,
+        "the auto-retried scan must complete and land in the batch"
+    );
+
+    view.update(&mut *cx, |view, _| {
+        assert!(view.import_view.scan_panel.busy_since.is_none());
+        assert!(view.import_view.scan_panel.job.is_none());
+    });
+    let _ = session_dir;
+}
+
+#[test]
+fn scan_zoom_is_cursor_anchored_and_clamped() {
+    use crate::import_view::zoom_view;
+    // Zoom 2x about a quarter-point: that fraction stays fixed.
+    let (zoom, origin) = zoom_view(2.0, (0.0, 0.0), (0.25, 0.25), 2.0);
+    assert_eq!(zoom, 4.0);
+    assert_eq!(origin, (0.125, 0.125));
+    // Zoom out below 1x clamps to fit.
+    let (zoom, origin) = zoom_view(1.0, (0.1, 0.1), (0.5, 0.5), 0.5);
+    assert_eq!(zoom, 1.0);
+    assert_eq!(origin, (0.0, 0.0));
+    // Zoom in past 8x clamps there and the origin stays in range.
+    let (zoom, origin) = zoom_view(8.0, (0.0, 0.0), (0.0, 0.0), 4.0);
+    assert_eq!(zoom, 8.0);
+    assert_eq!(origin, (0.0, 0.0));
+}
+
+#[test]
+fn scan_handle_hit_maps_edges_and_corners() {
+    use crate::import_view::{ScanRegionFractions, region_handle_hit};
+    let region = ScanRegionFractions {
+        x0: 0.0,
+        y0: 0.0,
+        x1: 0.5,
+        y1: 0.6,
+    };
+    let tol = (0.03, 0.03);
+    let edges = region_handle_hit((0.5, 0.3), region, tol).expect("right edge");
+    assert!(edges.right && !edges.left && !edges.top && !edges.bottom);
+    let corner = region_handle_hit((0.01, 0.01), region, tol).expect("corner");
+    assert!(corner.left && corner.top);
+    assert!(
+        region_handle_hit((0.25, 0.3), region, tol).is_none(),
+        "interior is not a handle"
+    );
+    assert!(
+        region_handle_hit((0.75, 0.75), region, tol).is_none(),
+        "outside the region is not a handle"
+    );
+}
+
+#[test]
+fn scan_region_label_uses_the_captured_platen() {
+    // Pure check of the full-platen label math: 2550x3510 units = 216x297 mm.
+    let caps = test_scanner_caps_ref();
+    let region = sources::scanner::escl::region_from_fractions(&caps.platen, 0.0, 0.0, 1.0, 1.0);
+    assert_eq!(
+        format!(
+            "region {}×{} mm",
+            sources::scanner::escl::units_to_mm(region.width as f64).round(),
+            sources::scanner::escl::units_to_mm(region.height as f64).round()
+        ),
+        "region 216×297 mm"
+    );
+}
+
+fn test_scanner_caps_ref() -> sources::scanner::escl::ScannerCapabilities {
+    sources::scanner::escl::ScannerCapabilities {
+        platen: sources::scanner::escl::InputCaps {
+            min_width: 96,
+            max_width: 2550,
+            min_height: 96,
+            max_height: 3510,
+        },
+        max_scan_regions: 1,
+        color_modes: Vec::new(),
+        document_formats: vec!["image/jpeg".to_owned()],
+        resolutions: vec![300],
+    }
+}
+
+#[gpui::test]
+fn import_double_click_opens_viewer_and_round_trips(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let library = root.path().join("library");
+    std::fs::create_dir(&library).unwrap();
+    let card = write_import_source(root.path(), "card", 0, 2);
+    let (view, cx) = import_view_with_card(cx, &library, &card);
+
+    // Both photos preselected; the user deselects the first one deliberately.
+    view.update(&mut *cx, |view, cx| {
+        let first = view.import_view.photos[0].key();
+        view.import_toggle_photo(&first, cx);
+    });
+    let selection_before = view.read_with(&*cx, |view, _| view.import_view.selection.clone());
+    assert_eq!(selection_before.len(), 1);
+
+    // Double-click the first tile: the viewer opens (fit zoom).
+    let tile = cx.debug_bounds("#import-tile-0").expect("tile renders");
+    double_click(cx, tile.center());
+    cx.run_until_parked();
+    assert!(
+        view.read_with(&*cx, |view, _| matches!(view.main_view, MainView::Image(_))),
+        "a double-click must open the viewer"
+    );
+
+    // Escape closes the viewer; Import mode, batch, and selection survive.
+    cx.dispatch_action(CloseImage);
+    cx.run_until_parked();
+    view.update(&mut *cx, |view, _| {
+        assert!(matches!(view.main_view, MainView::Dir(..)));
+        assert_eq!(
+            view.directory_view_mode,
+            DirectoryViewMode::Import,
+            "closing the viewer must land back in the import view"
+        );
+        assert_eq!(
+            view.import_view.selection, selection_before,
+            "the round trip must not touch the import selection"
+        );
+        assert_eq!(view.import_view.photos.len(), 2);
+    });
 }

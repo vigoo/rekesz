@@ -107,6 +107,44 @@ pub(crate) struct AppSettings {
     pub import_destination_preset: crate::import::DestinationPreset,
     #[serde(default)]
     pub import_include_duplicates: bool,
+    #[serde(default = "default_scan_dpi")]
+    pub import_scan_dpi: u32,
+    #[serde(default)]
+    pub import_scan_color: ScanColorMode,
+}
+
+/// Color mode of the scan panel, persisted across restarts.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScanColorMode {
+    #[default]
+    Rgb,
+    Gray,
+    BlackAndWhite,
+}
+
+impl ScanColorMode {
+    /// The label shown in the scan panel's color-mode combobox.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rgb => "Color",
+            Self::Gray => "Grayscale",
+            Self::BlackAndWhite => "Black & white",
+        }
+    }
+
+    /// The eSCL ColorMode written into the ScanSettings.
+    pub fn to_escl(self) -> crate::sources::scanner::escl::ColorMode {
+        match self {
+            Self::Rgb => crate::sources::scanner::escl::ColorMode::Rgb24,
+            Self::Gray => crate::sources::scanner::escl::ColorMode::Grayscale8,
+            Self::BlackAndWhite => crate::sources::scanner::escl::ColorMode::BlackAndWhite1,
+        }
+    }
+}
+
+fn default_scan_dpi() -> u32 {
+    300
 }
 
 #[derive(Clone, Debug)]
@@ -221,6 +259,8 @@ fn defaults(dirs: &directories::ProjectDirs) -> Result<AppSettings> {
         import_recent_sources: Vec::new(),
         import_destination_preset: Default::default(),
         import_include_duplicates: false,
+        import_scan_dpi: default_scan_dpi(),
+        import_scan_color: Default::default(),
         cache_root: dirs.cache_dir().to_path_buf(),
         job_parallelism,
         raw_parallelism: default_raw_parallelism(job_parallelism),

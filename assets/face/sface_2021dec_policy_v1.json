@@ -24,7 +24,7 @@
       "production_inference_source_sha256": "1b0c97a4d5aacb04b2beaa71637a84cb45e6062622ae932692e4174726df5f36",
       "production_policy_source_sha256": "3d2e0693777abdf37fe0085feb7badf66a7fb3859c448e23676eb36ceb4a8bda",
       "corpus_provenance_sha256": "119d83ca04a64beab77799daa79396474a34d5a2a2dbb19a188e1e818b1926da",
-      "dependency_lock_sha256": "4b139d177bb9ba2741b791673a80ac1f6dafad3ffa2a3caa85e7aa31b623be51",
+      "dependency_lock_sha256": "9730c76aba3b785d216e436b1bb90da42b26412b9d1b7c085bd2cd252f0518b4",
       "generator_spec_sha256": "df7dbebefc2128fb1bed2363a15394857f3d5d96ef5bb08b8905c12249414fee",
       "identity_count": 20,
       "calibration_queries": 28,
