@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<pwg:ScanSettings xmlns:pwg="http://www.pwg.org/schemas/2010/12/sm" xmlns:scan="http://schemas.hp.com/imaging/escl/2011/05/03">
+  <pwg:Version>2.0</pwg:Version>
+  <pwg:InputSource>Platen</pwg:InputSource>
+  <pwg:ScanRegions>
+    <pwg:ScanRegion>
+      <pwg:Height>3510</pwg:Height>
+      <pwg:Width>2550</pwg:Width>
+      <pwg:XOffset>0</pwg:XOffset>
+      <pwg:YOffset>0</pwg:YOffset>
+      <pwg:ContentRegionUnits>escl:ThreeHundredthsOfInches</pwg:ContentRegionUnits>
+    </pwg:ScanRegion>
+  </pwg:ScanRegions>
+  <scan:ColorMode>RGB24</scan:ColorMode>
+  <scan:DocumentFormat>image/jpeg</scan:DocumentFormat>
+  <scan:XResolution>300</scan:XResolution>
+  <scan:YResolution>300</scan:YResolution>
+</pwg:ScanSettings>

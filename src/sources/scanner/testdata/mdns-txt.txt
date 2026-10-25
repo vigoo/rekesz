@@ -1,0 +1,7 @@
+Captured 2026-10-19 via `avahi-browse -artp`, addresses/UUID sanitized.
+The L3160 advertises both eSCL transports on port 443 and Epson's
+proprietary ESC/I-2 channel on port 1865 (which we do not implement).
+
+=;enp5s0;IPv4;EPSON\032L3160\032Series;_uscans._tcp;local;EPSONAB4E45.local;192.0.2.10;443;"txtvers=1" "vers=2.63" "rs=eSCL" "ty=EPSON L3160 Series" "pdl=application/pdf,image/jpeg" "cs=color,grayscale,binary" "is=platen" "duplex=F" "mopria-certified-scan=1.1" "UUID=cfe92100-67c4-11d4-a45f-5f011a2b3c4d" "note="
+=;enp5s0;IPv4;EPSON\032L3160\032Series;_uscan._tcp;local;EPSONAB4E45.local;192.0.2.10;443;(same TXT keys as _uscans)
+=;enp5s0;IPv4;EPSON\032L3160\032Series;_scanner._tcp;local;EPSONAB4E45.local;192.0.2.10;1865;"txtvers=1" "ty=EPSON L3160 Series" "mfg=EPSON" "mdl=L3160 Series" "scannerAvailable=1" "UUID=cfe92100-67c4-11d4-a45f-5f011a2b3c4d"
