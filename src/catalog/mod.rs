@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 pub(crate) mod people;
 pub(crate) mod recognition;
 mod recognition_policy;
+pub(crate) mod repair;
 pub(crate) mod selections;
 
 pub const CATALOG_DIR: &str = ".rekesz";
@@ -507,24 +508,24 @@ pub fn import_lightroom(root: &Path, lightroom_catalog: &Path) -> Result<ImportR
     import_lightroom_inner(root, lightroom_catalog, true, CURRENT_IMPORT_CAPABILITIES)
 }
 
-fn import_lightroom_inner(
-    root: &Path,
-    lightroom_catalog: &Path,
-    apply: bool,
-    capabilities: ImportCapabilities,
-) -> Result<ImportReport> {
-    let root = root
-        .canonicalize()
-        .with_context(|| format!("cannot resolve opened root {}", root.display()))?;
-    let destination = catalog_path(&root);
-    let lightroom = open_lightroom_immutable(lightroom_catalog)?;
-    let source_namespace = lightroom_source_namespace(&lightroom, lightroom_catalog)?;
-    let mut report = ImportReport {
-        catalog_path: destination.clone(),
-        ..ImportReport::default()
-    };
+/// What the importer would persist for the Lightroom catalog: a recipe for
+/// every matched non-virtual master whose normalized recipe is non-empty.
+/// `matched_keys` carries every matched non-virtual master, including ones
+/// that normalize to empty — the repair needs the full population to
+/// distinguish "derives to no recipe" from "absent from the catalog".
+pub(crate) struct LightroomPlan {
+    pub recipes: BTreeMap<Vec<u8>, DevelopRecipe>,
+    pub matched_keys: HashSet<Vec<u8>>,
+}
 
+fn plan_lightroom_recipes(
+    root: &Path,
+    lightroom: &Connection,
+    capabilities: ImportCapabilities,
+    report: &mut ImportReport,
+) -> Result<LightroomPlan> {
     let mut planned = BTreeMap::<Vec<u8>, DevelopRecipe>::new();
+    let mut matched_keys = HashSet::new();
     let mut query = lightroom.prepare(
         "SELECT root.absolutePath, folder.pathFromRoot, file.baseName, file.extension, \
                 image.masterImage, coalesce(settings.processVersion, ''), \
@@ -546,12 +547,10 @@ fn import_lightroom_inner(
         let folder: String = row.get(1)?;
         let base: String = row.get(2)?;
         let extension: String = row.get(3)?;
-        let Some(relative) = resolve_relative_source(
-            &root,
-            &absolute_root,
-            &folder,
-            &format!("{base}.{extension}"),
-        ) else {
+        let file_name = format!("{base}.{extension}");
+        let is_raw = crate::formats::is_raw(Path::new(&file_name));
+        let Some(relative) = resolve_relative_source(root, &absolute_root, &folder, &file_name)
+        else {
             report.missing_or_outside_root += 1;
             continue;
         };
@@ -564,7 +563,7 @@ fn import_lightroom_inner(
             Parser::new(&text).parse_assignment()?
         };
         let (mut recipe, unsupported, warnings) =
-            normalize_recipe(&process_version, &parsed, capabilities);
+            normalize_recipe(&process_version, &parsed, is_raw, capabilities);
         for property in unsupported {
             *report
                 .unsupported_property_occurrences
@@ -579,6 +578,7 @@ fn import_lightroom_inner(
             let digest = blake3::hash(&relative_key);
             grain.seed = u64::from_le_bytes(digest.as_bytes()[..8].try_into().unwrap());
         }
+        matched_keys.insert(relative_key.clone());
         if recipe.is_empty() {
             report.empty_supported_recipes += 1;
         } else {
@@ -593,6 +593,31 @@ fn import_lightroom_inner(
     }
     drop(rows);
     drop(query);
+    Ok(LightroomPlan {
+        recipes: planned,
+        matched_keys,
+    })
+}
+
+fn import_lightroom_inner(
+    root: &Path,
+    lightroom_catalog: &Path,
+    apply: bool,
+    capabilities: ImportCapabilities,
+) -> Result<ImportReport> {
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("cannot resolve opened root {}", root.display()))?;
+    let destination = catalog_path(&root);
+    let lightroom = open_lightroom_immutable(lightroom_catalog)?;
+    let source_namespace = lightroom_source_namespace(&lightroom, lightroom_catalog)?;
+    let mut report = ImportReport {
+        catalog_path: destination.clone(),
+        ..ImportReport::default()
+    };
+
+    let plan = plan_lightroom_recipes(&root, &lightroom, capabilities, &mut report)?;
+    let planned = plan.recipes;
     let people =
         people::collect_lightroom_people(&root, &lightroom, &source_namespace, &mut report)?;
 
@@ -2275,6 +2300,7 @@ enum Value {
 fn normalize_recipe(
     process_version: &str,
     values: &BTreeMap<String, Value>,
+    is_raw: bool,
     capabilities: ImportCapabilities,
 ) -> (DevelopRecipe, Vec<String>, Vec<String>) {
     if !matches!(process_version, "6.7" | "11.0" | "15.4") {
@@ -2601,31 +2627,87 @@ fn normalize_recipe(
             flatten_property_paths(key, value, &mut unsupported);
         }
     }
-    clear_lightroom_defaults(process_version, &mut recipe);
+    clear_lightroom_defaults(
+        process_version,
+        is_raw,
+        values.contains_key("Sharpness"),
+        &mut recipe,
+    );
     (recipe, unsupported, warnings)
 }
 
-fn clear_lightroom_defaults(process_version: &str, recipe: &mut DevelopRecipe) {
-    // Lightroom serializes these effective defaults even when the user has
-    // made no edit. They are defaults of the supported PV2012-family process
-    // versions, rather than authored recipe operations.
-    if matches!(process_version, "6.7" | "11.0" | "15.4")
-        && recipe
-            .tone_curve
-            .as_deref()
-            .is_some_and(is_lightroom_default_tone_curve)
+/// Strip the detail block and tone curve that Lightroom serializes for an
+/// untouched image. The serialized defaults depend on the file flavor: raw
+/// defaults differ per process version, and non-raw files omit the
+/// `Sharpness`/`ColorNoiseReduction` keys entirely, so the unwrapped fill
+/// values form their own default. The no-`Sharpness`-key raw row is selected
+/// by key absence — a deliberate `Sharpness = 0` on a raw (key present) must
+/// survive as an edit even though it builds the same numbers.
+fn clear_lightroom_defaults(
+    process_version: &str,
+    is_raw: bool,
+    has_sharpness_key: bool,
+    recipe: &mut DevelopRecipe,
+) {
+    if recipe
+        .tone_curve
+        .as_deref()
+        .is_some_and(is_lightroom_default_tone_curve)
     {
         recipe.tone_curve = None;
     }
-    if matches!(process_version, "6.7" | "11.0" | "15.4")
-        && recipe.detail.is_some_and(is_lightroom_default_detail)
-    {
+    if recipe.detail.is_some_and(|detail| {
+        detail == lightroom_serialized_detail_default(process_version, is_raw, has_sharpness_key)
+    }) {
         recipe.detail = None;
     }
 }
 
+fn lightroom_serialized_detail_default(
+    process_version: &str,
+    is_raw: bool,
+    has_sharpness_key: bool,
+) -> DetailRecipe {
+    let generic = DetailRecipe {
+        sharpening: 0.0,
+        sharpen_radius: 1.0,
+        sharpen_detail: 25.0,
+        edge_masking: 0.0,
+        luminance_noise_reduction: 0.0,
+        luminance_detail: 50.0,
+        luminance_contrast: 0.0,
+        color_noise_reduction: 0.0,
+        color_detail: 50.0,
+        color_smoothness: 50.0,
+    };
+    match (is_raw, has_sharpness_key) {
+        (false, _) => generic,
+        // Linear/rendered DNG-style raws serialize without a Sharpness key.
+        (true, false) => DetailRecipe {
+            color_noise_reduction: 25.0,
+            ..generic
+        },
+        (true, true) => match process_version {
+            "6.7" => DetailRecipe {
+                sharpening: 25.0,
+                color_noise_reduction: 25.0,
+                ..generic
+            },
+            // Keep this arm in lockstep with the supported process versions in
+            // normalize_recipe; a newly accepted version must get its own
+            // measured default here rather than silently inheriting this one.
+            "11.0" | "15.4" => DetailRecipe {
+                sharpening: 40.0,
+                color_noise_reduction: 25.0,
+                ..generic
+            },
+            _ => generic,
+        },
+    }
+}
+
 fn is_lightroom_default_tone_curve(curve: &[[f32; 2]]) -> bool {
-    const DEFAULT: [[f32; 2]; 7] = [
+    const PV2012_DEFAULT: [[f32; 2]; 7] = [
         [0.0, 0.0],
         [22.0 / 255.0, 16.0 / 255.0],
         [40.0 / 255.0, 35.0 / 255.0],
@@ -2634,29 +2716,24 @@ fn is_lightroom_default_tone_curve(curve: &[[f32; 2]]) -> bool {
         [240.0 / 255.0, 246.0 / 255.0],
         [1.0, 1.0],
     ];
-    curve.len() == DEFAULT.len()
-        && curve.iter().zip(DEFAULT).all(|(actual, expected)| {
+    const LEGACY_MEDIUM_CONTRAST: [[f32; 2]; 6] = [
+        [0.0, 0.0],
+        [32.0 / 255.0, 22.0 / 255.0],
+        [64.0 / 255.0, 56.0 / 255.0],
+        [128.0 / 255.0, 128.0 / 255.0],
+        [192.0 / 255.0, 196.0 / 255.0],
+        [1.0, 1.0],
+    ];
+    fn matches(actual: &[[f32; 2]], expected: &[[f32; 2]]) -> bool {
+        actual.iter().zip(expected).all(|(actual, expected)| {
             actual
                 .iter()
                 .zip(expected)
                 .all(|(actual, expected)| (actual - expected).abs() <= 1e-6)
         })
-}
-
-fn is_lightroom_default_detail(detail: DetailRecipe) -> bool {
-    detail
-        == DetailRecipe {
-            sharpening: 40.0,
-            sharpen_radius: 1.0,
-            sharpen_detail: 25.0,
-            edge_masking: 0.0,
-            luminance_noise_reduction: 0.0,
-            luminance_detail: 50.0,
-            luminance_contrast: 0.0,
-            color_noise_reduction: 25.0,
-            color_detail: 50.0,
-            color_smoothness: 50.0,
-        }
+    }
+    (curve.len() == PV2012_DEFAULT.len() && matches(curve, &PV2012_DEFAULT))
+        || (curve.len() == LEGACY_MEDIUM_CONTRAST.len() && matches(curve, &LEGACY_MEDIUM_CONTRAST))
 }
 
 fn flatten_property_paths(prefix: &str, value: &Value, output: &mut Vec<String>) {

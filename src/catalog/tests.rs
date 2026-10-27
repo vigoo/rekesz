@@ -237,7 +237,64 @@ fn query_workload_lifecycle_has_bounded_start_wait_and_exact_in_progress_state()
     );
 }
 
+struct FixtureEntry {
+    base_name: String,
+    extension: String,
+    process_version: String,
+    text: String,
+    /// When set, this entry becomes a virtual copy of the master entry with
+    /// this index (shares its file, gets its own settings row).
+    virtual_copy_of: Option<usize>,
+}
+
+fn fixture_master(
+    base_name: &str,
+    extension: &str,
+    process_version: &str,
+    text: &str,
+) -> FixtureEntry {
+    FixtureEntry {
+        base_name: base_name.to_owned(),
+        extension: extension.to_owned(),
+        process_version: process_version.to_owned(),
+        text: text.to_owned(),
+        virtual_copy_of: None,
+    }
+}
+
+fn fixture_virtual_copy(master_index: usize, process_version: &str, text: &str) -> FixtureEntry {
+    FixtureEntry {
+        base_name: String::new(),
+        extension: String::new(),
+        process_version: process_version.to_owned(),
+        text: text.to_owned(),
+        virtual_copy_of: Some(master_index),
+    }
+}
+
 fn lightroom_fixture(root: &Path, recipe: &str) -> tempfile::TempDir {
+    lightroom_fixture_with(root, "photo", "CR3", "15.4", recipe)
+}
+
+fn lightroom_fixture_with(
+    root: &Path,
+    base_name: &str,
+    extension: &str,
+    process_version: &str,
+    recipe: &str,
+) -> tempfile::TempDir {
+    lightroom_catalog_fixture(
+        root,
+        &[fixture_master(
+            base_name,
+            extension,
+            process_version,
+            recipe,
+        )],
+    )
+}
+
+fn lightroom_catalog_fixture(root: &Path, entries: &[FixtureEntry]) -> tempfile::TempDir {
     let fixture = tempfile::tempdir().unwrap();
     let path = fixture.path().join("fixture.lrcat");
     let connection = Connection::open(path).unwrap();
@@ -266,18 +323,55 @@ fn lightroom_fixture(root: &Path, recipe: &str) -> tempfile::TempDir {
     connection
         .execute("INSERT INTO AgLibraryFolder VALUES(1, 1, '')", [])
         .unwrap();
-    connection
-        .execute("INSERT INTO AgLibraryFile VALUES(1, 1, 'photo', 'CR3')", [])
-        .unwrap();
-    connection
-        .execute("INSERT INTO Adobe_images VALUES(1, 1, NULL)", [])
-        .unwrap();
-    connection
-        .execute(
-            "INSERT INTO Adobe_imageDevelopSettings VALUES(1, '15.4', ?1)",
-            [recipe],
-        )
-        .unwrap();
+    let mut master_ids: Vec<(i64, i64)> = Vec::new();
+    // Per-table counters mirror the old single-fixture allocation (file 1,
+    // image 1) so tests that append rows with assumed ids keep working.
+    let mut next_file_id = 1i64;
+    let mut next_image_id = 1i64;
+    for entry in entries {
+        let (file_id, image_id) = match entry.virtual_copy_of {
+            None => {
+                let file_id = next_file_id;
+                next_file_id += 1;
+                connection
+                    .execute(
+                        "INSERT INTO AgLibraryFile VALUES(?1, 1, ?2, ?3)",
+                        rusqlite::params![file_id, entry.base_name, entry.extension],
+                    )
+                    .unwrap();
+                let image_id = next_image_id;
+                next_image_id += 1;
+                connection
+                    .execute(
+                        "INSERT INTO Adobe_images VALUES(?1, ?2, NULL)",
+                        rusqlite::params![image_id, file_id],
+                    )
+                    .unwrap();
+                (file_id, image_id)
+            }
+            Some(master_index) => {
+                let image_id = next_image_id;
+                next_image_id += 1;
+                let master = master_ids[master_index];
+                connection
+                    .execute(
+                        "INSERT INTO Adobe_images VALUES(?1, ?2, ?3)",
+                        rusqlite::params![image_id, master.0, master.1],
+                    )
+                    .unwrap();
+                (master.0, image_id)
+            }
+        };
+        connection
+            .execute(
+                "INSERT INTO Adobe_imageDevelopSettings VALUES(?1, ?2, ?3)",
+                rusqlite::params![image_id, entry.process_version, entry.text],
+            )
+            .unwrap();
+        if entry.virtual_copy_of.is_none() {
+            master_ids.push((file_id, image_id));
+        }
+    }
     fixture
 }
 
@@ -322,7 +416,7 @@ fn normalization_keeps_only_supported_non_defaults() {
             .parse_assignment()
             .unwrap();
     let (recipe, unsupported, warnings) =
-        normalize_recipe("15.4", &values, ImportCapabilities::ALL);
+        normalize_recipe("15.4", &values, true, ImportCapabilities::ALL);
     assert_eq!(recipe.exposure_ev, Some(1.0));
     assert_eq!(recipe.contrast, None);
     assert_eq!(recipe.tone_curve, None);
@@ -332,19 +426,634 @@ fn normalization_keeps_only_supported_non_defaults() {
 
 #[test]
 fn lightroom_effective_defaults_do_not_create_a_recipe() {
-    let values = Parser::new(
-            "s={ToneCurvePV2012={0,0,22,16,40,35,127,127,224,230,240,246,255,255},Sharpness=40,SharpenRadius=1,SharpenDetail=25,SharpenEdgeMasking=0,LuminanceSmoothing=0,LuminanceNoiseReductionDetail=50,LuminanceNoiseReductionContrast=0,ColorNoiseReduction=25,ColorNoiseReductionDetail=50,ColorNoiseReductionSmoothness=50}",
-        )
+    // Lightroom serializes its raw default detail per process version: PV6.7
+    // defaults to sharpening 25, PV11/15.4 to 40; colour NR defaults to 25 in
+    // both. The blobs below are the untouched raw serializations measured in a
+    // real catalog, not one shared fixture.
+    let per_version = [
+        ("6.7", "Sharpness=25"),
+        ("11.0", "Sharpness=40"),
+        ("15.4", "Sharpness=40"),
+    ];
+    for (version, sharpness) in per_version {
+        let values = Parser::new(&format!(
+            "s={{ToneCurvePV2012={{0,0,255,255}},{sharpness},SharpenRadius=1,SharpenDetail=25,\
+             SharpenEdgeMasking=0,LuminanceSmoothing=0,LuminanceNoiseReductionDetail=50,\
+             LuminanceNoiseReductionContrast=0,ColorNoiseReduction=25,ColorNoiseReductionDetail=50,\
+             ColorNoiseReductionSmoothness=50}}"
+        ))
         .parse_assignment()
         .unwrap();
-
-    for version in ["6.7", "11.0", "15.4"] {
         let (recipe, unsupported, warnings) =
-            normalize_recipe(version, &values, ImportCapabilities::ALL);
+            normalize_recipe(version, &values, true, ImportCapabilities::ALL);
         assert!(recipe.is_empty(), "{version}: {recipe:?}");
         assert!(unsupported.is_empty(), "{version}: {unsupported:?}");
         assert!(warnings.is_empty(), "{version}: {warnings:?}");
     }
+}
+
+// Untouched non-raw serialization measured from a real catalog blob: no
+// Sharpness or ColorNoiseReduction keys, only the radius/detail/masking keys.
+const NON_RAW_UNTOUCHED_BLOB: &str = "s={AutoGrayscaleMix=true,Blacks2012=0,Brightness=0,\
+     CameraProfile='Embedded',ColorGradeBlending=50,Contrast2012=0,ConvertToGrayscale=false,\
+     Exposure2012=0,GrainSize=25,Highlights2012=0,IncrementalTemperature=0,IncrementalTint=0,\
+     LensManualDistortionAmount=0,LensProfileEnable=0,LuminanceNoiseReductionContrast=0,\
+     Saturation=0,SDRBlend=0,Shadows2012=0,SharpenDetail=25,SharpenEdgeMasking=0,SharpenRadius=1,\
+     ToneCurveName2012='Linear',ToneCurvePV2012={0,0,255,255},Vibrance=0,WhiteBalance='As Shot',\
+     Whites2012=0}";
+
+#[test]
+fn non_raw_serialized_detail_defaults_do_not_create_a_recipe() {
+    // The unwrapped amounts must not masquerade as an edit.
+    let values = Parser::new(NON_RAW_UNTOUCHED_BLOB)
+        .parse_assignment()
+        .unwrap();
+    let (recipe, _, _) = normalize_recipe("6.7", &values, false, ImportCapabilities::ALL);
+    assert!(recipe.is_empty(), "{recipe:?}");
+}
+
+#[test]
+fn pv67_raw_serialized_detail_defaults_do_not_create_a_recipe() {
+    // PV6.7 raws default to sharpening 25 (not the PV11/15.4 value of 40);
+    // measured untouched NEF blob including legacy compatibility keys.
+    let values = Parser::new(
+        "s={Blacks2012=0,Brightness=50,CameraProfile='Adobe Standard',ColorNoiseReduction=25,\
+             Contrast2012=0,ConvertToGrayscale=false,Exposure2012=0,GrainSize=25,\
+             Highlights2012=0,LuminanceNoiseReductionContrast=0,Saturation=0,Shadows=5,\
+             Shadows2012=0,SharpenDetail=25,SharpenEdgeMasking=0,SharpenRadius=1,Sharpness=25,\
+             Temperature=6550,Tint=7,ToneCurveName2012='Linear',ToneCurvePV2012={0,0,255,255},\
+             Vibrance=0,WhiteBalance='As Shot',Whites2012=0}",
+    )
+    .parse_assignment()
+    .unwrap();
+    let (recipe, _, _) = normalize_recipe("6.7", &values, true, ImportCapabilities::ALL);
+    assert!(recipe.is_empty(), "{recipe:?}");
+}
+
+#[test]
+fn raw_without_a_sharpness_key_serializes_default_detail() {
+    // Linear/rendered DNG-style raws serialize the detail block without a
+    // Sharpness key and with colour NR at its default 25; the unwrapped zero
+    // sharpening must not masquerade as a deliberate edit. Selected by the
+    // absence of the Sharpness key, not by the built value.
+    let values = Parser::new(
+        "s={SharpenRadius=1,SharpenDetail=25,SharpenEdgeMasking=0,LuminanceSmoothing=0,\
+             LuminanceNoiseReductionDetail=50,LuminanceNoiseReductionContrast=0,\
+             ColorNoiseReduction=25,ColorNoiseReductionDetail=50,ColorNoiseReductionSmoothness=50,\
+             ToneCurvePV2012={0,0,255,255}}",
+    )
+    .parse_assignment()
+    .unwrap();
+    let (recipe, _, _) = normalize_recipe("15.4", &values, true, ImportCapabilities::ALL);
+    assert!(recipe.is_empty(), "{recipe:?}");
+}
+
+#[test]
+fn legacy_medium_contrast_curve_default_does_not_create_a_recipe() {
+    // With a linear PV2012 curve the legacy ToneCurve fallback picks up the
+    // serialized PV2003-era "Medium Contrast" default (six points).
+    let values = Parser::new(
+        "s={ToneCurveName='Medium Contrast',ToneCurveName2012='Linear',\
+             ToneCurve={0,0,32,22,64,56,128,128,192,196,255,255},\
+             ToneCurvePV2012={0,0,255,255},Sharpness=40,SharpenRadius=1,SharpenDetail=25,\
+             SharpenEdgeMasking=0,LuminanceSmoothing=0,LuminanceNoiseReductionDetail=50,\
+             LuminanceNoiseReductionContrast=0,ColorNoiseReduction=25,ColorNoiseReductionDetail=50,\
+             ColorNoiseReductionSmoothness=50}",
+    )
+    .parse_assignment()
+    .unwrap();
+    let (recipe, _, _) = normalize_recipe("11.0", &values, true, ImportCapabilities::ALL);
+    assert!(recipe.is_empty(), "{recipe:?}");
+}
+
+#[test]
+fn cross_flavor_serialized_defaults_stay_edits() {
+    let default_detail = "SharpenRadius=1,SharpenDetail=25,SharpenEdgeMasking=0,\
+         LuminanceSmoothing=0,LuminanceNoiseReductionDetail=50,LuminanceNoiseReductionContrast=0,\
+         ColorNoiseReductionDetail=50,ColorNoiseReductionSmoothness=50";
+    let build = |sharpness: &str, color_noise: &str| {
+        Parser::new(&format!(
+            "s={{ToneCurvePV2012={{0,0,255,255}},{sharpness},{default_detail},\
+             ColorNoiseReduction={color_noise}}}"
+        ))
+        .parse_assignment()
+        .unwrap()
+    };
+    let expected_detail = |sharpening: f32, color_noise_reduction: f32| {
+        Some(DetailRecipe {
+            sharpening,
+            sharpen_radius: 1.0,
+            sharpen_detail: 25.0,
+            edge_masking: 0.0,
+            luminance_noise_reduction: 0.0,
+            luminance_detail: 50.0,
+            luminance_contrast: 0.0,
+            color_noise_reduction,
+            color_detail: 50.0,
+            color_smoothness: 50.0,
+        })
+    };
+    // A PV6.7 raw raised to the PV11 default (40) is a real edit.
+    let (recipe, _, _) = normalize_recipe(
+        "6.7",
+        &build("Sharpness=40", "25"),
+        true,
+        ImportCapabilities::ALL,
+    );
+    assert_eq!(recipe.detail, expected_detail(40.0, 25.0));
+    // A PV11/15.4 raw lowered to the PV6.7 default (25) is a real edit.
+    let (recipe, _, _) = normalize_recipe(
+        "15.4",
+        &build("Sharpness=25", "25"),
+        true,
+        ImportCapabilities::ALL,
+    );
+    assert_eq!(recipe.detail, expected_detail(25.0, 25.0));
+    // A non-raw file with an explicit raw-default sharpening is a real edit.
+    let (recipe, _, _) = normalize_recipe(
+        "15.4",
+        &build("Sharpness=40", "0"),
+        false,
+        ImportCapabilities::ALL,
+    );
+    assert_eq!(recipe.detail, expected_detail(40.0, 0.0));
+    // A non-raw file whose values are numerically identical to the PV15.4 raw
+    // default (40/25) is still a real edit: only the file's rawness decides.
+    let (recipe, _, _) = normalize_recipe(
+        "15.4",
+        &build("Sharpness=40", "25"),
+        false,
+        ImportCapabilities::ALL,
+    );
+    assert_eq!(recipe.detail, expected_detail(40.0, 25.0));
+    // A deliberate zero with the key present (colour NR untouched at its
+    // default) is a real edit, distinct from the key-absent serialization.
+    let (recipe, _, _) = normalize_recipe(
+        "15.4",
+        &build("Sharpness=0", "25"),
+        true,
+        ImportCapabilities::ALL,
+    );
+    assert_eq!(recipe.detail, expected_detail(0.0, 25.0));
+}
+
+#[test]
+fn user_legacy_point_curve_survives() {
+    // A six-point curve that differs from Medium Contrast in one interior
+    // point is a genuine user curve, not the serialized default.
+    let values = Parser::new(
+        "s={ToneCurveName='Custom',ToneCurveName2012='Linear',\
+             ToneCurve={0,0,32,30,64,56,128,128,192,196,255,255},\
+             ToneCurvePV2012={0,0,255,255}}",
+    )
+    .parse_assignment()
+    .unwrap();
+    let (recipe, _, _) = normalize_recipe("11.0", &values, true, ImportCapabilities::ALL);
+    let curve = recipe.tone_curve.as_ref().unwrap();
+    assert_eq!(curve.len(), 6);
+    assert!((curve[1][1] - 30.0 / 255.0).abs() < 1e-6, "{curve:?}");
+}
+
+#[test]
+fn default_look_and_curves_do_not_create_a_recipe() {
+    let seven_point_default = "ToneCurvePV2012={0,0,22,16,40,35,127,127,224,230,240,246,255,255}";
+    let default_raw_detail = "Sharpness=40,SharpenRadius=1,SharpenDetail=25,SharpenEdgeMasking=0,\
+         LuminanceSmoothing=0,LuminanceNoiseReductionDetail=50,LuminanceNoiseReductionContrast=0,\
+         ColorNoiseReduction=25,ColorNoiseReductionDetail=50,ColorNoiseReductionSmoothness=50";
+    // Direct top-level serialization of the PV2012 default curve together with
+    // default raw detail: both strips must fire in one pass.
+    let direct = Parser::new(&format!("s={{{seven_point_default},{default_raw_detail}}}"))
+        .parse_assignment()
+        .unwrap();
+    let (recipe, _, _) = normalize_recipe("15.4", &direct, true, ImportCapabilities::ALL);
+    assert!(recipe.is_empty(), "{recipe:?}");
+
+    // The default "Adobe Color" look's curve rides Look.Parameters and must
+    // stay masked by the default strip when no top-level curve exists.
+    let look = Parser::new(&format!(
+        "s={{Look={{Name='Adobe Color',Parameters={{{seven_point_default},ProcessVersion='11.0'}},\
+         SupportsAmount=false}}}}"
+    ))
+    .parse_assignment()
+    .unwrap();
+    let (recipe, _, _) = normalize_recipe("11.0", &look, true, ImportCapabilities::ALL);
+    assert!(recipe.is_empty(), "{recipe:?}");
+}
+
+#[test]
+fn non_default_curve_via_look_parameters_survives() {
+    // Real imports depend on this fallback: 33 catalog images carry custom
+    // curves only through Look.Parameters.
+    let values = Parser::new(
+        "s={Look={Name='Custom Look',Parameters={ToneCurvePV2012={0,0,128,160,255,255}}}}",
+    )
+    .parse_assignment()
+    .unwrap();
+    let (recipe, _, _) = normalize_recipe("11.0", &values, true, ImportCapabilities::ALL);
+    let curve = recipe.tone_curve.as_ref().unwrap();
+    assert_eq!(curve.len(), 3);
+    assert!((curve[1][0] - 128.0 / 255.0).abs() < 1e-6, "{curve:?}");
+    assert!((curve[1][1] - 160.0 / 255.0).abs() < 1e-6, "{curve:?}");
+}
+
+#[test]
+fn grain_frequency_without_size_stays_an_edit() {
+    // 44 is deliberately not the unwrap_or fill (50): only key presence may
+    // produce the grain recipe here.
+    let values = Parser::new("s={GrainFrequency=44,ToneCurvePV2012={0,0,255,255}}")
+        .parse_assignment()
+        .unwrap();
+    let (recipe, _, _) = normalize_recipe("15.4", &values, true, ImportCapabilities::ALL);
+    assert_eq!(recipe.grain.unwrap().roughness, 44.0);
+}
+
+#[test]
+fn exposure_edit_with_default_detail_keeps_only_the_edit() {
+    let values = Parser::new(
+        "s={Exposure2012=0.5,ToneCurvePV2012={0,0,255,255},Sharpness=40,SharpenRadius=1,\
+             SharpenDetail=25,SharpenEdgeMasking=0,LuminanceSmoothing=0,\
+             LuminanceNoiseReductionDetail=50,LuminanceNoiseReductionContrast=0,\
+             ColorNoiseReduction=25,ColorNoiseReductionDetail=50,ColorNoiseReductionSmoothness=50}",
+    )
+    .parse_assignment()
+    .unwrap();
+    let (recipe, _, _) = normalize_recipe("15.4", &values, true, ImportCapabilities::ALL);
+    assert_eq!(recipe.exposure_ev, Some(0.5));
+    assert_eq!(recipe.detail, None);
+    assert!(!recipe.is_empty());
+}
+
+#[test]
+fn missing_develop_settings_produce_no_recipe() {
+    // A missing Adobe_imageDevelopSettings row LEFT JOINs to empty text and an
+    // empty process version, which must land on the unsupported-version path
+    // with a default recipe.
+    let values = Parser::new("s={}").parse_assignment().unwrap();
+    let (recipe, unsupported, _) = normalize_recipe("", &values, true, ImportCapabilities::ALL);
+    assert!(recipe.is_empty(), "{recipe:?}");
+    assert_eq!(unsupported, ["UnsupportedProcessVersion:"]);
+}
+
+#[test]
+fn non_raw_default_detail_imports_no_recipe_end_to_end() {
+    // The import loop must classify rawness from the file extension before
+    // default stripping: a JPEG with the untouched non-raw serialization
+    // produces no recipe at all (and no catalog, matching the empty-import
+    // behavior).
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("photo.jpg"), b"test").unwrap();
+    let fixture =
+        lightroom_fixture_with(root.path(), "photo", "jpg", "6.7", NON_RAW_UNTOUCHED_BLOB);
+    let report = import_lightroom_inner(
+        root.path(),
+        &fixture.path().join("fixture.lrcat"),
+        true,
+        ImportCapabilities::ALL,
+    )
+    .unwrap();
+    assert_eq!(report.imported_recipes, 0);
+    assert_eq!(report.empty_supported_recipes, 1);
+    assert!(load_recipes(root.path()).unwrap().is_empty());
+}
+
+// Pre-fix importer output shapes, reconstructed through the real serializer
+// so field naming and ordering match what load_recipes parses.
+fn legacy_default_detail() -> DetailRecipe {
+    DetailRecipe {
+        sharpening: 25.0,
+        ..DetailRecipe {
+            sharpen_radius: 1.0,
+            sharpen_detail: 25.0,
+            color_noise_reduction: 25.0,
+            ..DetailRecipe::default()
+        }
+    }
+}
+
+fn fixture_recipe_json(recipe: &DevelopRecipe) -> String {
+    serde_json::to_string(recipe).unwrap()
+}
+
+fn seed_legacy_row(connection: &Connection, relative: &str, recipe_json: &str) {
+    // The pre-fix importer computed real digests, so the seeded rows must
+    // carry the matching digest too — load_recipes rejects mismatches.
+    let recipe: DevelopRecipe = serde_json::from_str(recipe_json).unwrap();
+    let digest = recipe.digest().unwrap();
+    let encoded = encode_relative_path(Path::new(relative)).unwrap();
+    connection
+        .execute(
+            "INSERT INTO assets(relative_path, scope_key) VALUES (?1, ?2)",
+            rusqlite::params![encoded, scope_key(Path::new(relative)).unwrap()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO develop_recipes(asset_id, recipe_json, recipe_digest, imported_at) \
+             VALUES ((SELECT id FROM assets WHERE relative_path=?1), ?2, ?3, \
+                     datetime('now'))",
+            rusqlite::params![encoded, recipe_json, digest.as_slice()],
+        )
+        .unwrap();
+}
+
+#[test]
+fn lightroom_defaults_repair_partitions_and_is_idempotent() {
+    let root = tempfile::tempdir().unwrap();
+    // Untouched PV6.7 raw, untouched non-raw, legacy-curve carrier, genuine
+    // edit with pre-fix default detail, a file edited after the import
+    // (never imported), and a virtual copy.
+    let entries = [
+        fixture_master(
+            "DSC_0001",
+            "NEF",
+            "6.7",
+            "s={Exposure2012=0,Sharpness=25,ColorNoiseReduction=25,SharpenRadius=1,SharpenDetail=25,SharpenEdgeMasking=0,LuminanceSmoothing=0,LuminanceNoiseReductionDetail=50,LuminanceNoiseReductionContrast=0,ToneCurvePV2012={0,0,255,255},WhiteBalance='As Shot'}",
+        ),
+        fixture_master("IMG_0002", "jpg", "6.7", NON_RAW_UNTOUCHED_BLOB),
+        fixture_master(
+            "DSC_0003",
+            "NEF",
+            "6.7",
+            "s={Exposure2012=0.5,Sharpness=25,ColorNoiseReduction=25,SharpenRadius=1,SharpenDetail=25,SharpenEdgeMasking=0,LuminanceSmoothing=0,LuminanceNoiseReductionDetail=50,LuminanceNoiseReductionContrast=0,ToneCurvePV2012={0,0,255,255},WhiteBalance='As Shot'}",
+        ),
+        fixture_master(
+            "DSC_0004",
+            "NEF",
+            "6.7",
+            "s={Exposure2012=0,Sharpness=25,ColorNoiseReduction=25,SharpenRadius=1,SharpenDetail=25,SharpenEdgeMasking=0,LuminanceSmoothing=0,LuminanceNoiseReductionDetail=50,LuminanceNoiseReductionContrast=0,ToneCurve={0,0,32,22,64,56,128,128,192,196,255,255},ToneCurvePV2012={0,0,255,255},WhiteBalance='As Shot'}",
+        ),
+        fixture_master(
+            "NEW_0005",
+            "NEF",
+            "6.7",
+            "s={Exposure2012=1.0,WhiteBalance='As Shot'}",
+        ),
+        fixture_virtual_copy(0, "6.7", "s={Exposure2012=2.0,WhiteBalance='As Shot'}"),
+    ];
+    for name in [
+        "DSC_0001.NEF",
+        "IMG_0002.jpg",
+        "DSC_0003.NEF",
+        "DSC_0004.NEF",
+        "NEW_0005.NEF",
+    ] {
+        fs::write(root.path().join(name), b"x").unwrap();
+    }
+    let fixture = lightroom_catalog_fixture(root.path(), &entries);
+    let lightroom_path = fixture.path().join("fixture.lrcat");
+
+    let defaults_only = fixture_recipe_json(&DevelopRecipe {
+        detail: Some(legacy_default_detail()),
+        ..DevelopRecipe::default()
+    });
+    let curve_only = fixture_recipe_json(&DevelopRecipe {
+        tone_curve: Some(vec![
+            [0.0, 0.0],
+            [32.0 / 255.0, 22.0 / 255.0],
+            [64.0 / 255.0, 56.0 / 255.0],
+            [0.5, 0.5],
+            [192.0 / 255.0, 196.0 / 255.0],
+            [1.0, 1.0],
+        ]),
+        ..DevelopRecipe::default()
+    });
+    let genuine_with_default_detail = fixture_recipe_json(&DevelopRecipe {
+        exposure_ev: Some(0.5),
+        detail: Some(legacy_default_detail()),
+        ..DevelopRecipe::default()
+    });
+
+    initialize_test_catalog(root.path()).unwrap();
+    let connection = Connection::open(catalog_path(root.path())).unwrap();
+    seed_legacy_row(&connection, "DSC_0001.NEF", &defaults_only);
+    seed_legacy_row(&connection, "IMG_0002.jpg", &defaults_only);
+    seed_legacy_row(&connection, "DSC_0003.NEF", &genuine_with_default_detail);
+    seed_legacy_row(&connection, "DSC_0004.NEF", &curve_only);
+    drop(connection);
+
+    // Dry run: partition without writing.
+    let dry = repair::repair_lightroom_defaults(root.path(), &lightroom_path, false).unwrap();
+    assert_eq!(dry.deleted, 3, "raw + non-raw defaults-only + curve-only");
+    assert_eq!(dry.updated, 1, "genuine edit sheds its default detail");
+    assert_eq!(dry.kept_unprovable, 0);
+    assert_eq!(
+        dry.not_yet_imported, 1,
+        "NEW_0005 was edited after the import"
+    );
+    assert!(!dry.applied);
+    assert_eq!(dry.derivation.imported, 2);
+    assert_eq!(
+        Connection::open(catalog_path(root.path()))
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM develop_recipes", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        4,
+        "dry run must not write"
+    );
+
+    // Apply: three rows deleted, the genuine row rewritten in place.
+    let applied = repair::repair_lightroom_defaults(root.path(), &lightroom_path, true).unwrap();
+    assert_eq!(applied.deleted, 3);
+    assert_eq!(applied.updated, 1);
+    assert!(
+        applied
+            .backup_path
+            .as_ref()
+            .is_some_and(|path| path.exists())
+    );
+    // Orphaned asset rows from the deleted recipes are collected.
+    assert_eq!(applied.orphaned_assets_removed, 3);
+
+    let recipes = load_recipes(root.path()).unwrap();
+    assert_eq!(recipes.len(), 1, "load_recipes validates every digest");
+    let entry = recipes.values().next().unwrap();
+    assert_eq!(entry.recipe.exposure_ev, Some(0.5));
+    assert_eq!(entry.recipe.detail, None);
+    assert_eq!(entry.recipe.tone_curve, None);
+
+    // Idempotency: the rewritten row now matches byte-for-byte.
+    let second = repair::repair_lightroom_defaults(root.path(), &lightroom_path, true).unwrap();
+    assert_eq!(second.deleted, 0);
+    assert_eq!(second.updated, 0);
+    assert_eq!(second.kept_identical, 1);
+    assert_eq!(second.orphaned_assets_removed, 0);
+}
+
+#[test]
+fn lightroom_defaults_repair_keeps_unprovable_rows_and_refuses_dirty_catalogs() {
+    let root = tempfile::tempdir().unwrap();
+    let entries = [fixture_master(
+        "DSC_0001",
+        "NEF",
+        "6.7",
+        "s={Exposure2012=0,WhiteBalance='As Shot'}",
+    )];
+    fs::write(root.path().join("DSC_0001.NEF"), b"x").unwrap();
+    let fixture = lightroom_catalog_fixture(root.path(), &entries);
+    let lightroom_path = fixture.path().join("fixture.lrcat");
+
+    let defaults_only = fixture_recipe_json(&DevelopRecipe {
+        detail: Some(legacy_default_detail()),
+        ..DevelopRecipe::default()
+    });
+    initialize_test_catalog(root.path()).unwrap();
+    let connection = Connection::open(catalog_path(root.path())).unwrap();
+    // A row whose file the .lrcat cannot re-derive (not present in it).
+    seed_legacy_row(&connection, "ABSENT.NEF", &defaults_only);
+    drop(connection);
+
+    let dry = repair::repair_lightroom_defaults(root.path(), &lightroom_path, false).unwrap();
+    assert_eq!(dry.kept_unprovable, 1, "absent files are never deleted");
+    assert_eq!(dry.deleted, 0);
+
+    let applied = repair::repair_lightroom_defaults(root.path(), &lightroom_path, true).unwrap();
+    assert_eq!(applied.kept_unprovable, 1);
+    assert_eq!(applied.deleted, 0);
+    assert_eq!(applied.orphaned_assets_removed, 0);
+    assert_eq!(load_recipes(root.path()).unwrap().len(), 1);
+
+    // The imported_at precondition cannot be exercised here: schema v7
+    // declares the column NOT NULL, so a non-import writer's rows are
+    // unrepresentable. The refusal check in repair_lightroom_defaults exists
+    // as defense-in-depth against future schema drift.
+}
+
+#[test]
+#[ignore = "live acceptance: point REKESZ_LR_ROOT at a real library root and \
+           REKESZ_LR_CATALOG at its Lightroom catalog, then run with \
+           --include-ignored; the catalog is read through an immutable \
+           snapshot, so hot-WAL rows are invisible to it"]
+fn live_lightroom_defaults_dry_run() {
+    let Some(root) = std::env::var_os("REKESZ_LR_ROOT").map(PathBuf::from) else {
+        eprintln!("skipping: REKESZ_LR_ROOT is not set");
+        return;
+    };
+    let Some(lightroom_catalog) = std::env::var_os("REKESZ_LR_CATALOG").map(PathBuf::from) else {
+        eprintln!("skipping: REKESZ_LR_CATALOG is not set");
+        return;
+    };
+    let report = analyze_lightroom(&root, &lightroom_catalog).unwrap();
+    eprintln!(
+        "lightroom_images {} matched {} imported {} empty {} virtual {} missing {} conflicts {}",
+        report.lightroom_images,
+        report.matched_files,
+        report.imported_recipes,
+        report.empty_supported_recipes,
+        report.skipped_virtual_copies,
+        report.missing_or_outside_root,
+        report.conflicting_sources,
+    );
+    println!("unsupported: {:?}", report.unsupported_property_occurrences);
+    println!("warnings: {:?}", report.fidelity_warnings);
+    assert_eq!(report.conflicting_sources, 0);
+    // Snapshot-independent population invariants: every image lands in exactly
+    // one bucket. The absolute imported/empty split is time-dependent (the
+    // live catalog keeps evolving) and is judged against the counters recorded
+    // in the plan, not asserted here.
+    assert_eq!(
+        report.imported_recipes + report.empty_supported_recipes,
+        report.matched_files
+    );
+    assert_eq!(
+        report.matched_files + report.skipped_virtual_copies + report.missing_or_outside_root,
+        report.lightroom_images
+    );
+    assert!(report.imported_recipes > 0);
+    assert!(report.empty_supported_recipes > 0);
+}
+
+#[test]
+#[ignore = "live acceptance: point REKESZ_LR_ROOT at a real library root and \
+           REKESZ_LR_CATALOG at its Lightroom catalog, then run with \
+           --include-ignored; dry-run only — pass REKESZ_LR_REPAIR_APPLY=1 \
+           to actually mutate the catalog (fresh backup is taken first)"]
+fn live_lightroom_defaults_repair() {
+    let Some(root) = std::env::var_os("REKESZ_LR_ROOT").map(PathBuf::from) else {
+        eprintln!("skipping: REKESZ_LR_ROOT is not set");
+        return;
+    };
+    let Some(lightroom_catalog) = std::env::var_os("REKESZ_LR_CATALOG").map(PathBuf::from) else {
+        eprintln!("skipping: REKESZ_LR_CATALOG is not set");
+        return;
+    };
+    let apply = std::env::var_os("REKESZ_LR_REPAIR_APPLY").is_some_and(|value| value == "1");
+    let report = repair::repair_lightroom_defaults(&root, &lightroom_catalog, apply).unwrap();
+    eprintln!(
+        "derivation: images {} matched {} imported {} empty {} virtual {} missing {} conflicts {}",
+        report.derivation.lightroom_images,
+        report.derivation.matched,
+        report.derivation.imported,
+        report.derivation.empty,
+        report.derivation.virtual_copies,
+        report.derivation.missing_or_outside_root,
+        report.derivation.conflicting_sources,
+    );
+    eprintln!(
+        "repair(applied={}): deleted {} updated {} kept_identical {} kept_unprovable {} \
+         not_yet_imported {} orphaned_assets {} backup {:?}",
+        report.applied,
+        report.deleted,
+        report.updated,
+        report.kept_identical,
+        report.kept_unprovable,
+        report.not_yet_imported,
+        report.orphaned_assets_removed,
+        report.backup_path,
+    );
+    assert_eq!(report.derivation.conflicting_sources, 0);
+    assert!(report.derivation.imported > 0);
+    if apply {
+        assert!(report.backup_path.is_some());
+    }
+}
+
+#[test]
+fn non_raw_values_matching_the_raw_default_stay_an_edit_end_to_end() {
+    // Numerically identical to the PV15.4 raw default, but on a JPEG: only
+    // correct rawness wiring keeps this as a recipe.
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("photo.jpg"), b"test").unwrap();
+    let fixture = lightroom_fixture_with(
+        root.path(),
+        "photo",
+        "jpg",
+        "15.4",
+        "s={ToneCurvePV2012={0,0,255,255},Sharpness=40,SharpenRadius=1,SharpenDetail=25,\
+          SharpenEdgeMasking=0,LuminanceSmoothing=0,LuminanceNoiseReductionDetail=50,\
+          LuminanceNoiseReductionContrast=0,ColorNoiseReduction=25,ColorNoiseReductionDetail=50,\
+          ColorNoiseReductionSmoothness=50,WhiteBalance='As Shot'}",
+    );
+    let report = import_lightroom_inner(
+        root.path(),
+        &fixture.path().join("fixture.lrcat"),
+        true,
+        ImportCapabilities::ALL,
+    )
+    .unwrap();
+    assert_eq!(report.imported_recipes, 1);
+    let recipes = load_recipes(root.path()).unwrap();
+    let entry = recipes.values().next().unwrap();
+    assert_eq!(entry.recipe.detail.unwrap().sharpening, 40.0);
+}
+
+#[test]
+fn missing_develop_settings_row_imports_no_recipe_end_to_end() {
+    // Exercise the actual LEFT JOIN: a file with no settings row at all.
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("photo.CR3"), b"test").unwrap();
+    let fixture = lightroom_fixture(root.path(), "s={Exposure2012=1.5}");
+    let lightroom_path = fixture.path().join("fixture.lrcat");
+    Connection::open(&lightroom_path)
+        .unwrap()
+        .execute("DELETE FROM Adobe_imageDevelopSettings", [])
+        .unwrap();
+    let report =
+        import_lightroom_inner(root.path(), &lightroom_path, true, ImportCapabilities::ALL)
+            .unwrap();
+    assert_eq!(report.imported_recipes, 0);
+    assert_eq!(report.empty_supported_recipes, 1);
+    assert!(load_recipes(root.path()).unwrap().is_empty());
 }
 
 #[test]
@@ -359,8 +1068,10 @@ fn deviations_from_lightroom_defaults_remain_develop_edits() {
         .parse_assignment()
         .unwrap();
 
-    let (curve_recipe, _, _) = normalize_recipe("15.4", &changed_curve, ImportCapabilities::ALL);
-    let (detail_recipe, _, _) = normalize_recipe("15.4", &changed_detail, ImportCapabilities::ALL);
+    let (curve_recipe, _, _) =
+        normalize_recipe("15.4", &changed_curve, true, ImportCapabilities::ALL);
+    let (detail_recipe, _, _) =
+        normalize_recipe("15.4", &changed_detail, true, ImportCapabilities::ALL);
     assert!(curve_recipe.tone_curve.is_some());
     assert!(detail_recipe.detail.is_some());
 }
@@ -374,7 +1085,7 @@ fn phase_b_normalization_is_stable_across_catalog_process_versions() {
         .unwrap();
     for version in ["6.7", "11.0", "15.4"] {
         let (recipe, unsupported, warnings) =
-            normalize_recipe(version, &values, ImportCapabilities::ALL);
+            normalize_recipe(version, &values, true, ImportCapabilities::ALL);
         assert_eq!(recipe.exposure_ev, Some(1.25));
         assert_eq!(recipe.white_balance.unwrap().temperature, 7200.0);
         assert!(recipe.white_balance_increment.is_none());
@@ -392,7 +1103,7 @@ fn incremental_white_balance_is_used_only_without_an_absolute_family() {
     )
     .parse_assignment()
     .unwrap();
-    let (recipe, _, _) = normalize_recipe("15.4", &incremental, ImportCapabilities::ALL);
+    let (recipe, _, _) = normalize_recipe("15.4", &incremental, true, ImportCapabilities::ALL);
     assert!(recipe.white_balance.is_none());
     assert_eq!(recipe.white_balance_increment.unwrap().temperature, 8.0);
 
@@ -401,7 +1112,7 @@ fn incremental_white_balance_is_used_only_without_an_absolute_family() {
         )
         .parse_assignment()
         .unwrap();
-    let (recipe, _, _) = normalize_recipe("15.4", &absolute, ImportCapabilities::ALL);
+    let (recipe, _, _) = normalize_recipe("15.4", &absolute, true, ImportCapabilities::ALL);
     assert!(recipe.white_balance.is_some());
     assert!(recipe.white_balance_increment.is_none());
 }
@@ -414,7 +1125,7 @@ fn phase_c_controls_are_normalized_without_adobe_profile_payloads() {
         .parse_assignment()
         .unwrap();
     let (recipe, unsupported, warnings) =
-        normalize_recipe("15.4", &values, ImportCapabilities::ALL);
+        normalize_recipe("15.4", &values, true, ImportCapabilities::ALL);
 
     assert_eq!(recipe.detail.unwrap().sharpening, 40.0);
     assert_eq!(recipe.texture, Some(10.0));
@@ -437,7 +1148,7 @@ fn phase_d_omits_unselected_upright_and_normalizes_heal_manual_lens_and_grain() 
         .parse_assignment()
         .unwrap();
     let (recipe, unsupported, warnings) =
-        normalize_recipe("15.4", &values, ImportCapabilities::ALL);
+        normalize_recipe("15.4", &values, true, ImportCapabilities::ALL);
 
     assert!(recipe.upright_homography.is_none());
     assert_eq!(recipe.lens_distortion, Some(12.0));
@@ -465,7 +1176,7 @@ fn retouch_areas_is_canonical_and_legacy_is_only_a_fallback() {
         )
         .parse_assignment()
         .unwrap();
-    let (recipe, _, _) = normalize_recipe("15.4", &values, ImportCapabilities::ALL);
+    let (recipe, _, _) = normalize_recipe("15.4", &values, true, ImportCapabilities::ALL);
 
     assert_eq!(recipe.heal_spots.len(), 1);
     assert_eq!(recipe.heal_spots[0].kind, HealKind::Clone);
@@ -478,13 +1189,13 @@ fn active_unresolved_lens_profiles_warn_but_inactive_profiles_do_not() {
     let inactive = Parser::new("s={LensProfileEnable=0,LensProfileName='Adobe Lens Profile'}")
         .parse_assignment()
         .unwrap();
-    let (_, _, warnings) = normalize_recipe("15.4", &inactive, ImportCapabilities::ALL);
+    let (_, _, warnings) = normalize_recipe("15.4", &inactive, true, ImportCapabilities::ALL);
     assert!(warnings.is_empty());
 
     let active = Parser::new("s={LensProfileEnable=1,LensProfileName='Adobe Lens Profile'}")
         .parse_assignment()
         .unwrap();
-    let (recipe, _, warnings) = normalize_recipe("15.4", &active, ImportCapabilities::ALL);
+    let (recipe, _, warnings) = normalize_recipe("15.4", &active, true, ImportCapabilities::ALL);
     assert!(recipe.lens_distortion.is_none());
     assert!(
         warnings
@@ -567,7 +1278,7 @@ fn identity_upright_and_default_grain_are_not_stored() {
     let values = Parser::new("s={UprightTransform_4='1,0,0,0,1,0,0,0,1',GrainSize=25}")
         .parse_assignment()
         .unwrap();
-    let (recipe, _, _) = normalize_recipe("15.4", &values, ImportCapabilities::ALL);
+    let (recipe, _, _) = normalize_recipe("15.4", &values, true, ImportCapabilities::ALL);
     assert!(recipe.upright_homography.is_none());
     assert!(recipe.grain.is_none());
 }
@@ -4867,7 +5578,7 @@ fn unknown_process_version_imports_no_actions() {
         .parse_assignment()
         .unwrap();
     let (recipe, unsupported, warnings) =
-        normalize_recipe("99.0", &values, ImportCapabilities::ALL);
+        normalize_recipe("99.0", &values, true, ImportCapabilities::ALL);
     assert!(recipe.is_empty());
     assert!(unsupported.contains(&"UnsupportedProcessVersion:99.0".to_owned()));
     assert_eq!(warnings, ["unsupported process version 99.0"]);
