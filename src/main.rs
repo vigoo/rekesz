@@ -1037,6 +1037,11 @@ struct PictureBrowser {
     main_focus: FocusHandle,
     sidebar_width: f32,
     resizing_sidebar: bool,
+    /// Measured size of the image viewport, recorded while painting. The
+    /// 1:1 layout and its pan clamp use this instead of estimating the
+    /// viewport from the window size, which silently misses the in-window
+    /// menu and any open side panel.
+    image_viewport_measured: Option<gpui::Size<gpui::Pixels>>,
     pair_preference: RawJpegPreference,
     work: WorkProgress,
     render_pipeline: PreviewRenderer,
@@ -1948,6 +1953,7 @@ impl PictureBrowser {
             main_focus: cx.focus_handle(),
             sidebar_width: 300.0,
             resizing_sidebar: false,
+            image_viewport_measured: None,
             pair_preference: settings.pair_preference.into(),
             work: WorkProgress::default(),
             render_pipeline,
@@ -3309,6 +3315,7 @@ impl PictureBrowser {
             MainView::Image(state) => self.render_identity_for(&state.path),
             MainView::Dir(_, _) => return,
         };
+        let (viewport_width, viewport_height) = self.image_viewport_size(window);
         let MainView::Image(state) = &mut self.main_view else {
             return;
         };
@@ -3324,15 +3331,39 @@ impl PictureBrowser {
 
         if let PreviewState::Loaded(preview) = self.previews.state_for(&state.path, identity) {
             let (image_width, image_height) = preview.metadata.output_dimensions;
-            let viewport_width =
-                (f32::from(window.viewport_size().width) - self.sidebar_width - 5.0).max(0.0);
-            let viewport_height = (f32::from(window.viewport_size().height) - 44.0).max(0.0);
             let max_x = ((image_width as f32 - viewport_width) / 2.0).max(0.0);
             let max_y = ((image_height as f32 - viewport_height) / 2.0).max(0.0);
             state.pan.0 = state.pan.0.clamp(-max_x, max_x);
             state.pan.1 = state.pan.1.clamp(-max_y, max_y);
         }
         cx.notify();
+    }
+
+    /// The image viewport size for the 1:1 layout and its pan clamp.
+    /// Prefers the size recorded from the last paint, which is exact no
+    /// matter what chrome is present; the window-size estimate only covers
+    /// the first frame before the viewport has been painted.
+    fn image_viewport_size(&self, window: &Window) -> (f32, f32) {
+        if let Some(size) = self.image_viewport_measured {
+            return (f32::from(size.width), f32::from(size.height));
+        }
+        let inspector_width = if self.show_job_queue {
+            JOB_QUEUE_PANEL_WIDTH
+        } else {
+            0.0
+        } + if self.show_develop_inspector {
+            DEVELOP_PANEL_WIDTH
+        } else {
+            0.0
+        };
+        // The menu bar is 30px tall including its bottom border on Linux;
+        // the header is 44px including its bottom border everywhere.
+        let menu_height = if USE_IN_WINDOW_MENU { 30.0 } else { 0.0 };
+        (
+            (f32::from(window.viewport_size().width) - self.sidebar_width - 5.0 - inspector_width)
+                .max(0.0),
+            (f32::from(window.viewport_size().height) - menu_height - 44.0).max(0.0),
+        )
     }
 
     fn image_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -11526,13 +11557,10 @@ impl Render for PictureBrowser {
                             .into_any_element(),
                         ZoomLevel::ActualSize => {
                             let (width, height) = preview.metadata.output_dimensions;
-                            let viewport_width = (f32::from(window.viewport_size().width)
-                                - self.sidebar_width
-                                - 5.0)
-                                .max(0.0);
-                            let viewport_height =
-                                (f32::from(window.viewport_size().height) - 44.0).max(0.0);
+                            let (viewport_width, viewport_height) =
+                                self.image_viewport_size(window);
                             img(preview.image.clone())
+                                .debug_selector(|| "#actual-size-image".to_owned())
                                 .absolute()
                                 .left(px((viewport_width - width as f32) / 2.0 + pan.0))
                                 .top(px((viewport_height - height as f32) / 2.0 + pan.1))
@@ -12195,6 +12223,20 @@ impl Render for PictureBrowser {
                         .flex_1()
                         .min_h_0()
                         .text_color(rgb(0x8d96a5))
+                        .on_children_prepainted({
+                            let entity = cx.entity();
+                            move |children: Vec<gpui::Bounds<gpui::Pixels>>, _, cx| {
+                                let Some(bounds) = children.first() else {
+                                    return;
+                                };
+                                entity.update(cx, |this, cx| {
+                                    if this.image_viewport_measured != Some(bounds.size) {
+                                        this.image_viewport_measured = Some(bounds.size);
+                                        cx.notify();
+                                    }
+                                });
+                            }
+                        })
                         .child(main_content),
                 )
                 .when(

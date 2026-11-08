@@ -703,6 +703,62 @@ fn write_photo_stub(root: &Path, name: &str, latitude: f64, longitude: f64) -> P
     path
 }
 
+/// A phone-style photo: stored landscape with an EXIF orientation that
+/// rotates it 90° clockwise, so it displays as portrait.
+fn write_portrait_phone_photo(root: &Path, name: &str) -> PathBuf {
+    let path = root.join(format!("{name}.jpg"));
+    let image = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+        4000,
+        3000,
+        image::Rgb([120, 40, 160]),
+    ));
+    let mut jpeg = Vec::new();
+    image
+        .write_to(
+            &mut std::io::Cursor::new(&mut jpeg),
+            image::ImageFormat::Jpeg,
+        )
+        .unwrap();
+    insert_exif_orientation(&mut jpeg, 6);
+    std::fs::write(&path, &jpeg).unwrap();
+    // Sanity-check with the standard decoder calls the render pipeline uses
+    // for the Full variant (1:1 mode); scaled previews read EXIF separately.
+    use image::ImageDecoder;
+    let reader = image::ImageReader::open(&path)
+        .unwrap()
+        .with_guessed_format()
+        .unwrap();
+    let mut decoder = reader.into_decoder().unwrap();
+    assert_eq!(
+        decoder.orientation().unwrap(),
+        image::metadata::Orientation::Rotate90
+    );
+    path
+}
+
+/// Splices a minimal EXIF APP1 segment carrying `orientation` right after
+/// the JPEG SOI marker.
+fn insert_exif_orientation(jpeg: &mut Vec<u8>, orientation: u16) {
+    assert_eq!(&jpeg[0..2], &[0xFF, 0xD8], "expected a JPEG SOI marker");
+    let mut tiff = Vec::new();
+    tiff.extend_from_slice(b"II");
+    tiff.extend_from_slice(&42u16.to_le_bytes());
+    tiff.extend_from_slice(&8u32.to_le_bytes());
+    tiff.extend_from_slice(&1u16.to_le_bytes());
+    tiff.extend_from_slice(&0x0112u16.to_le_bytes()); // Orientation tag
+    tiff.extend_from_slice(&3u16.to_le_bytes()); // SHORT
+    tiff.extend_from_slice(&1u32.to_le_bytes()); // one value
+    tiff.extend_from_slice(&orientation.to_le_bytes());
+    tiff.extend_from_slice(&[0, 0]); // pad the SHORT value field to 4 bytes
+    tiff.extend_from_slice(&0u32.to_le_bytes()); // no next IFD
+    let mut payload = b"Exif\0\0".to_vec();
+    payload.extend_from_slice(&tiff);
+    let mut segment = vec![0xFF, 0xE1];
+    segment.extend_from_slice(&((payload.len() as u16 + 2).to_be_bytes()));
+    segment.extend_from_slice(&payload);
+    jpeg.splice(2..2, segment);
+}
+
 fn double_click(cx: &mut gpui::VisualTestContext, position: gpui::Point<gpui::Pixels>) {
     let modifiers = gpui::Modifiers::none();
     cx.simulate_event(MouseDownEvent {
@@ -907,6 +963,149 @@ fn gpui_image_view_double_clicks_zooms_and_drag_pans(cx: &mut gpui::TestAppConte
         &view.main_view,
         MainView::Image(state) if state.zoom == ZoomLevel::FitWindow && state.pan == (0.0, 0.0)
     )));
+}
+
+/// 1:1 panning must be able to bring every edge of the image into the
+/// viewport. Uses a stored-landscape, EXIF-rotated photo (displays as
+/// portrait) like the phone JPEGs where the first failure was seen.
+#[gpui::test]
+fn actual_size_pan_reaches_every_image_edge(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write_portrait_phone_photo(root.path(), "phone");
+    let mut config = gpui_test_config(root.path(), cache.path());
+    config.settings.automatic_face_analysis = false;
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.simulate_resize(size(px(1400.0), px(900.0)));
+    cx.run_until_parked();
+    let thumbnail = cx.debug_bounds("#thumbnail-0").unwrap();
+    double_click(cx, thumbnail.center());
+    let preview_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let loaded = view.read_with(&*cx, |view, _| {
+            let MainView::Image(state) = &view.main_view else {
+                return false;
+            };
+            matches!(
+                view.previews
+                    .state_for(&state.path, view.render_identity_for(&state.path)),
+                PreviewState::Loaded(_)
+            )
+        });
+        if loaded {
+            break;
+        }
+        assert!(
+            Instant::now() < preview_deadline,
+            "image preview did not load within ten seconds"
+        );
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    let viewport = cx.debug_bounds("#image-viewport").unwrap();
+    // Window 1400x900: tree 300 + splitter 5 on the left; in-window menu
+    // (Linux only, ~29px) + header 44 + 1px border stacked on top.
+    let menu_height = if USE_IN_WINDOW_MENU { 29.0 } else { 0.0 };
+    assert!(
+        (viewport.size.width - px(1400.0 - 300.0 - 5.0)).abs() < px(2.0),
+        "viewport width {} does not match window minus tree and splitter",
+        viewport.size.width
+    );
+    assert!(
+        (viewport.size.height - px(900.0 - menu_height - 45.0)).abs() < px(2.0),
+        "viewport height {} does not match window minus menu and header",
+        viewport.size.height
+    );
+
+    double_click(cx, viewport.center());
+    assert!(view.read_with(&*cx, |view, _| matches!(
+        &view.main_view,
+        MainView::Image(state) if state.zoom == ZoomLevel::ActualSize
+    )));
+    cx.run_until_parked();
+
+    // Drag the image toward the bottom-left corner until the pan clamp
+    // stops it: one horizontal sweep, then two vertical sweeps (one sweep
+    // cannot cross the full 4000px height from inside the viewport).
+    let right_inside = point(viewport.right() - px(10.0), viewport.center().y);
+    let left_inside = point(viewport.left() + px(1.0), viewport.center().y);
+    cx.simulate_mouse_down(right_inside, MouseButton::Left, gpui::Modifiers::none());
+    cx.simulate_mouse_move(left_inside, MouseButton::Left, gpui::Modifiers::none());
+    cx.simulate_mouse_up(left_inside, MouseButton::Left, gpui::Modifiers::none());
+    let bottom_inside = point(viewport.center().x, viewport.bottom() - px(1.0));
+    let top_inside = point(viewport.center().x, viewport.top() + px(1.0));
+    for _ in 0..2 {
+        cx.simulate_mouse_down(bottom_inside, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(top_inside, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(top_inside, MouseButton::Left, gpui::Modifiers::none());
+    }
+
+    let panned = cx.debug_bounds("#actual-size-image").unwrap();
+    assert!(
+        panned.right() <= viewport.right() + px(1.0),
+        "right edge unreachable: image right {} vs viewport right {}",
+        panned.right(),
+        viewport.right()
+    );
+    assert!(
+        panned.bottom() <= viewport.bottom() + px(1.0),
+        "bottom edge unreachable: image bottom {} vs viewport bottom {}",
+        panned.bottom(),
+        viewport.bottom()
+    );
+    assert!(
+        panned.left() <= viewport.left() + px(1.0),
+        "left edge not visible: image left {} vs viewport left {}",
+        panned.left(),
+        viewport.left()
+    );
+    assert!(
+        panned.top() <= viewport.top() + px(1.0),
+        "top edge not visible: image top {} vs viewport top {}",
+        panned.top(),
+        viewport.top()
+    );
+
+    // And back toward the top-right corner: the left and top edges must
+    // align with the viewport without overshooting into dead space. Each
+    // sweep crosses less than the full pan range, so repeat until the
+    // opposite clamp saturates.
+    for _ in 0..3 {
+        cx.simulate_mouse_down(left_inside, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(right_inside, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(right_inside, MouseButton::Left, gpui::Modifiers::none());
+    }
+    for _ in 0..4 {
+        cx.simulate_mouse_down(top_inside, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(bottom_inside, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(bottom_inside, MouseButton::Left, gpui::Modifiers::none());
+    }
+    let panned_back = cx.debug_bounds("#actual-size-image").unwrap();
+    assert!(
+        panned_back.left() >= viewport.left() - px(1.0),
+        "left edge unreachable: image left {} vs viewport left {}",
+        panned_back.left(),
+        viewport.left()
+    );
+    assert!(
+        panned_back.top() >= viewport.top() - px(1.0),
+        "top edge unreachable: image top {} vs viewport top {}",
+        panned_back.top(),
+        viewport.top()
+    );
+    assert!(
+        panned_back.right() >= viewport.right() - px(1.0),
+        "right edge not visible: image right {} vs viewport right {}",
+        panned_back.right(),
+        viewport.right()
+    );
+    assert!(
+        panned_back.bottom() >= viewport.bottom() - px(1.0),
+        "bottom edge not visible: image bottom {} vs viewport bottom {}",
+        panned_back.bottom(),
+        viewport.bottom()
+    );
 }
 
 #[gpui::test]
