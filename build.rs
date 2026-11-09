@@ -64,4 +64,29 @@ fn main() {
             "packaged asset manifest is missing the pinned entry for {file_name}"
         );
     }
+    embed_windows_icon();
 }
+
+/// Embeds the app icon into Windows executables. gpui's Windows platform loads
+/// the window and taskbar icon from icon resource 1, the id `set_icon`
+/// assigns. Regenerate the .ico with scripts/generate-app-icon.py.
+fn embed_windows_icon() {
+    const ICON: &str = "assets/icon/rekesz.ico";
+    println!("cargo:rerun-if-changed={ICON}");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        compile_windows_icon(ICON);
+    }
+}
+
+/// `winresource` is only a build dependency of Windows builds (see Cargo.toml):
+/// it drives the Windows SDK resource compiler.
+#[cfg(windows)]
+fn compile_windows_icon(icon: &str) {
+    winresource::WindowsResource::new()
+        .set_icon(icon)
+        .compile()
+        .unwrap_or_else(|error| panic!("cannot embed the Windows app icon {icon}: {error}"));
+}
+
+#[cfg(not(windows))]
+fn compile_windows_icon(_icon: &str) {}

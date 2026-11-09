@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Rekesz
+GenericName=Photo Browser
+Comment=Browse and develop a directory of photographs
+Exec=rekesz
+Icon=rekesz
+Terminal=false
+Categories=Graphics;Photography;Viewer;
+Keywords=photo;picture;image;raw;develop;camera;import;
+StartupWMClass=rekesz

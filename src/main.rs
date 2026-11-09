@@ -13918,6 +13918,9 @@ fn main() -> Result<()> {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                // Linux desktops match this id to assets/linux/rekesz.desktop
+                // to find the taskbar icon; other platforms ignore it.
+                app_id: Some("rekesz".into()),
                 ..Default::default()
             },
             |_, cx| cx.new(|cx| PictureBrowser::new(&config, cx)),
