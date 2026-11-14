@@ -1,0 +1,41 @@
+<- type=0x8000 payload=5 asc:.....
+-> LOCK type=0x2100 payload=7
+<- type=0xa100 payload=1 asc:.
+-> FS Y type=0x2000 payload=10
+<- type=0xa000 payload=1 asc:.
+-> INFO type=0x2000 payload=20
+<- type=0xa000 payload=64 asc:INFOx0000078#---#---#---#---#---#---#---#---#---#---#---#---#---
+   INFO: declared body 120 bytes, tokens []
+-> INFO:pureread type=0x2000 payload=8
+<- type=0xa000 payload=120 asc:#FB ALGNLEFT#FB AREAd850i0001170#FB RESOi0001200#IMXi0065535i0065535#PRDh010PID 1157        #VERh008FB  1.10#DSZi0001536
+-> CAPA type=0x2000 payload=20
+<- type=0xa000 payload=64 asc:CAPAx00000EC#---#---#---#---#---#---#---#---#---#---#---#---#---
+   CAPA: declared body 236 bytes, tokens []
+-> CAPA:pureread type=0x2000 payload=8
+<- type=0xa000 payload=236 asc:#FB RSMSLISTd075d150d300d600i0001200#COLLISTC024M001M008#FMTLISTRAW JPG #JPGRANGd001d100#THRRANGd000d255#GMMLISTUG10UG18#GMTLISTRED GRN BLU MONO#CMXLISTUNITUM08#RSMLISTd075d150d300d600i0001200#RSSLISTd075d150d300d400d600i0001200i0002400
+-> FIN type=0x2000 payload=20
+<- type=0xa000 payload=64 asc:FIN x0000000#---#---#---#---#---#---#---#---#---#---#---#---#---
+   FIN: declared body 0 bytes, tokens []
+-> FS Z type=0x2000 payload=10
+<- type=0xa000 payload=1 asc:.
+-> INFO type=0x2000 payload=20
+<- type=0xa000 payload=64 asc:INFOx0000040#---#---#---#---#---#---#---#---#---#---#---#---#---
+   INFO: declared body 64 bytes, tokens []
+-> INFO:pureread type=0x2000 payload=8
+<- type=0xa000 payload=64 asc:#PRDh010PID 1157        #VERh008FB  1.10#DSZi0001536#isn#mem#psv
+-> CAPA type=0x2000 payload=20
+<- type=0xa000 payload=64 asc:CAPAx0000014#---#---#---#---#---#---#---#---#---#---#---#---#---
+   CAPA: declared body 20 bytes, tokens []
+-> CAPA:pureread type=0x2000 payload=8
+<- type=0xa000 payload=20 asc:#FB CNT d000xFFFFFFF
+-> RESA type=0x2000 payload=20
+<- type=0xa000 payload=64 asc:RESAx0000018#---#---#---#---#---#---#---#---#---#---#---#---#---
+   RESA: declared body 24 bytes, tokens []
+-> RESA:pureread type=0x2000 payload=8
+<- type=0xa000 payload=24 asc:#FB CNT d428#BSZi0065536
+-> FIN type=0x2000 payload=20
+<- type=0xa000 payload=64 asc:FIN x0000000#---#---#---#---#---#---#---#---#---#---#---#---#---
+   FIN: declared body 0 bytes, tokens []
+-> UNLOCK type=0x2101 payload=0
+<- type=0xa101 payload=0 asc:
+   unlock ack unexpected payload: []

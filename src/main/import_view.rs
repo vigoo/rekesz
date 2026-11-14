@@ -3280,6 +3280,7 @@ impl PictureBrowser {
 
     fn tick_scan_panel(&mut self, cx: &mut Context<Self>) {
         self.refresh_scan_panel(cx);
+        self.sync_push_engine(cx);
         // Finalize a job whose thread has written its result.
         let finished = self
             .import_view
@@ -3324,6 +3325,69 @@ impl PictureBrowser {
         }
         cx.notify();
         self.schedule_scan_panel_poll(cx);
+    }
+
+    /// Publish the push-scan engine inputs and consume an accepted panel
+    /// push (scanner-push-scan-plan.md stage 1). The poll chain runs only
+    /// while a scanner is selected in the import view, so its timestamp is
+    /// also the arming liveness: a chain that stops ticking disarms the
+    /// engine by going stale.
+    fn sync_push_engine(&mut self, cx: &mut Context<Self>) {
+        let key = self.selected_scanner_key();
+        sources::scanner::push::engine::push_engine().publish_input(|input| {
+            input.armed = key.is_some()
+                && !self.import_view.scan_panel.offline
+                && matches!(self.import_view.scan_panel.caps, ScanCapsState::Loaded(_));
+            input.busy = self.import_view.scan_panel.job.is_some()
+                || self.import_view.scan_panel.busy_since.is_some()
+                || self.import_view.job.is_some();
+            input.scanner_ips = key
+                .as_deref()
+                .map(|key| self.scanner_endpoint_ips(key))
+                .unwrap_or_default();
+            input.ticked_at = Some(std::time::Instant::now());
+        });
+        if !sources::scanner::push::engine::push_engine().take_trigger() {
+            return;
+        }
+        // The panel push was admitted while the state matched; if the UI
+        // cannot start it now (state moved between the trigger and this
+        // tick), say so precisely instead of silently dropping the press.
+        if self.scan_start_blocked() {
+            let reason = if self.import_view.scan_panel.offline
+                || !matches!(self.import_view.scan_panel.caps, ScanCapsState::Loaded(_))
+            {
+                "the scanner is unavailable"
+            } else {
+                "a job is in flight"
+            };
+            self.import_view.scan_panel.last_result =
+                Some(format!("Scanner panel push could not start — {reason}"));
+            cx.notify();
+            return;
+        }
+        crate::trace::event("push: accepted panel trigger starts the bridged scan");
+        self.start_scan(cx);
+    }
+
+    /// Addresses of the selected scanner — the push-scan announcement
+    /// filter (announcements from any other device are ignored). A poisoned
+    /// registry lock degrades to an empty filter rather than poisoning the
+    /// engine input lock this runs inside.
+    fn scanner_endpoint_ips(&self, key: &str) -> Vec<std::net::IpAddr> {
+        let map = match sources::scanner::discover::SCANNERS.lock() {
+            Ok(map) => map,
+            Err(_) => return Vec::new(),
+        };
+        map.get(key)
+            .map(|device| {
+                device
+                    .endpoints
+                    .iter()
+                    .map(|endpoint| endpoint.ip)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Begin a selection drag at the pointer position (window coordinates).

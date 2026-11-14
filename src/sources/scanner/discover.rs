@@ -35,6 +35,9 @@ const EXPIRY: Duration = Duration::from_secs(30);
 #[derive(Clone, Debug)]
 pub struct ScannerEndpoint {
     pub base_url: String,
+    /// The address `base_url` embeds — the push-scan announcement filter and
+    /// the ESC/I-2 session target need the raw IP, not a URL.
+    pub ip: IpAddr,
     pub tls: bool,
     pub last_seen: Instant,
 }
@@ -100,21 +103,27 @@ pub fn resource_prefix(txt: &[(String, String)]) -> String {
     prefix.trim_matches('/').to_string()
 }
 
+/// The address an endpoint talks to, applying the reachability rules: IPv4
+/// preferred, link-local IPv6 skipped (its interface scope is lost in
+/// DNS-SD resolution — such a device would look discovered forever and
+/// never answer).
+pub fn endpoint_address(addresses: &[IpAddr]) -> Option<IpAddr> {
+    addresses
+        .iter()
+        .find(|address| matches!(address, IpAddr::V4(_)))
+        .or_else(|| addresses.iter().find(|address| !is_link_local_v6(address)))
+        .copied()
+}
+
 /// Base URL of an endpoint, or None when the service resolved no usable
-/// address. IPv6 link-local addresses are skipped: their interface scope is
-/// lost in DNS-SD resolution, and `http://[fe80::…]/` without a zone can
-/// never connect — such a device would look discovered forever and never
-/// answer.
+/// address.
 pub fn endpoint_base_url(
     tls: bool,
     addresses: &[IpAddr],
     port: u16,
     prefix: &str,
 ) -> Option<String> {
-    let address = addresses
-        .iter()
-        .find(|address| matches!(address, IpAddr::V4(_)))
-        .or_else(|| addresses.iter().find(|address| !is_link_local_v6(address)))?;
+    let address = endpoint_address(addresses)?;
     let host = match address {
         IpAddr::V4(v4) => v4.to_string(),
         IpAddr::V6(v6) => format!("[{v6}]"),
@@ -142,6 +151,9 @@ pub fn note_service(
 ) {
     let tls = service.service_type.starts_with("_uscans");
     let prefix = resource_prefix(&service.txt);
+    let Some(ip) = endpoint_address(&service.addresses) else {
+        return;
+    };
     let Some(base_url) = endpoint_base_url(tls, &service.addresses, service.port, &prefix) else {
         return;
     };
@@ -164,10 +176,12 @@ pub fn note_service(
     {
         Some(endpoint) => {
             endpoint.base_url = base_url;
+            endpoint.ip = ip;
             endpoint.last_seen = now;
         }
         None => device.endpoints.push(ScannerEndpoint {
             base_url,
+            ip,
             tls,
             last_seen: now,
         }),

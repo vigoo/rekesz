@@ -56,6 +56,10 @@ tempfile = "3"
 # hand-matched to these releases (see src/sources/scanner/).
 mdns-sd = "=0.21.6"
 quick-xml = "=0.42.0"
+# Push-scan sockets need SO_REUSEADDR set before bind and multicast joins —
+# std::net exposes neither; socket2 is the portable route (see
+# src/sources/scanner/push/).
+socket2 = "0.6"
 
 # Face-model inference uses the CUDA execution provider where the bundled
 # ONNX Runtime binaries ship one (x86_64 Linux and Windows). Other targets,

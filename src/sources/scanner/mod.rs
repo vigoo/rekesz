@@ -13,6 +13,11 @@ pub mod discover;
 // `scanner-probe` bin drive it, which the main build sees as dead code.
 #[allow(dead_code)]
 pub mod escl;
+// Push scan (Epson NetScanMonitor) lands per scanner-push-scan-plan.md; the
+// wire codec ships first for the scanner-probe dialect probe, the rest of
+// the module follows in later stages and is dead code until then.
+#[allow(dead_code)]
+pub mod push;
 
 #[cfg(test)]
 pub(crate) mod mock;
@@ -42,6 +47,10 @@ static DAEMON_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 #[cfg(test)]
 pub(crate) fn set_daemon_enabled(enabled: bool) {
     DAEMON_ENABLED.store(enabled, std::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn daemon_enabled() -> bool {
+    DAEMON_ENABLED.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// File name for the next scan: `scan-<local timestamp with millis>.jpg`.
