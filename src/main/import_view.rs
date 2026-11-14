@@ -84,8 +84,13 @@ pub(crate) struct ImportViewState {
     pub(crate) index_building: bool,
     pub(crate) recursive: bool,
     pub(crate) preset: import::DestinationPreset,
-    /// Absolute folder the layout applies within; `None` = library root.
+    /// Absolute folder the layout applies within; `None` = nothing picked
+    /// yet, and imports are refused rather than falling back anywhere.
     pub(crate) destination_base: Option<PathBuf>,
+    /// Library paths touched from this view (picked destinations, created
+    /// folders, import destinations): leaving the view re-scans their chains
+    /// so the directory tree reflects changes made off-model.
+    pub(crate) touched_directories: BTreeSet<PathBuf>,
     pub(crate) destination_picker_open: bool,
     pub(crate) picker_dir: PathBuf,
     pub(crate) picker_entries: Option<Vec<String>>,
@@ -432,6 +437,7 @@ impl ImportViewState {
             recursive: false,
             preset: settings.import_destination_preset,
             destination_base: None,
+            touched_directories: BTreeSet::new(),
             destination_picker_open: false,
             picker_dir: PathBuf::new(),
             picker_entries: None,
@@ -1189,14 +1195,24 @@ impl PictureBrowser {
             cx.notify();
             return;
         }
+        // The parent listing and the folder itself changed off-model; both
+        // re-scan when the view is left so the tree shows the new folder.
+        self.import_view.touched_directories.insert(target.clone());
+        self.import_view
+            .touched_directories
+            .insert(self.import_view.picker_dir.clone());
         self.import_view.creating_folder = false;
         self.import_view.new_folder_name.clear();
-        window.blur();
-        self.load_picker_entries(cx);
+        // Land inside the created folder: the next "Use this folder" picks
+        // it, and the picker header shows where you are.
+        self.navigate_picker(target, window, cx);
         cx.notify();
     }
 
     fn pick_destination(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.import_view
+            .touched_directories
+            .insert(self.import_view.picker_dir.clone());
         self.import_view.destination_base = Some(self.import_view.picker_dir.clone());
         self.import_view.destination_picker_open = false;
         window.blur();
@@ -1277,12 +1293,20 @@ impl PictureBrowser {
         // import reads a mix of device objects and staged files.
         let access = sources::staged_import_access(access);
         let root = self.settings.root.clone();
+        // An unpicked destination must never silently choose one: the last
+        // time that fallback existed, a scanned batch landed in the library
+        // root while the report claimed success. Importing into the root is
+        // still possible — by picking it with "Use this folder".
         let destination_base = self
             .import_view
             .destination_base
             .clone()
-            .filter(|base| base.starts_with(&root))
-            .unwrap_or_else(|| root.clone());
+            .filter(|base| base.starts_with(&root));
+        let Some(destination_base) = destination_base else {
+            self.import_view.notice = Some("Pick a destination folder first.".into());
+            cx.notify();
+            return;
+        };
         let plan = import::ImportPlan {
             library_root: root,
             destination_base,
@@ -1313,7 +1337,7 @@ impl PictureBrowser {
                     import::ImportStatus::Completed(report) => ("Import finished.", report),
                     import::ImportStatus::Cancelled(report) => ("Import cancelled.", report),
                 };
-                this.refresh_imported_directories(&report.directories, cx);
+                this.refresh_directory_chains(&report.directories, cx);
                 // Leaving the view cancels the import and must not resurrect
                 // a stale report dialog on the next Import entry.
                 if this.directory_view_mode == DirectoryViewMode::Import {
@@ -1332,9 +1356,17 @@ impl PictureBrowser {
         cx.notify();
     }
 
-    /// Make the freshly written files show up in the browser: ensure every
-    /// directory on each destination chain is loaded by the discovery model.
-    fn refresh_imported_directories(&mut self, directories: &[PathBuf], cx: &mut Context<Self>) {
+    /// Make changes made off the discovery model visible in the browser:
+    /// every directory on each path's chain is ensured in the model,
+    /// invalidated, and reloaded. Invalidation is the load-bearing step —
+    /// loading is refused for already-listed nodes, so without it a re-scan
+    /// after an import or a folder created in the picker would be a no-op
+    /// and the tree/grid would keep showing the old listing.
+    fn refresh_directory_chains<'a>(
+        &mut self,
+        directories: impl IntoIterator<Item = &'a PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
         let root = self.settings.root.clone();
         let mut chains = BTreeSet::new();
         for directory in directories {
@@ -1350,8 +1382,16 @@ impl PictureBrowser {
         }
         for path in chains {
             let node = self.model.ensure_node(path);
+            self.model.invalidate(node);
             self.ensure_directory_loaded(node, discovery::DirectoryScanPriority::Background, cx);
         }
+    }
+
+    /// Re-scan the library folders this import session touched (destinations
+    /// picked, folders created) and forget the list.
+    fn refresh_touched_directories(&mut self, cx: &mut Context<Self>) {
+        let touched = std::mem::take(&mut self.import_view.touched_directories);
+        self.refresh_directory_chains(&touched, cx);
     }
 
     pub(crate) fn cancel_import(&mut self, cx: &mut Context<Self>) {
@@ -1385,6 +1425,11 @@ impl PictureBrowser {
             self.import_view.scan_panel.preview = ScanPreviewState::Idle;
         }
         self.import_view.index_cancel.store(true, Ordering::Release);
+        // Folders created or picked in this session changed the library off
+        // the discovery model; re-scan their chains so the tree and grid
+        // show them (new folders under an expanded parent, imported files
+        // in an already-open folder).
+        self.refresh_touched_directories(cx);
         if self.directory_view_mode == DirectoryViewMode::Import {
             self.set_directory_view_mode(DirectoryViewMode::Grid, cx);
         }
@@ -2049,17 +2094,16 @@ impl PictureBrowser {
 
     pub(crate) fn render_import_options_rail(&self, cx: &mut Context<Self>) -> AnyElement {
         let root = self.settings.root.clone();
-        let base = self
-            .import_view
-            .destination_base
-            .clone()
-            .unwrap_or_else(|| root.clone());
-        let base_display = base
-            .strip_prefix(&root)
-            .ok()
-            .map(|relative| relative.display().to_string())
-            .filter(|display| !display.is_empty())
-            .unwrap_or_else(|| "Library root".to_owned());
+        let destination_picked = self.import_view.destination_base.is_some();
+        let base_display = match &self.import_view.destination_base {
+            None => "No destination picked".to_owned(),
+            Some(base) => base
+                .strip_prefix(&root)
+                .ok()
+                .map(|relative| relative.display().to_string())
+                .filter(|display| !display.is_empty())
+                .unwrap_or_else(|| base.display().to_string()),
+        };
         let include_duplicates = self.import_view.include_duplicates;
         let count: usize = self
             .import_view
@@ -2108,7 +2152,13 @@ impl PictureBrowser {
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(0x9da7b6))
+                            .text_color(if destination_picked {
+                                rgb(0x9da7b6)
+                            } else {
+                                // Unpicked destinations are refused on
+                                // import; make the missing pick visible.
+                                rgb(0xf2b8b5)
+                            })
                             .truncate()
                             .child(base_display),
                     )
@@ -2158,9 +2208,10 @@ impl PictureBrowser {
                     ),
             )
             .child(div().flex_1())
-            .child(if count > 0 && !running {
+            .child(if count > 0 && !running && destination_picked {
                 div()
                     .id("import-start")
+                    .debug_selector(|| "#import-start".to_owned())
                     .px_4()
                     .py_2()
                     .rounded_sm()
@@ -2188,8 +2239,10 @@ impl PictureBrowser {
                     .text_sm()
                     .child(if running {
                         "Import running…".to_owned()
-                    } else {
+                    } else if count == 0 {
                         "Import 0 photos".to_owned()
+                    } else {
+                        "Pick a destination folder".to_owned()
                     })
                     .into_any_element()
             })

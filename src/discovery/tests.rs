@@ -144,6 +144,52 @@ fn a_node_can_only_start_one_load() {
 }
 
 #[test]
+fn invalidation_discards_contents_and_stale_loads() {
+    let mut model = DirectoryModel::new(PathBuf::from("/pictures"));
+    let root = model.root();
+    let (request, _) = model.begin_load(root).unwrap();
+    model.finish_load(
+        root,
+        request,
+        Ok(DirectoryScan {
+            directories: vec![PathBuf::from("/pictures/a")],
+            images: vec![PathBuf::from("/pictures/one.jpg")],
+            companions: HashMap::new(),
+        }),
+    );
+    assert!(model.loaded(root).is_some());
+
+    model.invalidate(root);
+    assert!(model.loaded(root).is_none());
+
+    // The discarded load's completion must not resurrect stale contents:
+    // the request id no longer matches, so the node stays unloaded.
+    assert!(!model.finish_load(
+        root,
+        request,
+        Ok(DirectoryScan {
+            directories: Vec::new(),
+            images: vec![PathBuf::from("/pictures/stale.jpg")],
+            companions: HashMap::new(),
+        }),
+    ));
+    assert!(model.loaded(root).is_none());
+
+    // A fresh load after invalidation works and re-reads the directory.
+    let (request, _) = model.begin_load(root).unwrap();
+    model.finish_load(
+        root,
+        request,
+        Ok(DirectoryScan {
+            directories: vec![PathBuf::from("/pictures/new")],
+            images: Vec::new(),
+            companions: HashMap::new(),
+        }),
+    );
+    assert_eq!(model.loaded(root).unwrap().children.len(), 1);
+}
+
+#[test]
 fn loaded_and_failed_nodes_are_cached() {
     let mut model = DirectoryModel::new(PathBuf::from("/pictures"));
     let root = model.root();

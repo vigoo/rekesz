@@ -251,6 +251,16 @@ impl DirectoryModel {
         }
     }
 
+    /// Discard a node's contents so the next load re-reads the filesystem.
+    /// The only way a changed directory becomes visible again: loads of
+    /// already-listed nodes are refused by [`Self::begin_load`]. An in-flight
+    /// load is discarded with the state; its completion finds no matching
+    /// request in [`Self::finish_load`] and the node stays unloaded until
+    /// something reloads it.
+    pub fn invalidate(&mut self, id: NodeId) {
+        self.nodes[id.0].contents = DirectoryContents::Unloaded;
+    }
+
     pub fn begin_load(&mut self, id: NodeId) -> Option<(RequestId, Arc<Path>)> {
         if !matches!(self.node(id).contents, DirectoryContents::Unloaded) {
             return None;

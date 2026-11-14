@@ -4662,12 +4662,182 @@ fn import_destination_picker_creates_folder(cx: &mut gpui::TestAppContext) {
         library.join("d2024").is_dir(),
         "typed folder was not created"
     );
+    // Creating a folder lands the picker inside it: the next "Use this
+    // folder" picks the new folder, and its empty listing says so.
     assert_eq!(
         _view.read_with(&*cx, |view, _| (
             view.import_view.creating_folder,
+            view.import_view.picker_dir.clone(),
             view.import_view.picker_entries.clone().unwrap()
         )),
-        (false, vec!["d2024".to_owned()])
+        (false, library.join("d2024"), Vec::<String>::new())
+    );
+    assert!(cx.debug_bounds("#picker-up-0").is_some());
+}
+
+/// Recursive `.jpg` count, skipping non-image bookkeeping (the catalog dir).
+fn count_jpegs(dir: &Path) -> usize {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| {
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                count_jpegs(&path)
+            } else if path.extension().is_some_and(|extension| extension == "jpg") {
+                1
+            } else {
+                0
+            }
+        })
+        .sum()
+}
+
+/// Regression for the silent destination fallback: with no destination
+/// picked, the import used to copy everything into the library root while
+/// the report claimed success (a scanned batch landed there on 2026-11-14).
+#[gpui::test]
+fn import_without_picked_destination_is_refused_and_picking_enables_it(
+    cx: &mut gpui::TestAppContext,
+) {
+    let root = tempfile::tempdir().unwrap();
+    let library = root.path().join("library");
+    std::fs::create_dir_all(library.join("Album")).unwrap();
+    let card = write_import_source(root.path(), "card", 0, 1);
+    let (view, cx) = import_view_with_card(cx, &library, &card);
+
+    // No pick yet: the start button is inactive, and starting the import
+    // anyway is refused with a precise notice instead of choosing a
+    // destination behind the user's back.
+    assert!(cx.debug_bounds("#import-start").is_none());
+    view.update(&mut *cx, |view, cx| {
+        view.start_import(cx);
+        assert!(view.import_view.job.is_none());
+        assert_eq!(
+            view.import_view.notice.as_deref(),
+            Some("Pick a destination folder first.")
+        );
+    });
+
+    // Picking a folder activates the button, and the import then lands
+    // inside the picked folder — not the library root.
+    let toggle = cx.debug_bounds("#import-destination-picker").unwrap();
+    cx.simulate_click(toggle.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let album = cx.debug_bounds("#picker-entry-0").unwrap();
+    cx.simulate_click(album.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let use_folder = cx.debug_bounds("#picker-use-folder").unwrap();
+    cx.simulate_click(use_folder.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.import_view.destination_base.clone()),
+        Some(library.join("Album"))
+    );
+    let start = cx
+        .debug_bounds("#import-start")
+        .expect("start button activates after the pick");
+    cx.simulate_click(start.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+
+    assert_eq!(
+        count_jpegs(&library.join("Album")),
+        1,
+        "the import must land in the picked folder"
+    );
+    assert_eq!(count_jpegs(&library), 1, "the library root must stay empty");
+}
+
+/// Regression: a folder created in the destination picker never showed up in
+/// the directory tree, because loads of already-listed nodes are refused and
+/// nothing invalidated them.
+#[gpui::test]
+fn folder_created_during_import_shows_in_tree_after_leaving(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let library = root.path().join("library");
+    // A pre-existing child keeps Scan expanded: loads of empty directories
+    // collapse them again, and the regression needs the loaded-and-expanded
+    // state a folder creation during import has to break through.
+    std::fs::create_dir_all(library.join("Scan").join("old")).unwrap();
+    let card = write_import_source(root.path(), "card", 0, 0);
+    let (view, cx) = import_view_with_card(cx, &library, &card);
+
+    view.update(&mut *cx, |view, cx| {
+        let scan = view
+            .model
+            .node_id(&library.join("Scan"))
+            .expect("Scan is listed under the root");
+        view.open(scan, cx);
+    });
+    cx.run_until_parked();
+    let expanded_and_loaded = view.read_with(&*cx, |view, _| {
+        let scan = view.model.node_id(&library.join("Scan")).unwrap();
+        (
+            view.expanded.contains(&scan),
+            view.model
+                .loaded(scan)
+                .map(|contents| contents.children.len()),
+        )
+    });
+    assert_eq!(
+        expanded_and_loaded,
+        (true, Some(1)),
+        "Scan must be expanded and loaded before the change"
+    );
+
+    // Create a folder inside Scan through the destination picker.
+    let toggle = cx.debug_bounds("#import-destination-picker").unwrap();
+    cx.simulate_click(toggle.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let scan_row = cx.debug_bounds("#picker-entry-0").unwrap();
+    cx.simulate_click(scan_row.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let new_folder = cx.debug_bounds("#picker-new-folder-0").unwrap();
+    cx.simulate_click(new_folder.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    // The app installs its keymap in main(); tests must do the same for
+    // the input's Enter binding.
+    cx.update(|_, cx| bind_picture_browser_keys(cx));
+    cx.simulate_keystrokes("1 enter");
+    cx.run_until_parked();
+    assert!(
+        library.join("Scan").join("1").is_dir(),
+        "typed folder was not created"
+    );
+
+    // Leaving the import view re-scans the touched chains: the still
+    // expanded Scan now lists the new folder.
+    view.update(&mut *cx, |view, cx| view.exit_import_view(cx));
+    cx.run_until_parked();
+
+    let (scan_children, new_folder_loaded) = view.read_with(&*cx, |view, _| {
+        let scan = view.model.node_id(&library.join("Scan")).unwrap();
+        let children: Vec<PathBuf> = view
+            .model
+            .loaded(scan)
+            .expect("Scan reloaded after leaving the view")
+            .children
+            .iter()
+            .map(|child| view.model.node(*child).path.to_path_buf())
+            .collect();
+        let new_folder = view
+            .model
+            .node_id(&library.join("Scan").join("1"))
+            .map(|node| view.model.loaded(node).is_some());
+        (children, new_folder)
+    });
+    assert_eq!(
+        scan_children,
+        vec![
+            library.join("Scan").join("1"),
+            library.join("Scan").join("old")
+        ],
+        "the created folder must appear in the re-scanned parent"
+    );
+    assert_eq!(
+        new_folder_loaded,
+        Some(true),
+        "the created folder itself is reloaded too"
     );
 }
 
