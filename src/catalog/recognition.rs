@@ -28,7 +28,7 @@ pub const PROTOTYPE_ALGORITHM_VERSION: i64 = 1;
 pub const ANN_INDEX_VERSION: i64 = 1;
 pub const PRODUCTION_SFACE_MODEL_ID: &str = "sface-2021dec";
 pub const PRODUCTION_SFACE_POLICY_DIGEST: &str =
-    "4f748d22b72b1bfbb5bafe6b207a4e6a74b5cecd0cace96dfee9ba88e6ba1fb2";
+    "4ac3a8a1beb2cc92243ac4c9704e92b105e274b84048d787458b2e86d58a7614";
 const PRODUCTION_SFACE_MODEL_DIGEST: &str =
     "0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79";
 const PRODUCTION_SFACE_POLICY: &[u8] =
@@ -208,15 +208,15 @@ fn validate_calibration_report(report: &CalibrationReport, license: &PolicyLicen
         || data.verifier_source_sha256
             != "887bf9c8f2058157a0a0e3079d74207522d242021884639f7047259005a548d3"
         || data.extractor_source_sha256
-            != "3989cc579043bd226f5b1cf5fbd562bb2138966528d79719102d6f34581553f7"
+            != "d1ba4714c33312150c3679fa8ea873c7a6d2fbc96451842c9248bfe1ade41d73"
         || data.production_inference_source_sha256
-            != "1b0c97a4d5aacb04b2beaa71637a84cb45e6062622ae932692e4174726df5f36"
+            != "d4d9eb5af52c7d423296584169fcef54a3d6a0ea622f87e87ffa0027d72701b7"
         || data.production_policy_source_sha256
             != "3d2e0693777abdf37fe0085feb7badf66a7fb3859c448e23676eb36ceb4a8bda"
         || data.corpus_provenance_sha256
             != "119d83ca04a64beab77799daa79396474a34d5a2a2dbb19a188e1e818b1926da"
         || data.dependency_lock_sha256
-            != "f4ff50f313bd217ca3d644794f55b0b3b644b2c308c0ba4ae9fc64c84c4cbf5f"
+            != "a767eaee6f6948e4a3432134a9da3bda1a918a1e2aee9c29b8945d685a2d5cc5"
         || data.generator_spec_sha256
             != "df7dbebefc2128fb1bed2363a15394857f3d5d96ef5bb08b8905c12249414fee"
         || data.identity_count != 20

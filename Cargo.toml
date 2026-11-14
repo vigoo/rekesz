@@ -38,7 +38,7 @@ image = { version = "0.25", features = ["avif", "bmp", "dds", "exr", "ff", "gif"
 libc = "=0.2.189"
 jpeg-decoder = "0.3.2"
 moxcms = "0.9.1"
-ort = { version = "2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "download-binaries", "copy-dylibs", "tls-rustls"] }
+ort = { version = "2.0.0-rc.15", default-features = false, features = ["std", "ndarray", "download-binaries", "copy-dylibs", "tls-rustls"] }
 rawler = { git = "https://github.com/vigoo/dnglab.git", rev = "e7a2ad7fb627a99a1e846d02bca8993371fd90fa" }
 priority-queue = "2"
 rayon = "1"
@@ -63,7 +63,7 @@ quick-xml = "=0.42.0"
 # runtime: face analysis falls back to CPU when the NVIDIA driver or the
 # CUDA/cuDNN userland libraries are missing.
 [target.'cfg(all(any(target_os = "linux", target_os = "windows"), target_arch = "x86_64"))'.dependencies]
-ort = { version = "2.0.0-rc.13", default-features = false, features = [
+ort = { version = "2.0.0-rc.15", default-features = false, features = [
     "std",
     "ndarray",
     "download-binaries",

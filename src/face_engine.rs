@@ -11,7 +11,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView, Rgb, RgbImage};
-use ort::{session::Session, value::Tensor};
+use ort::{environment::Environment, session::Session, value::Tensor};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
@@ -1304,6 +1304,21 @@ fn benchmark_device(device: FaceComputeDevice) -> Result<std::time::Duration> {
     Ok(started.elapsed() / TIMED_RUNS as u32)
 }
 
+/// ONNX Runtime allows exactly one environment per process (ort rc.14+), so
+/// every inference session shares this one. `Environment` is an `Arc` handle,
+/// which makes cloning it cheap.
+static ORT_ENVIRONMENT: Mutex<Option<Environment>> = Mutex::new(None);
+
+fn ort_environment() -> Result<Environment> {
+    let mut current = ORT_ENVIRONMENT.lock().unwrap();
+    if let Some(env) = &*current {
+        return Ok(env.clone());
+    }
+    let env = ort::init().build()?;
+    *current = Some(env.clone());
+    Ok(env)
+}
+
 fn build_inference_session(
     model: &[u8],
     device: FaceComputeDevice,
@@ -1312,7 +1327,8 @@ fn build_inference_session(
     // Bounded per-worker ORT pools: each session gets two intra-op threads,
     // so N workers use 2N ORT threads; the models are invoked sequentially
     // within each job.
-    let builder = Session::builder()?
+    let env = ort_environment()?;
+    let builder = Session::builder(&env)?
         .with_intra_threads(2)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?
         .with_inter_threads(1)

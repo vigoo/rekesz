@@ -34,17 +34,20 @@ struct Models {
 
 impl Models {
     fn new() -> Result<Self> {
+        // Sessions own their environment reference, so one environment for
+        // both models is enough (ort rc.14).
+        let env = ort::init().build()?;
         Ok(Self {
             // Match the production engine's bounded ORT execution policy so
             // calibration measures the same inference configuration and does
             // not create host-sized thread pools.
-            detector: Session::builder()?
+            detector: Session::builder(&env)?
                 .with_intra_threads(2)
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?
                 .with_inter_threads(1)
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?
                 .commit_from_memory(YUNET)?,
-            recognizer: Session::builder()?
+            recognizer: Session::builder(&env)?
                 .with_intra_threads(2)
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?
                 .with_inter_threads(1)
