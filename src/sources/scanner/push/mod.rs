@@ -5,7 +5,10 @@
 //! MIT-licensed epson2paperless project.
 
 pub mod announce;
+pub mod colour;
+pub mod dialect;
 pub mod engine;
+pub mod session;
 pub mod trigger;
 pub mod wire;
 

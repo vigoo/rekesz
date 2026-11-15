@@ -342,13 +342,13 @@ pub fn handle_connection(
                     let decision = engine::admit_push_scan(
                         &input,
                         action_byte(request.action),
-                        output.trigger_pending,
+                        output.scan_active,
                         now,
                     );
                     if decision == Admission::Accept {
-                        // Reserve the slot now; abandoned below if the
-                        // response never goes out.
-                        output.trigger_pending = true;
+                        // Reserve the session slot now; abandoned below if
+                        // the response never goes out.
+                        output.scan_active = true;
                     }
                     decision
                 }
@@ -358,7 +358,9 @@ pub fn handle_connection(
                 Admission::Accept => ("OK", Vec::new(), true),
                 Admission::OkNoSession => ("OK", Vec::new(), false),
                 Admission::Refuse => {
-                    trace::event("push: push scan refused (disarmed, busy, or pending)");
+                    trace::event(
+                        "push: push scan refused (disarmed, busy, or a session is active)",
+                    );
                     ("ERROR", Vec::new(), false)
                 }
             }
@@ -389,12 +391,50 @@ pub fn handle_connection(
     if !sent && reserved {
         // The reservation must not block real triggers after a dead write.
         if let Ok(mut output) = output.lock() {
-            output.trigger_pending = false;
+            output.scan_active = false;
         }
     }
     if sent && reserved {
-        trace::event("push: push scan accepted — waiting for the UI to start the scan");
+        // The native session replaces the stage-1 eSCL bridge: the printer
+        // now expects the ESC/I-2 scan on port 1865 right after the answered
+        // trigger. It runs on this connection thread; the result lands in
+        // the output slot for the UI's poll chain to ingest.
+        let (scan, scan_dir) = match input.lock() {
+            Ok(input) => (input.scan, input.scan_dir.clone()),
+            Err(_) => (None, None),
+        };
+        let dpi_note = scan.as_ref().map(|scan| scan.dpi.to_string());
+        trace::event(&format!(
+            "push: push scan accepted — running the ESC/I-2 session at {dpi_note:?} DPI"
+        ));
+        let result = match (scan, scan_dir) {
+            (Some(scan), Some(scan_dir)) => {
+                let cancel = std::sync::atomic::AtomicBool::new(false);
+                match super::session::run_flatbed(peer, scan, &cancel) {
+                    Ok(jpeg) => write_scan_file(&scan_dir, &jpeg)
+                        .map_err(|error| format!("cannot write the scan file: {error}")),
+                    Err(error) => Err(error.to_string()),
+                }
+            }
+            _ => Err("no scan settings or scan folder published".to_string()),
+        };
+        if let Ok(mut output) = output.lock() {
+            output.scan_done = Some(result);
+            output.scan_active = false;
+        }
     }
+}
+
+/// Deliver the session's JPEG with the house staged-write convention:
+/// `<destination>.rekesz-part` written whole, then renamed into place so a
+/// torn write is never listable.
+fn write_scan_file(scan_dir: &std::path::Path, jpeg: &[u8]) -> std::io::Result<std::path::PathBuf> {
+    std::fs::create_dir_all(scan_dir)?;
+    let destination = crate::sources::scanner::unique_scan_path(scan_dir);
+    let partial = destination.with_extension("rekesz-part");
+    std::fs::write(&partial, jpeg)?;
+    std::fs::rename(&partial, &destination)?;
+    Ok(destination)
 }
 
 /// Panel action byte: '1' JPG, '2' PDF; email ('3') and preview ('4') and

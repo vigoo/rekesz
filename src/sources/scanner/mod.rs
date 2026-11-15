@@ -62,6 +62,23 @@ pub fn scan_file_name(now: chrono::DateTime<chrono::Local>) -> String {
     )
 }
 
+/// Collision-safe destination for a new scan in `directory`: the millisecond
+/// timestamp name, `-2`/`-3`… suffixed when two scans land in the same
+/// millisecond. Shared by the eSCL scan path and the push-scan session.
+pub fn unique_scan_path(directory: &Path) -> PathBuf {
+    let mut path = directory.join(scan_file_name(chrono::Local::now()));
+    let mut index = 2;
+    while path.exists() {
+        let stem = path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "scan".to_owned());
+        path = directory.join(format!("{stem}-{index}.jpg"));
+        index += 1;
+    }
+    path
+}
+
 /// Scan output directory of one scanner for this app run.
 pub fn session_scan_dir(cache_root: &Path, device_key: &str) -> PathBuf {
     cache_root

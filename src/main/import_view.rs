@@ -3334,7 +3334,11 @@ impl PictureBrowser {
     /// engine by going stale.
     fn sync_push_engine(&mut self, cx: &mut Context<Self>) {
         let key = self.selected_scanner_key();
-        sources::scanner::push::engine::push_engine().publish_input(|input| {
+        let engine = sources::scanner::push::engine::push_engine();
+        let scan_dir = key
+            .as_deref()
+            .map(|key| sources::scanner::session_scan_dir(&self.settings.cache_root, key));
+        engine.publish_input(|input| {
             input.armed = key.is_some()
                 && !self.import_view.scan_panel.offline
                 && matches!(self.import_view.scan_panel.caps, ScanCapsState::Loaded(_));
@@ -3345,29 +3349,51 @@ impl PictureBrowser {
                 .as_deref()
                 .map(|key| self.scanner_endpoint_ips(key))
                 .unwrap_or_default();
+            input.scan = self.scan_settings().map(|settings| {
+                let fractions = self.import_view.scan_panel.region.normalized();
+                let color = match self.import_view.scan_panel.color {
+                    config::ScanColorMode::Rgb => {
+                        sources::scanner::push::dialect::ParaColorMode::Color
+                    }
+                    // Device JPEG output is 8-bit per channel: black-and-white
+                    // scans come back as grayscale JPEGs.
+                    config::ScanColorMode::Gray | config::ScanColorMode::BlackAndWhite => {
+                        sources::scanner::push::dialect::ParaColorMode::Grayscale
+                    }
+                };
+                sources::scanner::push::engine::PushScanSettings {
+                    dpi: settings.resolution,
+                    region: (fractions.x0, fractions.y0, fractions.x1, fractions.y1),
+                    color,
+                }
+            });
+            input.scan_dir = scan_dir;
             input.ticked_at = Some(std::time::Instant::now());
         });
-        if !sources::scanner::push::engine::push_engine().take_trigger() {
-            return;
+        // Consume a finished native session: the engine thread already wrote
+        // the JPEG into the session directory.
+        if let Some(result) = engine.take_scan_done() {
+            match result {
+                Ok(path) => {
+                    crate::trace::event(&format!(
+                        "push: session delivered {} into the batch",
+                        path.display()
+                    ));
+                    self.import_add_scanned_file(path, cx);
+                    self.import_view.scan_panel.last_result =
+                        Some("Scanner panel: scan added".to_string());
+                }
+                Err(error) => {
+                    self.import_view.scan_panel.last_result =
+                        Some(format!("Scanner panel: push failed ({error})"));
+                }
+            }
+        } else if engine.output_snapshot().scan_active && self.import_view.scan_panel.job.is_none()
+        {
+            // The native session has no eSCL job phases; say what is
+            // happening instead of leaving the status line stale.
+            self.import_view.scan_panel.last_result = Some("Scanner panel: scanning…".to_string());
         }
-        // The panel push was admitted while the state matched; if the UI
-        // cannot start it now (state moved between the trigger and this
-        // tick), say so precisely instead of silently dropping the press.
-        if self.scan_start_blocked() {
-            let reason = if self.import_view.scan_panel.offline
-                || !matches!(self.import_view.scan_panel.caps, ScanCapsState::Loaded(_))
-            {
-                "the scanner is unavailable"
-            } else {
-                "a job is in flight"
-            };
-            self.import_view.scan_panel.last_result =
-                Some(format!("Scanner panel push could not start — {reason}"));
-            cx.notify();
-            return;
-        }
-        crate::trace::event("push: accepted panel trigger starts the bridged scan");
-        self.start_scan(cx);
     }
 
     /// Addresses of the selected scanner — the push-scan announcement
@@ -3529,6 +3555,11 @@ impl PictureBrowser {
             || self.import_view.scan_panel.offline
             || !matches!(self.import_view.scan_panel.caps, ScanCapsState::Loaded(_))
             || self.import_view.job.is_some()
+            // A native push session holds the device; an eSCL scan started
+            // now would collide with it.
+            || sources::scanner::push::engine::push_engine()
+                .output_snapshot()
+                .scan_active
     }
 
     /// The resolution actually used: the persisted pick when the device
@@ -3648,20 +3679,13 @@ impl PictureBrowser {
             cx.notify();
             return;
         }
-        // Unique name even for two scans within the same millisecond.
-        let now = chrono::Local::now();
-        let mut path = directory.join(sources::scanner::scan_file_name(now));
-        let mut index = 2;
-        while path.exists() {
-            let stem = path
-                .file_stem()
-                .map(|stem| stem.to_string_lossy().into_owned());
-            let stem = stem.unwrap_or_else(|| "scan".to_owned());
-            path = directory.join(format!("{stem}-{index}.jpg"));
-            index += 1;
-        }
-        let destination = path.clone();
-        self.begin_scan_job(ScanJobKind::Scan(path), settings, destination, cx);
+        let destination = sources::scanner::unique_scan_path(&directory);
+        self.begin_scan_job(
+            ScanJobKind::Scan(destination.clone()),
+            settings,
+            destination,
+            cx,
+        );
     }
 
     fn begin_scan_job(

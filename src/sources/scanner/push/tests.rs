@@ -9,9 +9,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::announce::{self, KeepaliveValues};
+use super::dialect::{self, ParaColorMode};
 use super::engine::{
-    self, ANNOUNCE_DEDUPE_WINDOW, Admission, EngineInput, EngineOutput, TICK_STALENESS,
+    self, ANNOUNCE_DEDUPE_WINDOW, Admission, EngineInput, EngineOutput, PushScanSettings,
+    TICK_STALENESS,
 };
+use super::session::{self, Link as SessionLink};
 use super::trigger::{self, TriggerKind};
 use super::wire::{self, ParsedPacket, parse_is_packet};
 
@@ -305,6 +308,14 @@ fn keepalive_skips_unknown_requested_tags() {
     assert_eq!(text, "(ClientName=N)");
 }
 
+fn push_settings() -> PushScanSettings {
+    PushScanSettings {
+        dpi: 300,
+        region: (0.0, 0.0, 1.0, 1.0),
+        color: ParaColorMode::Color,
+    }
+}
+
 fn armed_input(now: Instant) -> EngineInput {
     EngineInput {
         armed: true,
@@ -312,6 +323,8 @@ fn armed_input(now: Instant) -> EngineInput {
         scanner_ips: vec![IpAddr::V4(Ipv4Addr::new(192, 168, 50, 67))],
         destination_name: "Rekesz".to_string(),
         ticked_at: Some(now),
+        scan: Some(push_settings()),
+        scan_dir: Some(std::path::PathBuf::from("/tmp/rekesz-test-scans")),
     }
 }
 
@@ -441,8 +454,8 @@ fn trigger_request_of(body: &str) -> trigger::TriggerRequest {
     );
     std::thread::spawn(move || {
         let mut client = client;
-        use std::io::Write as _;
-        let _ = client.write_all(raw.as_bytes());
+        std::io::Write::write_all(&mut client, raw.as_bytes()).ok();
+        std::io::Write::flush(&mut client).ok();
         let _ = client.shutdown(std::net::Shutdown::Write);
     });
     let mut server = server;
@@ -502,7 +515,7 @@ fn loopback_input(now: Instant) -> EngineInput {
 }
 
 #[test]
-fn scripted_connection_answers_ok_and_sets_the_trigger() {
+fn scripted_connection_answers_ok_and_attempts_the_session() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
     let address = listener.local_addr().expect("address");
     let input = Arc::new(Mutex::new(loopback_input(Instant::now())));
@@ -514,21 +527,32 @@ fn scripted_connection_answers_ok_and_sets_the_trigger() {
         trigger::handle_connection(server, &server_input, &server_output);
     });
     let mut client = TcpStream::connect(address).expect("client");
-    use std::io::{Read as _, Write as _};
-    client
-        .write_all(push_scan_request("42", "01").as_bytes())
+    std::io::Write::write_all(&mut client, push_scan_request("42", "01").as_bytes())
         .expect("request written");
     let _ = client.shutdown(std::net::Shutdown::Write);
     let mut response = Vec::new();
     // Reads to EOF: the handler half-closes after the response (FIN).
-    client.read_to_end(&mut response).expect("response read");
+    std::io::Read::read_to_end(&mut client, &mut response).expect("response read");
     let response = String::from_utf8_lossy(&response).into_owned();
     assert!(response.starts_with("HTTP/1.0 200 OK\r\n"), "{response}");
     assert!(response.contains("x-uid : 42\r\n"));
     assert!(response.contains("<StatusOut>OK</StatusOut>"));
+    // The accepted push reserves the session slot and then attempts the
+    // session; with no printer listening on the loopback ESC/I-2 port the
+    // connect fails fast and reports through the result slot.
+    // The session attempt happens after the response is flushed; wait for
+    // it (loopback connect-refused fails within milliseconds).
+    let mut done = None;
+    for _ in 0..40 {
+        done = output.lock().expect("output").scan_done.take();
+        if done.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
     assert!(
-        output.lock().expect("output").trigger_pending,
-        "an accepted push must set the trigger"
+        matches!(&done, Some(Err(message)) if message.contains("connect")),
+        "the accept path must attempt the session and report why it stopped: {done:?}"
     );
 }
 
@@ -547,15 +571,13 @@ fn scripted_connection_refuses_busy_with_error_status() {
         trigger::handle_connection(server, &server_input, &server_output);
     });
     let mut client = TcpStream::connect(address).expect("client");
-    use std::io::{Read as _, Write as _};
-    client
-        .write_all(push_scan_request("7", "01").as_bytes())
+    std::io::Write::write_all(&mut client, push_scan_request("7", "01").as_bytes())
         .expect("request written");
     let _ = client.shutdown(std::net::Shutdown::Write);
     let mut response = Vec::new();
-    client.read_to_end(&mut response).expect("response read");
+    std::io::Read::read_to_end(&mut client, &mut response).expect("response read");
     assert!(String::from_utf8_lossy(&response).contains("<StatusOut>ERROR</StatusOut>"));
-    assert!(!output.lock().expect("output").trigger_pending);
+    assert!(!output.lock().expect("output").scan_active);
 }
 
 #[test]
@@ -571,23 +593,20 @@ fn scripted_connection_answers_scan_end_without_a_trigger() {
         trigger::handle_connection(server, &server_input, &server_output);
     });
     let mut client = TcpStream::connect(address).expect("client");
-    use std::io::{Read as _, Write as _};
     let body =
         "<p:ScanEnd xmlns:p=\"http://schema.epson.net/EpsonNet/Scan/2004/pushscan\"></p:ScanEnd>";
     let request = format!(
         "POST / HTTP/1.0\r\nContent-Type : text/xml\r\nContent-Length : {}\r\nx-uid : 5\r\nx-protocol-version : 2.00\r\n\r\n{body}",
         body.len()
     );
-    client
-        .write_all(request.as_bytes())
-        .expect("request written");
+    std::io::Write::write_all(&mut client, request.as_bytes()).expect("request written");
     let _ = client.shutdown(std::net::Shutdown::Write);
     let mut response = Vec::new();
-    client.read_to_end(&mut response).expect("response read");
+    std::io::Read::read_to_end(&mut client, &mut response).expect("response read");
     let response = String::from_utf8_lossy(&response).into_owned();
     assert!(response.contains("<StatusOut>OK</StatusOut>"));
     assert!(response.contains("<p:PushScanResponse"));
-    assert!(!output.lock().expect("output").trigger_pending);
+    assert!(!output.lock().expect("output").scan_active);
 }
 
 #[test]
@@ -629,8 +648,8 @@ fn extract_element_ignores_closing_tags() {
     );
     std::thread::spawn(move || {
         let mut client = client;
-        use std::io::Write as _;
-        let _ = client.write_all(raw.as_bytes());
+        std::io::Write::write_all(&mut client, raw.as_bytes()).ok();
+        std::io::Write::flush(&mut client).ok();
         let _ = client.shutdown(std::net::Shutdown::Write);
     });
     let mut server = server;
@@ -648,11 +667,437 @@ fn read_request_survives_hostile_content_length() {
     let raw = "POST / HTTP/1.0\r\nContent-Length : 18446744073709551611\r\n\r\n";
     std::thread::spawn(move || {
         let mut client = client;
-        use std::io::Write as _;
-        let _ = client.write_all(raw.as_bytes());
+        std::io::Write::write_all(&mut client, raw.as_bytes()).ok();
+        std::io::Write::flush(&mut client).ok();
         let _ = client.shutdown(std::net::Shutdown::Write);
     });
     let mut server = server;
     // The clamp makes the parser read to EOF (client already closed) → None.
     assert!(trigger::read_request(&mut server).is_none());
+}
+
+// ---- Stage 2: capability parsing, PARA composition, session replay ----
+
+/// The L3160's CAPA reply from the stage-0 live probe.
+const L3160_CAPA: &[u8] = include_bytes!("testdata/l3160-capa-init1.bin");
+const L3160_INFO: &[u8] = include_bytes!("testdata/l3160-info-init1.bin");
+const GOLDEN_PARA_300: &[u8] = include_bytes!("testdata/golden-para-flatbed-300dpi.bin");
+const GOLDEN_PARA_600: &[u8] = include_bytes!("testdata/golden-para-flatbed-600dpi.bin");
+/// A real ET-4800 flatbed JPEG session, both directions (the ET-4800's CAPA
+/// shape matches the L3160's): printer→host and host→printer byte streams.
+const ET4800_PRINTER_STREAM: &[u8] = include_bytes!("testdata/et4800-flatbed-jpg-printer.bin");
+const ET4800_HOST_STREAM: &[u8] = include_bytes!("testdata/et4800-flatbed-jpg-host.bin");
+
+#[test]
+fn l3160_capa_tokens_parse_from_the_live_probe_fixture() {
+    let capa = dialect::parse_capa_tokens(L3160_CAPA);
+    assert_eq!(capa.gmm_list.as_deref(), Some("UG10UG18"));
+    assert_eq!(capa.cmx_list.as_deref(), Some("UNITUM08"));
+    assert_eq!(capa.fmt_list.as_deref(), Some("RAW JPG"));
+    assert_eq!(
+        capa.rsm_list.as_deref(),
+        Some(&[75, 150, 300, 600, 1200][..])
+    );
+    assert_eq!(
+        capa.rss_list.as_deref(),
+        Some(&[75, 150, 300, 400, 600, 1200, 2400][..])
+    );
+    assert_eq!(
+        capa.fb_rsms_list.as_deref(),
+        Some(&[75, 150, 300, 600, 1200][..])
+    );
+    assert_eq!(capa.jpg_range, Some((1, 100)));
+    // Resolution negotiation: RSMLIST ∩ RSSLIST = 75/150/300/600.
+    // 1200 is in BOTH RSMLIST and RSSLIST, so it survives the intersection.
+    assert_eq!(
+        dialect::advertised_dpi_set(&capa),
+        vec![75, 150, 300, 600, 1200]
+    );
+    assert_eq!(dialect::select_wire_dpi(300, &[75, 150, 300, 600]), 300);
+    assert_eq!(dialect::select_wire_dpi(200, &[75, 150, 300, 600]), 300);
+    assert_eq!(dialect::select_wire_dpi(1200, &[75, 150, 300, 600]), 600);
+}
+
+#[test]
+fn l3160_info_tokens_parse_from_the_live_probe_fixture() {
+    let info = dialect::parse_info_tokens(L3160_INFO);
+    assert_eq!(info.pid.as_deref(), Some("1157"));
+    assert_eq!(info.fb_area.as_deref(), Some("d850i0001170"));
+    assert_eq!(info.fb_align.as_deref(), Some("LEFT"));
+}
+
+#[test]
+fn region_window_maps_the_crop_over_the_info_area() {
+    let info = dialect::parse_info_tokens(L3160_INFO);
+    let area = dialect::parse_area(info.fb_area.as_deref().expect("area")).expect("two values");
+    // Full platen: the whole advertised area at the wire DPI — the same
+    // rectangle an app-initiated eSCL scan captures.
+    let full = dialect::region_window(area, (0.0, 0.0, 1.0, 1.0), 300).expect("full");
+    assert_eq!(
+        full,
+        dialect::Extents {
+            x0: 0,
+            y0: 0,
+            w: 2550,
+            h: 3510
+        }
+    );
+    let full600 = dialect::region_window(area, (0.0, 0.0, 1.0, 1.0), 600).expect("full 600");
+    assert_eq!(full600.w, 5100);
+    assert_eq!(full600.h, 7020);
+    // A half-size crop anchored in the top-left quadrant.
+    let crop = dialect::region_window(area, (0.0, 0.0, 0.5, 0.5), 300).expect("crop");
+    assert_eq!(
+        crop,
+        dialect::Extents {
+            x0: 0,
+            y0: 0,
+            w: 1275,
+            h: 1755
+        }
+    );
+    // Degenerate: a zero-area crop is refused.
+    assert!(dialect::region_window(area, (0.5, 0.5, 0.5, 0.5), 300).is_err());
+}
+
+#[test]
+fn composed_para_matches_the_reference_golden() {
+    // The goldens were produced by the reference's own composer for the
+    // ET-4800 dialect inputs (flatbed, jpg, A4 window, quality 90) and are
+    // byte-identical to what a real Windows driver sent the ET-4800 — the
+    // same CAPA shape as the L3160.
+    let dialect = dialect::FlatbedDialect::et4800();
+    let window = dialect::Extents {
+        x0: 0,
+        y0: 0,
+        w: 2481,
+        h: 3506,
+    };
+    assert_eq!(
+        dialect::compose_para(dialect, 300, window, ParaColorMode::Color).as_slice(),
+        GOLDEN_PARA_300
+    );
+    assert_eq!(
+        dialect::compose_para(
+            dialect,
+            600,
+            dialect::Extents {
+                x0: 0,
+                y0: 0,
+                w: 4962,
+                h: 7012
+            },
+            ParaColorMode::Color
+        )
+        .as_slice(),
+        GOLDEN_PARA_600
+    );
+}
+
+/// A scripted printer: replays a recorded printer→host stream and captures
+/// everything the session writes.
+struct ReplayLink {
+    incoming: &'static [u8],
+    position: usize,
+    sent: Vec<u8>,
+}
+
+impl SessionLink for ReplayLink {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let remaining = self.incoming.len() - self.position;
+        if remaining == 0 {
+            return Ok(0);
+        }
+        let take = remaining.min(buf.len());
+        buf[..take].copy_from_slice(&self.incoming[self.position..self.position + take]);
+        self.position += take;
+        Ok(take)
+    }
+
+    fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
+        self.sent.extend_from_slice(data);
+        Ok(())
+    }
+}
+
+#[test]
+fn session_replays_the_real_et4800_capture_byte_for_byte() {
+    let mut link = ReplayLink {
+        incoming: ET4800_PRINTER_STREAM,
+        position: 0,
+        sent: Vec::new(),
+    };
+    // The recording's driver sent the A4 window (2481×3506) over the
+    // 2550×3510 area — express it as the crop fractions that reproduce it.
+    let settings = PushScanSettings {
+        dpi: 300,
+        region: (0.0, 0.0, 2481.0 / 2550.0, 3506.0 / 3510.0),
+        color: ParaColorMode::Color,
+    };
+    let image = session::drive_for_test(&mut link, dialect::FlatbedDialect::et4800(), settings)
+        .expect("the session completes");
+    // The recorded host traffic must be reproduced exactly.
+    assert_eq!(
+        link.sent.as_slice(),
+        ET4800_HOST_STREAM,
+        "host stream diverges from the real capture"
+    );
+    // The image the session assembled is the device-encoded JPEG.
+    assert!(image.len() > 100_000, "{} bytes of scan", image.len());
+    assert_eq!(&image[..2], &[0xff, 0xd8], "JPEG SOI");
+}
+
+// ---- Stage 2: scripted-session tests over synthetic printer streams ----
+
+/// A 64-byte ESC/I-2 reply frame: echoed command, declared body length,
+/// token block padded with `#---` filler.
+fn meta(cmd: &str, body_len: u32, tokens: &str) -> Vec<u8> {
+    let mut frame = vec![0_u8; 64];
+    let padded = format!("{cmd:<4}");
+    frame[0..4].copy_from_slice(padded.as_bytes());
+    frame[4] = b'x';
+    // The declared length is 7 HEX digits on the wire.
+    frame[5..12].copy_from_slice(format!("{body_len:07X}").as_bytes());
+    let mut block = format!("#{tokens}");
+    while block.len() < 52 {
+        block.push_str("#---");
+    }
+    frame[12..12 + block.len().min(52)].copy_from_slice(&block.as_bytes()[..52.min(block.len())]);
+    frame
+}
+
+/// A synthetic printer stream for a complete minimal flatbed session: the
+/// L3160 fixture's INFO/CAPA bodies, one 4-byte #pen image chunk, clean
+/// teardown. `inject` runs mid-stream (async events, error frames…).
+fn synthetic_session_stream(inject_after_lock: Option<Vec<u8>>, img_meta_tokens: &str) -> Vec<u8> {
+    let mut stream = Vec::new();
+    let push = |stream: &mut Vec<u8>, frame: Vec<u8>| stream.extend_from_slice(&frame);
+    push(
+        &mut stream,
+        wire::build_is_packet(wire::TYPE_WELCOME, &[0x01, 0x04, 0x00, 0x00, 0x00]),
+    );
+    push(
+        &mut stream,
+        wire::build_is_packet(wire::TYPE_LOCK_ACK, &[wire::ACK_BYTE]),
+    );
+    if let Some(injected) = inject_after_lock {
+        push(&mut stream, injected);
+    }
+    push(
+        &mut stream,
+        wire::build_is_packet(wire::TYPE_PASSTHRU_REPLY, &[wire::ACK_BYTE]),
+    );
+    // INIT1: INFO + CAPA from the live-probe fixtures.
+    push(
+        &mut stream,
+        wire::build_is_packet(
+            wire::TYPE_PASSTHRU_REPLY,
+            &meta("INFO", L3160_INFO.len() as u32, ""),
+        ),
+    );
+    push(
+        &mut stream,
+        wire::build_is_packet(wire::TYPE_PASSTHRU_REPLY, L3160_INFO),
+    );
+    push(
+        &mut stream,
+        wire::build_is_packet(
+            wire::TYPE_PASSTHRU_REPLY,
+            &meta("CAPA", L3160_CAPA.len() as u32, ""),
+        ),
+    );
+    push(
+        &mut stream,
+        wire::build_is_packet(wire::TYPE_PASSTHRU_REPLY, L3160_CAPA),
+    );
+    push(
+        &mut stream,
+        wire::build_is_packet(wire::TYPE_PASSTHRU_REPLY, &meta("FIN", 0, "")),
+    );
+    // INIT2: small second-mode replies.
+    push(
+        &mut stream,
+        wire::build_is_packet(wire::TYPE_PASSTHRU_REPLY, &[wire::ACK_BYTE]),
+    );
+    push(
+        &mut stream,
+        wire::build_is_packet(wire::TYPE_PASSTHRU_REPLY, &meta("INFO", 2, "")),
+    );
+    push(
+        &mut stream,
+        wire::build_is_packet(wire::TYPE_PASSTHRU_REPLY, b"OK"),
+    );
+    push(
+        &mut stream,
+        wire::build_is_packet(wire::TYPE_PASSTHRU_REPLY, &meta("CAPA", 2, "")),
+    );
+    push(
+        &mut stream,
+        wire::build_is_packet(wire::TYPE_PASSTHRU_REPLY, b"OK"),
+    );
+    push(
+        &mut stream,
+        wire::build_is_packet(wire::TYPE_PASSTHRU_REPLY, &meta("RESA", 2, "")),
+    );
+    push(
+        &mut stream,
+        wire::build_is_packet(wire::TYPE_PASSTHRU_REPLY, b"OK"),
+    );
+    push(
+        &mut stream,
+        wire::build_is_packet(wire::TYPE_PASSTHRU_REPLY, &meta("FIN", 0, "")),
+    );
+    // Two init polls (the L3160 dialect's count).
+    for _ in 0..2 {
+        push(
+            &mut stream,
+            wire::build_is_packet(wire::TYPE_PASSTHRU_REPLY, &[wire::ACK_BYTE]),
+        );
+        push(
+            &mut stream,
+            wire::build_is_packet(wire::TYPE_PASSTHRU_REPLY, &meta("STAT", 2, "")),
+        );
+        push(
+            &mut stream,
+            wire::build_is_packet(wire::TYPE_PASSTHRU_REPLY, b"OK"),
+        );
+        push(
+            &mut stream,
+            wire::build_is_packet(wire::TYPE_PASSTHRU_REPLY, &meta("FIN", 0, "")),
+        );
+    }
+    push(
+        &mut stream,
+        wire::build_is_packet(wire::TYPE_PASSTHRU_REPLY, &[wire::ACK_BYTE]),
+    );
+    push(
+        &mut stream,
+        wire::build_is_packet(wire::TYPE_PASSTHRU_REPLY, &meta("STAT", 2, "")),
+    );
+    push(
+        &mut stream,
+        wire::build_is_packet(wire::TYPE_PASSTHRU_REPLY, b"OK"),
+    );
+    // PARA: the empty header ack (skipped by the filter), then #parOK.
+    push(
+        &mut stream,
+        wire::build_is_packet(wire::TYPE_PASSTHRU_REPLY, &[]),
+    );
+    push(
+        &mut stream,
+        wire::build_is_packet(wire::TYPE_PASSTHRU_REPLY, &meta("PARA", 0, "parOK")),
+    );
+    push(
+        &mut stream,
+        wire::build_is_packet(wire::TYPE_PASSTHRU_REPLY, &meta("TRDT", 0, "")),
+    );
+    // One image chunk, page end marker in the metadata.
+    push(
+        &mut stream,
+        wire::build_is_packet(wire::TYPE_PASSTHRU_REPLY, &meta("IMG", 4, img_meta_tokens)),
+    );
+    push(
+        &mut stream,
+        wire::build_is_packet(wire::TYPE_PASSTHRU_REPLY, b"JPEG"),
+    );
+    push(
+        &mut stream,
+        wire::build_is_packet(wire::TYPE_PASSTHRU_REPLY, &meta("FIN", 0, "")),
+    );
+    push(
+        &mut stream,
+        wire::build_is_packet(wire::TYPE_UNLOCK_ACK, &[]),
+    );
+    stream
+}
+
+#[test]
+fn synthetic_session_delivers_the_device_jpeg() {
+    let mut link = ReplayLink {
+        incoming: Box::leak(synthetic_session_stream(None, "pen").into_boxed_slice()),
+        position: 0,
+        sent: Vec::new(),
+    };
+    let image =
+        session::drive_for_test(&mut link, dialect::FlatbedDialect::l3160(), push_settings())
+            .expect("the session completes");
+    assert_eq!(image, b"JPEG");
+    // The host traffic ends with the unlock.
+    assert!(link.sent.ends_with(&wire::build_unlock_packet()));
+}
+
+#[test]
+fn synthetic_session_refuses_rejected_parameters() {
+    let link = ReplayLink {
+        incoming: Box::leak(synthetic_session_stream(None, "pen").into_boxed_slice()),
+        position: 0,
+        sent: Vec::new(),
+    };
+    // Rewrite the PARA reply's #par token to NG: find the PARA META frame
+    // (64 B, cmd PARA) and patch its token block.
+    let mut stream = link.incoming.to_vec();
+    let mut offset = 0;
+    while offset + 12 <= stream.len() {
+        if &stream[offset..offset + 2] != b"IS" {
+            break;
+        }
+        let kind = u16::from_be_bytes([stream[offset + 2], stream[offset + 3]]);
+        let size = u32::from_be_bytes([
+            stream[offset + 6],
+            stream[offset + 7],
+            stream[offset + 8],
+            stream[offset + 9],
+        ]) as usize;
+        if kind == wire::TYPE_PASSTHRU_REPLY
+            && size == 64
+            && &stream[offset + 12..offset + 16] == b"PARA"
+        {
+            let token_start = offset + 12 + 12;
+            stream[token_start..token_start + 8].copy_from_slice(b"#parNG  ");
+            break;
+        }
+        offset += 12 + size;
+    }
+    let mut link = ReplayLink {
+        incoming: Box::leak(stream.into_boxed_slice()),
+        position: 0,
+        sent: Vec::new(),
+    };
+    let error =
+        session::drive_for_test(&mut link, dialect::FlatbedDialect::l3160(), push_settings())
+            .expect_err("a #parNG reply must stop the session");
+    assert!(
+        error.to_string().contains("refused the scan parameters"),
+        "{error}"
+    );
+}
+
+#[test]
+fn synthetic_session_fails_on_fatal_async_events() {
+    let injected = wire::build_is_packet(wire::TYPE_ASYNC_EVENT, &[0x02]);
+    let mut link = ReplayLink {
+        incoming: Box::leak(synthetic_session_stream(Some(injected), "pen").into_boxed_slice()),
+        position: 0,
+        sent: Vec::new(),
+    };
+    let error =
+        session::drive_for_test(&mut link, dialect::FlatbedDialect::l3160(), push_settings())
+            .expect_err("a disconnect event must stop the session");
+    assert!(error.to_string().contains("async event 0x02"), "{error}");
+}
+
+#[test]
+fn synthetic_session_reports_image_errors() {
+    let mut link = ReplayLink {
+        incoming: Box::leak(synthetic_session_stream(None, "pen#errFB  PJ  ").into_boxed_slice()),
+        position: 0,
+        sent: Vec::new(),
+    };
+    let error =
+        session::drive_for_test(&mut link, dialect::FlatbedDialect::l3160(), push_settings())
+            .expect_err("an in-image #err must stop the session");
+    assert!(
+        error.to_string().contains("the printer reported an error"),
+        "{error}"
+    );
 }

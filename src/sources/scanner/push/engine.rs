@@ -56,6 +56,22 @@ pub struct EngineInput {
     pub destination_name: String,
     /// Last poll tick; arms go stale after [`TICK_STALENESS`].
     pub ticked_at: Option<Instant>,
+    /// The scan panel's push-session settings (None = caps missing).
+    pub scan: Option<PushScanSettings>,
+    /// The device's session scan directory; push output lands here.
+    pub scan_dir: Option<std::path::PathBuf>,
+}
+
+/// The scan settings a push session runs with, published by the UI each tick.
+#[derive(Clone, Copy, Debug)]
+pub struct PushScanSettings {
+    /// Wire DPI (the panel's clamped pick).
+    pub dpi: u32,
+    /// The crop region as fractions of the platen (x0, y0, x1, y1).
+    pub region: (f64, f64, f64, f64),
+    /// The panel's colour mode; black-and-white maps to grayscale (device
+    /// JPEG output is 8-bit per channel).
+    pub color: super::dialect::ParaColorMode,
 }
 
 impl Default for EngineInput {
@@ -66,6 +82,8 @@ impl Default for EngineInput {
             scanner_ips: Vec::new(),
             destination_name: "Rekesz".to_string(),
             ticked_at: None,
+            scan: None,
+            scan_dir: None,
         }
     }
 }
@@ -73,8 +91,11 @@ impl Default for EngineInput {
 /// What the engine tells the UI. Consumed by the scan-panel poll chain.
 #[derive(Clone, Debug, Default)]
 pub struct EngineOutput {
-    /// An accepted panel push waits for the UI to start the bridged scan.
-    pub trigger_pending: bool,
+    /// A native ESC/I-2 session is running: admission refuses new pushes,
+    /// and the UI shows the scanning status.
+    pub scan_active: bool,
+    /// A finished push scan: the staged JPEG's path, or the failure reason.
+    pub scan_done: Option<Result<std::path::PathBuf, String>>,
 }
 
 /// The panel-trigger admission decision for a PushScan POST.
@@ -90,12 +111,20 @@ pub enum Admission {
     Refuse,
 }
 
-pub fn admit_push_scan(input: &EngineInput, action: u8, pending: bool, now: Instant) -> Admission {
+pub fn admit_push_scan(
+    input: &EngineInput,
+    action: u8,
+    session_active: bool,
+    now: Instant,
+) -> Admission {
     let armed = input
         .ticked_at
         .is_some_and(|at| now.duration_since(at) < TICK_STALENESS)
         && input.armed;
-    if !armed || input.busy || pending {
+    // A session in flight or a push while another waits to be consumed both
+    // refuse; the panel needs scan settings + a scan directory to be usable
+    // at all.
+    if !armed || input.busy || session_active || input.scan.is_none() || input.scan_dir.is_none() {
         return Admission::Refuse;
     }
     match action {
@@ -126,12 +155,20 @@ impl PushEngine {
         }
     }
 
-    /// Consume an accepted panel trigger, if one waits.
-    pub fn take_trigger(&self) -> bool {
+    /// Consume a finished push scan's result, if one waits.
+    pub fn take_scan_done(&self) -> Option<Result<std::path::PathBuf, String>> {
         self.output
             .lock()
-            .map(|mut output| std::mem::take(&mut output.trigger_pending))
-            .unwrap_or(false)
+            .ok()
+            .and_then(|mut output| output.scan_done.take())
+    }
+
+    /// Snapshot of the engine-output flags the UI reads each tick.
+    pub fn output_snapshot(&self) -> EngineOutput {
+        self.output
+            .lock()
+            .map(|output| output.clone())
+            .unwrap_or_default()
     }
 
     fn input(&self) -> Arc<Mutex<EngineInput>> {
