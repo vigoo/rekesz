@@ -59,6 +59,44 @@ impl Link for TcpStream {
     }
 }
 
+/// The session link with lock tracking: if the printer is still locked when
+/// the session tears down (an error, the printer's own cancel event, a
+/// panic unwind), the guard sends UNLOCK — otherwise the printer refuses
+/// sessions for its 300 s lock timeout. The happy path's own UNLOCK
+/// disarms it.
+struct GuardedLink<'a> {
+    inner: &'a mut dyn Link,
+    locked: bool,
+}
+
+impl Link for GuardedLink<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+
+    fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
+        // The session writes whole IS packets; track the lock frames.
+        if data.len() >= 4 {
+            match u16::from_be_bytes([data[2], data[3]]) {
+                wire::TYPE_LOCK => self.locked = true,
+                wire::TYPE_UNLOCK => self.locked = false,
+                _ => {}
+            }
+        }
+        self.inner.write_all(data)
+    }
+}
+
+impl Drop for GuardedLink<'_> {
+    fn drop(&mut self) {
+        if self.locked {
+            // Best effort: the printer may already be gone.
+            let _ = self.inner.write_all(&build_unlock_packet());
+            trace::event("push: session teardown sent the missing UNLOCK");
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum SessionError {
     Failed(String),
@@ -107,18 +145,16 @@ impl Session<'_> {
                 Ok(image)
             }
             Err(error) => {
-                // Never leave the printer locked for its 300 s session
-                // timeout: an UNLOCK before teardown, best effort, then a
-                // polite write half-close. (std's inherent read/write_all —
-                // not the Link impl — drive the raw stream here.)
+                // GuardedLink's drop already sent the UNLOCK (the printer
+                // otherwise refuses sessions for its 300 s lock timeout);
+                // drain briefly so the close is a FIN, not an RST. (std's
+                // inherent read — not the Link impl — drives the raw stream.)
                 let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
-                if std::io::Write::write_all(&mut stream, &build_unlock_packet()).is_ok() {
-                    let mut sink = [0_u8; 512];
-                    for _ in 0..2 {
-                        match std::io::Read::read(&mut stream, &mut sink) {
-                            Ok(0) | Err(_) => break,
-                            Ok(_) => continue,
-                        }
+                let mut sink = [0_u8; 512];
+                for _ in 0..2 {
+                    match std::io::Read::read(&mut stream, &mut sink) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => continue,
                     }
                 }
                 let _ = stream.shutdown(Shutdown::Write);
@@ -128,15 +164,19 @@ impl Session<'_> {
     }
 
     fn drive(&self, link: &mut dyn Link) -> Result<Vec<u8>, SessionError> {
+        let mut guarded = GuardedLink {
+            inner: link,
+            locked: false,
+        };
         let mut machine = Machine {
-            link,
+            link: &mut guarded,
             buffer: Vec::new(),
             cancel: self.cancel,
             started: Instant::now(),
         };
         // Welcome: the printer speaks first on plain TCP. Payload byte 1 is
         // the family discriminator (0x02 = legacy ESC/I, anything else ESC/I-2).
-        let (kind, payload) = machine.read_frame(false, "welcome")?;
+        let (kind, payload) = machine.read_frame("welcome")?;
         if kind != wire::TYPE_WELCOME {
             return Err(SessionError::Failed(format!(
                 "expected the 0x8000 welcome, got 0x{kind:04x}"
@@ -268,7 +308,7 @@ impl Session<'_> {
             "PARA header",
         )?;
         machine.send(&build_passthru_packet(&para, ESCI2_REPLY_SIZE), "PARA body")?;
-        let reply = machine.read_passthru_reply(false, "PARA body")?;
+        let reply = machine.read_passthru_reply("PARA body")?;
         let parsed = parse_esci2_reply(&reply)
             .ok_or_else(|| SessionError::Failed("unparseable PARA reply".to_string()))?;
         if parsed.cmd != "PARA" {
@@ -292,23 +332,33 @@ impl Session<'_> {
             &build_passthru_packet(&build_esci2_command("TRDT"), ESCI2_REPLY_SIZE),
             "TRDT",
         )?;
-        machine.read_passthru_reply(false, "TRDT")?;
+        machine.read_passthru_reply("TRDT")?;
 
         // The image is complete once #pen arrives; everything after it is
         // teardown, and a failure there must not discard the scan.
         let image = machine.img_loop()?;
+        // Everything after the last image chunk is cleanup: the reference
+        // treats UNLOCKING as a cleanup state, so a failure there must not
+        // discard the completed scan. (Deliberate divergence: the reference
+        // still rejects the scan when the FIN ack fails — the FIN ack is the
+        // printer's transfer-completed confirmation; we forgive it.)
         if machine.single_envelope("FIN").is_err() {
             trace::slow_event("push: session FIN after the image failed — keeping the scan");
         }
-        machine.send(&build_unlock_packet(), "UNLOCK")?;
-        match machine.expect_kind(wire::TYPE_UNLOCK_ACK, true, "UNLOCK") {
-            Ok(ack) => {
-                trace::event(&format!("push: session ← unlock ack ({} B)", ack.len()));
-            }
-            Err(error) => {
-                trace::slow_event(&format!(
-                    "push: session unlock ack not received ({error}) — keeping the scan"
-                ));
+        if machine.send(&build_unlock_packet(), "UNLOCK").is_err() {
+            trace::slow_event(
+                "push: session unlock send failed — keeping the scan (the printer self-heals)",
+            );
+        } else {
+            match machine.expect_kind(wire::TYPE_UNLOCK_ACK, "UNLOCK") {
+                Ok(ack) => {
+                    trace::event(&format!("push: session ← unlock ack ({} B)", ack.len()));
+                }
+                Err(error) => {
+                    trace::slow_event(&format!(
+                        "push: session unlock ack not received ({error}) — keeping the scan"
+                    ));
+                }
             }
         }
         Ok(image)
@@ -371,15 +421,10 @@ impl Machine<'_> {
         Ok(())
     }
 
-    /// Read one IS frame, skipping empty 0xa000 envelopes unless `allow_empty`
-    /// and dispatching async events (0x02 disconnect / 0x80 timeout / 0xa0
-    /// server error are fatal; 0x03 is the printer cancelling; anything else
-    /// is informational, like the reference).
-    fn read_frame(
-        &mut self,
-        allow_empty: bool,
-        label: &str,
-    ) -> Result<(u16, Vec<u8>), SessionError> {
+    /// Read one IS frame, dispatching async events (0x02 disconnect / 0x80
+    /// timeout / 0xa0 server error are fatal; 0x03 is the printer
+    /// cancelling; anything else is informational, like the reference).
+    fn read_frame(&mut self, label: &str) -> Result<(u16, Vec<u8>), SessionError> {
         let deadline = Instant::now() + STATE_BUDGET;
         loop {
             self.check_cancel(label)?;
@@ -390,10 +435,6 @@ impl Machine<'_> {
                     payload,
                 } => {
                     self.buffer.drain(..consumed);
-                    if payload.is_empty() && !allow_empty {
-                        // "Wait for body" pre-data signals on the ESC/I-2 wire.
-                        continue;
-                    }
                     if kind == wire::TYPE_ASYNC_EVENT {
                         let code = payload.first().copied().unwrap_or(0);
                         return match code {
@@ -434,27 +475,29 @@ impl Machine<'_> {
         }
     }
 
-    fn expect_kind(
-        &mut self,
-        kind: u16,
-        allow_empty: bool,
-        label: &str,
-    ) -> Result<Vec<u8>, SessionError> {
+    /// Wait for a frame of `kind`. Empty 0xa000 envelopes are the wire's
+    /// "wait for body" signals and stay filtered (they arrive as the PARA
+    /// header ack, among others); any other unexpected frame fails the
+    /// session fast, like the reference's dispatch.
+    fn expect_kind(&mut self, kind: u16, label: &str) -> Result<Vec<u8>, SessionError> {
         loop {
-            let (frame_kind, payload) = self.read_frame(allow_empty, label)?;
+            let (frame_kind, payload) = self.read_frame(label)?;
+            if frame_kind == wire::TYPE_PASSTHRU_REPLY && payload.is_empty() {
+                continue;
+            }
             if frame_kind == kind {
                 return Ok(payload);
             }
-            trace::event(&format!(
-                "push: session ← skipping 0x{frame_kind:04x} ({} B) during {label}",
+            return Err(SessionError::Failed(format!(
+                "unexpected 0x{frame_kind:04x} frame ({} B) during {label}, wanted 0x{kind:04x}",
                 payload.len()
-            ));
+            )));
         }
     }
 
     /// LOCK ACK: a payload whose first byte is 0x06.
     fn expect_ack(&mut self, kind: u16, label: &str) -> Result<(), SessionError> {
-        let payload = self.expect_kind(kind, false, label)?;
+        let payload = self.expect_kind(kind, label)?;
         if payload.first() != Some(&wire::ACK_BYTE) {
             return Err(SessionError::Failed(format!(
                 "{label}: expected ACK 0x06, got {payload:02x?}"
@@ -465,7 +508,7 @@ impl Machine<'_> {
 
     /// FS Y/Z/X: a 1-byte 0xa000 reply carrying the ACK.
     fn expect_fs_ack(&mut self, label: &str) -> Result<(), SessionError> {
-        let payload = self.read_passthru_reply(false, label)?;
+        let payload = self.read_passthru_reply(label)?;
         if payload.first() != Some(&wire::ACK_BYTE) {
             return Err(SessionError::Failed(format!(
                 "{label}: expected ACK 0x06, got {payload:02x?}"
@@ -474,12 +517,8 @@ impl Machine<'_> {
         Ok(())
     }
 
-    fn read_passthru_reply(
-        &mut self,
-        allow_empty: bool,
-        label: &str,
-    ) -> Result<Vec<u8>, SessionError> {
-        self.expect_kind(wire::TYPE_PASSTHRU_REPLY, allow_empty, label)
+    fn read_passthru_reply(&mut self, label: &str) -> Result<Vec<u8>, SessionError> {
+        self.expect_kind(wire::TYPE_PASSTHRU_REPLY, label)
     }
 
     /// Two-phase read: 64-byte META frame declaring the body length, then a
@@ -489,7 +528,7 @@ impl Machine<'_> {
             &build_passthru_packet(&build_esci2_command(name), ESCI2_REPLY_SIZE),
             name,
         )?;
-        let meta = self.read_passthru_reply(false, name)?;
+        let meta = self.read_passthru_reply(name)?;
         if meta.len() != ESCI2_REPLY_SIZE as usize {
             return Err(SessionError::Failed(format!(
                 "{name}: META frame is {} bytes, want {ESCI2_REPLY_SIZE}",
@@ -509,7 +548,7 @@ impl Machine<'_> {
                 &build_pureread_packet(reply.length),
                 &format!("{name}:pureread"),
             )?;
-            let data = self.read_passthru_reply(false, &format!("{name}:pureread"))?;
+            let data = self.read_passthru_reply(&format!("{name}:pureread"))?;
             if data.len() != reply.length as usize {
                 return Err(SessionError::Failed(format!(
                     "{name}: body is {} bytes, META declared {}",
@@ -530,7 +569,7 @@ impl Machine<'_> {
             &build_passthru_packet(&build_esci2_command(name), ESCI2_REPLY_SIZE),
             name,
         )?;
-        self.read_passthru_reply(false, name)?;
+        self.read_passthru_reply(name)?;
         Ok(())
     }
 
@@ -546,7 +585,7 @@ impl Machine<'_> {
                 &build_passthru_packet(&build_esci2_command("IMG"), ESCI2_REPLY_SIZE),
                 "IMG",
             )?;
-            let meta = self.read_passthru_reply(false, "IMG")?;
+            let meta = self.read_passthru_reply("IMG")?;
             if meta.len() != ESCI2_REPLY_SIZE as usize {
                 return Err(SessionError::Failed(format!(
                     "IMG: metadata frame is {} bytes, want {ESCI2_REPLY_SIZE}",
@@ -598,7 +637,7 @@ impl Machine<'_> {
                 ));
             }
             self.send(&build_pureread_packet(reply.length), "IMG:pureread")?;
-            let mut chunk = self.read_passthru_reply(false, "IMG:pureread")?;
+            let mut chunk = self.read_passthru_reply("IMG:pureread")?;
             // Some printers re-echo the IMG metadata header in response to
             // the pure-read; detect a same-length IMG META and read again.
             if chunk.len() == ESCI2_REPLY_SIZE as usize
@@ -606,7 +645,7 @@ impl Machine<'_> {
                 && echo.cmd == "IMG"
                 && echo.length == reply.length
             {
-                chunk = self.read_passthru_reply(false, "IMG:pureread")?;
+                chunk = self.read_passthru_reply("IMG:pureread")?;
             }
             if chunk.len() != reply.length as usize {
                 return Err(SessionError::Failed(format!(

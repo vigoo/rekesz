@@ -410,11 +410,26 @@ pub fn handle_connection(
         let result = match (scan, scan_dir) {
             (Some(scan), Some(scan_dir)) => {
                 let cancel = std::sync::atomic::AtomicBool::new(false);
-                match super::session::run_flatbed(peer, scan, &cancel) {
-                    Ok(jpeg) => write_scan_file(&scan_dir, &jpeg)
-                        .map_err(|error| format!("cannot write the scan file: {error}")),
-                    Err(error) => Err(error.to_string()),
-                }
+                // A panic mid-session must not skip the slot cleanup below:
+                // catch it and report it as a failed scan instead.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    super::session::run_flatbed(peer, scan, &cancel)
+                }));
+                let scanned = match outcome {
+                    Ok(result) => result.map_err(|error| error.to_string()),
+                    Err(panic) => Err(format!(
+                        "the scan session panicked: {}",
+                        panic
+                            .downcast_ref::<&str>()
+                            .map(|message| (*message).to_string())
+                            .or_else(|| panic.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "unknown panic".to_string())
+                    )),
+                };
+                scanned.and_then(|jpeg| {
+                    write_scan_file(&scan_dir, &jpeg)
+                        .map_err(|error| format!("cannot write the scan file: {error}"))
+                })
             }
             _ => Err("no scan settings or scan folder published".to_string()),
         };

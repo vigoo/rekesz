@@ -1101,3 +1101,97 @@ fn synthetic_session_reports_image_errors() {
         "{error}"
     );
 }
+
+// ---- Stage 3: teardown guard + fail-fast dispatch ----
+
+/// The happy-path synthetic stream, truncated right after the pre-PARA
+/// status: the session fails mid-way with the printer still locked.
+fn truncated_session_stream() -> Vec<u8> {
+    let full = synthetic_session_stream(None, "pen");
+    // Cut before the PARA frames: everything through the pre-PARA STAT body
+    // is present, so the session fails after LOCK with the printer locked.
+    let mut stream = Vec::new();
+    let mut offset = 0;
+    while offset + 12 <= full.len() {
+        if &full[offset..offset + 2] != b"IS" {
+            break;
+        }
+        let kind = u16::from_be_bytes([full[offset + 2], full[offset + 3]]);
+        let size = u32::from_be_bytes([
+            full[offset + 6],
+            full[offset + 7],
+            full[offset + 8],
+            full[offset + 9],
+        ]) as usize;
+        // Cut after the first small two-phase body (the INIT2 INFO reply):
+        // the session gets through INIT1 (LOCK sent) and fails mid-INIT2.
+        if kind == wire::TYPE_PASSTHRU_REPLY && size == 2 {
+            let end = offset + 12 + size;
+            let next_size =
+                u32::from_be_bytes([full[end + 6], full[end + 7], full[end + 8], full[end + 9]])
+                    as usize;
+            let stop = (end + 12 + next_size).min(full.len());
+            // Keep the session from its start, through the next frame.
+            stream.extend_from_slice(&full[..stop]);
+            return stream;
+        }
+        offset += 12 + size;
+    }
+    full
+}
+
+#[test]
+fn session_sends_unlock_on_teardown_after_lock() {
+    let mut link = ReplayLink {
+        incoming: Box::leak(truncated_session_stream().into_boxed_slice()),
+        position: 0,
+        sent: Vec::new(),
+    };
+    // The stream ends mid-session: the failure must not leave the printer
+    // locked — the guard's teardown UNLOCK is the last thing written.
+    let result =
+        session::drive_for_test(&mut link, dialect::FlatbedDialect::l3160(), push_settings());
+    assert!(result.is_err(), "the truncated stream must fail");
+    assert!(
+        link.sent.ends_with(&wire::build_unlock_packet()),
+        "teardown after LOCK must send UNLOCK"
+    );
+}
+
+#[test]
+fn session_does_not_unlock_before_lock() {
+    // A legacy-ESC/I welcome fails the session before LOCK is sent: the
+    // guard must stay silent (no unlock goes out for a lock never held).
+    let mut link = ReplayLink {
+        incoming: Box::leak(
+            wire::build_is_packet(wire::TYPE_WELCOME, &[0x01, 0x02, 0x00, 0x00, 0x00])
+                .into_boxed_slice(),
+        ),
+        position: 0,
+        sent: Vec::new(),
+    };
+    let error =
+        session::drive_for_test(&mut link, dialect::FlatbedDialect::l3160(), push_settings())
+            .expect_err("a legacy welcome must stop the session");
+    assert!(error.to_string().contains("legacy ESC/I"), "{error}");
+    assert!(
+        !link.sent.ends_with(&wire::build_unlock_packet()),
+        "no UNLOCK for a lock never held"
+    );
+}
+
+#[test]
+fn session_fails_fast_on_unexpected_frames() {
+    // A job-reply frame (0xa300) injected right after the lock ack: the
+    // state machine must stop, not skip, per the reference's dispatch.
+    let injected = wire::build_is_packet(wire::TYPE_JOB_REPLY, &[0xde, 0xad]);
+    let mut link = ReplayLink {
+        incoming: Box::leak(synthetic_session_stream(Some(injected), "pen").into_boxed_slice()),
+        position: 0,
+        sent: Vec::new(),
+    };
+    let error =
+        session::drive_for_test(&mut link, dialect::FlatbedDialect::l3160(), push_settings())
+            .expect_err("an unexpected frame must stop the session");
+    assert!(error.to_string().contains("unexpected 0xa300"), "{error}");
+}
