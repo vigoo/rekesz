@@ -72,12 +72,34 @@ pub(crate) type MockHandler = Box<dyn FnMut(&str, &str, &str, &[u8]) -> MockRepl
 /// Recorded requests of a mock server run: (method, path, Host header).
 pub(crate) type RecordedRequests = Arc<Mutex<Vec<(String, String, String)>>>;
 
+/// Bind the mock listener, retrying: CI runners occasionally refuse a fresh
+/// loopback bind under the parallel test load (observed as a transient
+/// `EPERM`), while the same process binds fine again moments later — the
+/// two known hits were 11 s apart, so the retry window spans that.
+fn bind_listener() -> TcpListener {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut last = None;
+    while std::time::Instant::now() < deadline {
+        match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => return listener,
+            Err(error) => {
+                last = Some(error);
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
+    }
+    panic!(
+        "cannot bind the mock listener to 127.0.0.1:0 within 20 s: {}",
+        last.expect("at least one bind attempt")
+    );
+}
+
 /// Spawn a single-threaded HTTP/1.1 responder on 127.0.0.1:0. One request
 /// per connection, `Connection: close` framing, correct Content-Length or
 /// chunked encoding — reqwest rejects sloppy replies, so the framing here
 /// is exact. Returns the eSCL base URL and the recorded requests.
 pub(crate) fn spawn_mock(handler: MockHandler) -> (String, RecordedRequests) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = bind_listener();
     let address = listener.local_addr().unwrap();
     let recorded: RecordedRequests = Arc::new(Mutex::new(Vec::new()));
     let recorded_clone = Arc::clone(&recorded);

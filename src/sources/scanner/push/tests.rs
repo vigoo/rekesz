@@ -21,6 +21,17 @@ use super::wire::{self, ParsedPacket, parse_is_packet};
 // The binary's test harness is test-r; plain `#[test]` would never register.
 use test_r::test;
 
+// CI runners are slower and more contended than dev machines; REKESZ_TEST_TIMING_SCALE
+// stretches the timing guards without weakening them locally.
+fn scaled_budget(budget: Duration) -> Duration {
+    let scale = std::env::var("REKESZ_TEST_TIMING_SCALE")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(1.0)
+        .max(1.0);
+    budget.mul_f64(scale)
+}
+
 #[test]
 fn lock_packet_matches_reference_bytes() {
     // "IS" + 0x2100 + offset 0x000c + payload 7 + padding + 01 a0 04 + u32BE(300).
@@ -516,6 +527,20 @@ fn loopback_input(now: Instant) -> EngineInput {
 
 #[test]
 fn scripted_connection_answers_ok_and_attempts_the_session() {
+    // Premise check: the test needs nothing to listen on the session port,
+    // or the session's connect would succeed and stall the state machine
+    // (60 s read budget per state) instead of refusing fast. A runner
+    // service squatting on 1865 fails here with the evidence instead of an
+    // opaque "None" after the wait. A probe refused for other reasons (the
+    // transient CI bind flake) says nothing about the port being occupied,
+    // so it only notes and continues.
+    match TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 1865))) {
+        Ok(listener) => drop(listener),
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            panic!("the ESC/I-2 session port 1865 is already in use on this machine: {error}");
+        }
+        Err(_) => {}
+    }
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
     let address = listener.local_addr().expect("address");
     let input = Arc::new(Mutex::new(loopback_input(Instant::now())));
@@ -539,11 +564,14 @@ fn scripted_connection_answers_ok_and_attempts_the_session() {
     assert!(response.contains("<StatusOut>OK</StatusOut>"));
     // The accepted push reserves the session slot and then attempts the
     // session; with no printer listening on the loopback ESC/I-2 port the
-    // connect fails fast and reports through the result slot.
-    // The session attempt happens after the response is flushed; wait for
-    // it (loopback connect-refused fails within milliseconds).
+    // connect fails and reports through the result slot. The session
+    // attempt happens after the response is flushed; wait for it past the
+    // session's own 10 s connect budget — on a contended runner even the
+    // loopback refusal can take that long, so the wait scales like the
+    // other timing budgets.
     let mut done = None;
-    for _ in 0..40 {
+    let deadline = Instant::now() + scaled_budget(Duration::from_secs(15));
+    while Instant::now() < deadline {
         done = output.lock().expect("output").scan_done.take();
         if done.is_some() {
             break;
