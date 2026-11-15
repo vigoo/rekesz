@@ -32,6 +32,27 @@ fn scaled_budget(budget: Duration) -> Duration {
     budget.mul_f64(scale)
 }
 
+/// A connected loopback socket pair for driving the connection-code tests:
+/// one bind per process (the CI runners intermittently deny fresh loopback
+/// binds with `EPERM`), and a mutex so a concurrent test can never steal
+/// the pair's connect/accept handshake.
+fn loopback_pair() -> (TcpStream, TcpStream) {
+    use std::sync::OnceLock;
+    static LISTENER: OnceLock<(TcpListener, Mutex<()>)> = OnceLock::new();
+    let (listener, serial) = LISTENER.get_or_init(|| {
+        (
+            crate::sources::scanner::mock::bind_listener(),
+            Mutex::new(()),
+        )
+    });
+    let _handshake = serial
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let client = TcpStream::connect(listener.local_addr().expect("address")).expect("client");
+    let (server, _) = listener.accept().expect("accept");
+    (client, server)
+}
+
 #[test]
 fn lock_packet_matches_reference_bytes() {
     // "IS" + 0x2100 + offset 0x000c + payload 7 + padding + 01 a0 04 + u32BE(300).
@@ -455,10 +476,7 @@ fn trigger_kind_classification_prefers_joblist() {
 fn trigger_request_of(body: &str) -> trigger::TriggerRequest {
     // Build the raw request text, then run it through the parser via a
     // loopback socket pair.
-    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
-    let address = listener.local_addr().expect("address");
-    let client = TcpStream::connect(address).expect("client");
-    let (server, _) = listener.accept().expect("accept");
+    let (client, mut server) = loopback_pair();
     let raw = format!(
         "POST / HTTP/1.0\r\nContent-Type : text/xml\r\nContent-Length : {}\r\nx-uid : 777\r\nx-protocol-version : 3.01\r\n\r\n{body}",
         body.len()
@@ -469,7 +487,6 @@ fn trigger_request_of(body: &str) -> trigger::TriggerRequest {
         std::io::Write::flush(&mut client).ok();
         let _ = client.shutdown(std::net::Shutdown::Write);
     });
-    let mut server = server;
     trigger::read_request(&mut server).expect("parses")
 }
 
@@ -541,17 +558,15 @@ fn scripted_connection_answers_ok_and_attempts_the_session() {
         }
         Err(_) => {}
     }
-    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
-    let address = listener.local_addr().expect("address");
+    let (client, server) = loopback_pair();
     let input = Arc::new(Mutex::new(loopback_input(Instant::now())));
     let output = Arc::new(Mutex::new(EngineOutput::default()));
     let server_input = Arc::clone(&input);
     let server_output = Arc::clone(&output);
     std::thread::spawn(move || {
-        let (server, _) = listener.accept().expect("accept");
         trigger::handle_connection(server, &server_input, &server_output);
     });
-    let mut client = TcpStream::connect(address).expect("client");
+    let mut client = client;
     std::io::Write::write_all(&mut client, push_scan_request("42", "01").as_bytes())
         .expect("request written");
     let _ = client.shutdown(std::net::Shutdown::Write);
@@ -586,8 +601,7 @@ fn scripted_connection_answers_ok_and_attempts_the_session() {
 
 #[test]
 fn scripted_connection_refuses_busy_with_error_status() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
-    let address = listener.local_addr().expect("address");
+    let (client, server) = loopback_pair();
     let mut state = loopback_input(Instant::now());
     state.busy = true;
     let input = Arc::new(Mutex::new(state));
@@ -595,10 +609,9 @@ fn scripted_connection_refuses_busy_with_error_status() {
     let server_input = Arc::clone(&input);
     let server_output = Arc::clone(&output);
     std::thread::spawn(move || {
-        let (server, _) = listener.accept().expect("accept");
         trigger::handle_connection(server, &server_input, &server_output);
     });
-    let mut client = TcpStream::connect(address).expect("client");
+    let mut client = client;
     std::io::Write::write_all(&mut client, push_scan_request("7", "01").as_bytes())
         .expect("request written");
     let _ = client.shutdown(std::net::Shutdown::Write);
@@ -610,17 +623,15 @@ fn scripted_connection_refuses_busy_with_error_status() {
 
 #[test]
 fn scripted_connection_answers_scan_end_without_a_trigger() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
-    let address = listener.local_addr().expect("address");
+    let (client, server) = loopback_pair();
     let input = Arc::new(Mutex::new(loopback_input(Instant::now())));
     let output = Arc::new(Mutex::new(EngineOutput::default()));
     let server_input = Arc::clone(&input);
     let server_output = Arc::clone(&output);
     std::thread::spawn(move || {
-        let (server, _) = listener.accept().expect("accept");
         trigger::handle_connection(server, &server_input, &server_output);
     });
-    let mut client = TcpStream::connect(address).expect("client");
+    let mut client = client;
     let body =
         "<p:ScanEnd xmlns:p=\"http://schema.epson.net/EpsonNet/Scan/2004/pushscan\"></p:ScanEnd>";
     let request = format!(
@@ -666,10 +677,7 @@ fn extract_element_ignores_closing_tags() {
     // Two capabilities: the closing tag of the first must not match as an
     // opening tag of the second (the reference regex cannot match closings).
     let body = "<p:CapabilityIn>A</p:CapabilityIn><p:CapabilityIn>B</p:CapabilityIn>";
-    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
-    let address = listener.local_addr().expect("address");
-    let client = TcpStream::connect(address).expect("client");
-    let (server, _) = listener.accept().expect("accept");
+    let (client, mut server) = loopback_pair();
     let raw = format!(
         "POST / HTTP/1.0\r\nContent-Length : {}\r\n\r\n{body}",
         body.len()
@@ -680,7 +688,6 @@ fn extract_element_ignores_closing_tags() {
         std::io::Write::flush(&mut client).ok();
         let _ = client.shutdown(std::net::Shutdown::Write);
     });
-    let mut server = server;
     let request = trigger::read_request(&mut server).expect("parses");
     assert_eq!(request.capabilities, vec!["A".to_string(), "B".to_string()]);
 }
@@ -688,10 +695,7 @@ fn extract_element_ignores_closing_tags() {
 #[test]
 fn read_request_survives_hostile_content_length() {
     // A garbage Content-Length must drop the connection, not panic.
-    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
-    let address = listener.local_addr().expect("address");
-    let client = TcpStream::connect(address).expect("client");
-    let (server, _) = listener.accept().expect("accept");
+    let (client, mut server) = loopback_pair();
     let raw = "POST / HTTP/1.0\r\nContent-Length : 18446744073709551611\r\n\r\n";
     std::thread::spawn(move || {
         let mut client = client;
@@ -699,7 +703,6 @@ fn read_request_survives_hostile_content_length() {
         std::io::Write::flush(&mut client).ok();
         let _ = client.shutdown(std::net::Shutdown::Write);
     });
-    let mut server = server;
     // The clamp makes the parser read to EOF (client already closed) → None.
     assert!(trigger::read_request(&mut server).is_none());
 }

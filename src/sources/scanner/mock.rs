@@ -72,24 +72,41 @@ pub(crate) type MockHandler = Box<dyn FnMut(&str, &str, &str, &[u8]) -> MockRepl
 /// Recorded requests of a mock server run: (method, path, Host header).
 pub(crate) type RecordedRequests = Arc<Mutex<Vec<(String, String, String)>>>;
 
-/// Bind the mock listener, retrying: CI runners occasionally refuse a fresh
-/// loopback bind under the parallel test load (observed as a transient
-/// `EPERM`), while the same process binds fine again moments later — the
-/// two known hits were 11 s apart, so the retry window spans that.
-fn bind_listener() -> TcpListener {
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+/// Bind the mock listener, retrying: CI runners intermittently deny fresh
+/// loopback binds with `EPERM` — and the denial sticks to the caller (one
+/// test was denied 80/80 attempts across 20 s while other tests bound fine
+/// in the same seconds), so each retry runs on a freshly spawned thread in
+/// case the state is per-task, with growing pauses in case it is a
+/// time-window. The panic carries process diagnostics for the next hit.
+pub(crate) fn bind_listener() -> TcpListener {
+    const PAUSES_MS: [u64; 12] = [
+        0, 250, 500, 1_000, 2_000, 4_000, 8_000, 16_000, 16_000, 16_000, 16_000, 16_000,
+    ];
     let mut last = None;
-    while std::time::Instant::now() < deadline {
-        match TcpListener::bind("127.0.0.1:0") {
+    for pause_ms in PAUSES_MS {
+        std::thread::sleep(Duration::from_millis(pause_ms));
+        let outcome = if pause_ms == 0 {
+            TcpListener::bind("127.0.0.1:0")
+        } else {
+            // Fresh thread: a denied caller stays denied, so retry off-task.
+            std::thread::spawn(|| TcpListener::bind("127.0.0.1:0"))
+                .join()
+                .unwrap_or_else(|_| Err(std::io::Error::other("bind thread panicked")))
+        };
+        match outcome {
             Ok(listener) => return listener,
-            Err(error) => {
-                last = Some(error);
-                std::thread::sleep(Duration::from_millis(250));
-            }
+            Err(error) => last = Some(error),
         }
     }
+    let descriptors = std::fs::read_dir("/proc/self/fd")
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    let threads = std::fs::read_dir("/proc/self/task")
+        .map(|entries| entries.count())
+        .unwrap_or(0);
     panic!(
-        "cannot bind the mock listener to 127.0.0.1:0 within 20 s: {}",
+        "cannot bind the mock listener to 127.0.0.1:0: {} \
+         (process holds {descriptors} fds and {threads} threads)",
         last.expect("at least one bind attempt")
     );
 }
