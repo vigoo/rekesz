@@ -373,11 +373,17 @@ fn backup_catalog(destination: &Path, rekesz: &mut Connection) -> Result<PathBuf
             temporary_path.display()
         )
     })?;
-    let backup =
-        Connection::open_with_flags(&temporary_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let integrity: String = backup.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    // The integrity-check connection must be closed before the rename below:
+    // Windows opens SQLite files without FILE_SHARE_DELETE, so renaming a
+    // file with a live handle fails with a sharing violation (os error 32).
+    let integrity: String = {
+        let backup = Connection::open_with_flags(
+            &temporary_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        backup.query_row("PRAGMA integrity_check", [], |row| row.get(0))?
+    };
     if integrity != "ok" {
-        drop(backup);
         let _ = std::fs::remove_file(&temporary_path);
         bail!("pre-repair backup failed integrity_check: {integrity}");
     }
