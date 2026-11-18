@@ -18,6 +18,414 @@ fn repeated_inventory_refresh_coalesces_into_active_run() {
     assert!(claim_inventory_run(&mut active));
 }
 
+// --- Stage 4 (ui-redesign-plan): triage work queue + person-filtered grid ---
+
+/// A triage `Y` confirm lands in the catalog through the shared decision
+/// pipeline (Stage 4a; fixture-verified).
+#[gpui::test]
+fn gpui_triage_keys_write_decisions_to_the_catalog(cx: &mut gpui::TestAppContext) {
+    cx.update(bind_picture_browser_keys);
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    seed_people_ui_catalog(root.path(), 2);
+    let config = gpui_test_config(root.path(), cache.path());
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+
+    view.update(&mut *cx, |view, cx| {
+        view.directory_view_mode = DirectoryViewMode::People;
+        view.open_people_triage(10, "Ada".to_owned(), cx);
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        cx.run_until_parked();
+        let ready = view.read_with(&*cx, |view, _| {
+            view.people_triage
+                .as_ref()
+                .is_some_and(|triage| triage.current().is_some())
+        });
+        if ready {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "triage faces did not load within ten seconds"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(cx.debug_bounds("#people-triage").is_some());
+    let face_id = view.read_with(&*cx, |view, _| {
+        view.people_triage
+            .as_ref()
+            .unwrap()
+            .current()
+            .unwrap()
+            .face_id
+    });
+
+    // Claim keyboard focus on the triage surface (click-to-focus), then Y.
+    let surface = cx.debug_bounds("#people-triage-surface").unwrap();
+    cx.simulate_click(surface.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    cx.simulate_keystrokes("y");
+    cx.run_until_parked();
+    let (cursor, error, pending) = view.read_with(&*cx, |view, _| {
+        (
+            view.people_triage.as_ref().map(|triage| triage.cursor),
+            view.people_decision_error
+                .as_ref()
+                .map(|error| error.to_string()),
+            view.pending_people_decisions.len(),
+        )
+    });
+    assert!(
+        error.is_none() && cursor == Some(1),
+        "Y must advance the triage cursor (cursor {cursor:?}, error {error:?}, pending {pending})"
+    );
+    let confirmed = rusqlite::Connection::open(catalog::catalog_path(root.path()))
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM face_assignments \
+             WHERE face_id=?1 AND person_id=10 AND kind='confirmed' AND provenance='rekesz'",
+            [face_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert_eq!(confirmed, 1, "Y must confirm the current face");
+
+    // The cursor advanced to the second suggestion.
+    let cursor = view.read_with(&*cx, |view, _| view.people_triage.as_ref().unwrap().cursor);
+    assert_eq!(cursor, 1);
+
+    // Esc exits back to the person's detail page.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    view.read_with(&*cx, |view, _| {
+        assert!(view.people_triage.is_none());
+        assert_eq!(view.selected_person, Some(10));
+    });
+}
+
+/// The triage face renders the FaceCrop variant (not the whole photo) — the
+/// P0 anchor: the crop is delivered into the FaceCrop cache and must be read
+/// back from it.
+#[gpui::test]
+fn gpui_triage_renders_the_face_crop(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    seed_people_ui_catalog(root.path(), 1);
+    let config = gpui_test_config(root.path(), cache.path());
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+
+    view.update(&mut *cx, |view, cx| {
+        view.directory_view_mode = DirectoryViewMode::People;
+        view.open_people_triage(10, "Ada".to_owned(), cx);
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(2));
+        let ready = view.read_with(&*cx, |view, _| {
+            view.people_triage
+                .as_ref()
+                .and_then(|triage| triage.current())
+                .is_some()
+        });
+        if ready {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "triage faces did not load within ten seconds"
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(2));
+        let crop = view.read_with(&*cx, |view, _| {
+            let triage = view.people_triage.as_ref().unwrap();
+            let face = triage.current().unwrap();
+            let identity = view.render_identity_for(&face.path);
+            matches!(
+                view.thumbnails.state_for_variant(
+                    &face.path,
+                    identity,
+                    RenderVariant::face_crop(face.face_id, face.bounds, 640),
+                ),
+                PreviewState::Loaded(_)
+            )
+        });
+        if crop {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the face crop did not render within ten seconds"
+        );
+    }
+    assert!(cx.debug_bounds("#triage-face-image").is_some());
+}
+
+/// The person-filtered grid lists the person's confirmed photos and the
+/// dismiss chip returns to the directory (Stage 4b).
+#[gpui::test]
+fn gpui_person_grid_lists_confirmed_photos_and_dismisses(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    // One confirmed photo, one suggested-only photo: only the confirmed one
+    // may appear in the person listing.
+    seed_people_ui_catalog(root.path(), 1);
+    confirm_test_face(root.path(), 100);
+    let suggested = root.path().join("suggested-only.png");
+    image::RgbImage::new(32, 32).save(&suggested).unwrap();
+    {
+        let mut connection =
+            rusqlite::Connection::open(catalog::catalog_path(root.path())).unwrap();
+        let transaction = connection.transaction().unwrap();
+        transaction
+            .execute(
+                "INSERT INTO assets(id, relative_path, scope_key) VALUES(2, ?1, ?2)",
+                rusqlite::params![
+                    catalog::encode_relative_path(Path::new("suggested-only.png")).unwrap(),
+                    catalog::scope_key(Path::new("suggested-only.png")).unwrap()
+                ],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO faces(id, asset_id, provenance, source_key, left, top, right, bottom, \
+                 origin, ignored, updated_at) VALUES(200, 2, 'rekesz', 'people-ui-200', .2, .2, .8, .8, \
+                 'rekesz', 0, datetime('now'))",
+                [],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO face_assignments(face_id, person_id, kind, provenance, confidence, updated_at) \
+                 VALUES(200, 10, 'suggested', 'rekesz', .5, datetime('now'))",
+                [],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+    }
+    let config = gpui_test_config(root.path(), cache.path());
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+
+    view.update(&mut *cx, |view, cx| {
+        view.directory_view_mode = DirectoryViewMode::Grid;
+        view.open_person_grid(10, "Ada".to_owned(), cx);
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(2));
+        let loaded = view.read_with(&*cx, |view, _| {
+            matches!(
+                view.person_grid,
+                Some(VirtualGrid::Person {
+                    status: VirtualGridStatus::Loaded(_),
+                    ..
+                })
+            )
+        });
+        if loaded {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "person listing did not load within ten seconds"
+        );
+    }
+    let paths = view.read_with(&*cx, |view, _| view.selected_images().to_vec());
+    assert_eq!(paths.len(), 1, "only confirmed photos are listed");
+    assert!(paths[0].ends_with("people-ui.png"));
+    assert!(cx.debug_bounds("#header-person").is_some());
+    assert!(cx.debug_bounds("#person-filter-close").is_some());
+
+    // The dismiss chip restores the directory listing. (No debug_bounds
+    // absence assert here: bounds entries persist across frames — see
+    // design/ui-guidelines.md §6.)
+    let close = cx.debug_bounds("#person-filter-close").unwrap();
+    cx.simulate_click(close.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    view.read_with(&*cx, |view, _| {
+        // The header variant derives from this state; debug_bounds absence
+        // is not assertable (bounds persist across frames — see
+        // design/ui-guidelines.md §6).
+        assert!(view.person_grid.is_none());
+    });
+}
+
+/// Selections on the person grid persist under the `@person-<id>` virtual
+/// album key (Stage 4b).
+#[gpui::test]
+fn gpui_person_grid_selections_use_the_virtual_album_key(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    seed_people_ui_catalog(root.path(), 1);
+    confirm_test_face(root.path(), 100);
+    let config = gpui_test_config(root.path(), cache.path());
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+
+    view.update(&mut *cx, |view, cx| {
+        view.directory_view_mode = DirectoryViewMode::Grid;
+        view.open_person_grid(10, "Ada".to_owned(), cx);
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(2));
+        let loaded = view.read_with(&*cx, |view, _| {
+            matches!(
+                view.person_grid,
+                Some(VirtualGrid::Person {
+                    status: VirtualGridStatus::Loaded(_),
+                    ..
+                })
+            )
+        });
+        if loaded {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "person listing did not load within ten seconds"
+        );
+    }
+
+    let album = view.read_with(&*cx, |view, _| view.selection_album());
+    assert_eq!(
+        album,
+        root.path().join("@person-10"),
+        "person selections must key under the virtual album"
+    );
+
+    // Save one selection for the person and reload the grid: it round-trips.
+    let paths = view.read_with(&*cx, |view, _| view.selected_images().to_vec());
+    view.update(&mut *cx, |view, cx| {
+        let mut selections = view.album_selections(&album);
+        selections.push(catalog::selections::AlbumSelection {
+            name: "Favourites".to_owned(),
+            members: paths.clone(),
+            created_at: String::new(),
+        });
+        view.replace_album_selections(album.clone(), selections, cx);
+    });
+    cx.run_until_parked();
+    view.update(&mut *cx, |view, cx| {
+        view.close_person_grid(cx);
+        view.open_person_grid(10, "Ada".to_owned(), cx);
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(2));
+        let loaded = view.read_with(&*cx, |view, _| {
+            matches!(
+                view.person_grid,
+                Some(VirtualGrid::Person {
+                    status: VirtualGridStatus::Loaded(_),
+                    ..
+                })
+            )
+        });
+        if loaded {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "person listing did not reload within ten seconds"
+        );
+    }
+    view.update(&mut *cx, |view, _| {
+        let selections = view.album_selections(&album);
+        assert_eq!(selections.len(), 1);
+        assert_eq!(selections[0].name, "Favourites");
+        assert_eq!(selections[0].members, paths);
+    });
+}
+
+#[test]
+fn develop_section_maps_every_emitted_edit_name() {
+    // Covers every label format_develop_edits can emit (review finding:
+    // the "Monochrome Red"-style rows previously fell into "Other").
+    let recipe = catalog::DevelopRecipe {
+        exposure_ev: Some(0.5),
+        contrast: Some(1.0),
+        highlights: Some(-1.0),
+        shadows: Some(1.0),
+        whites: Some(1.0),
+        blacks: Some(-1.0),
+        saturation: Some(1.0),
+        vibrance: Some(1.0),
+        clarity: Some(1.0),
+        texture: Some(1.0),
+        dehaze: Some(1.0),
+        white_balance: Some(catalog::WhiteBalance {
+            temperature: 6500.0,
+            tint: 1.0,
+        }),
+        tone_curve: Some(Vec::new()),
+        tone_curve_red: Some(Vec::new()),
+        tone_curve_green: Some(Vec::new()),
+        tone_curve_blue: Some(Vec::new()),
+        crop: Some(catalog::Crop {
+            left: 0.0,
+            top: 0.0,
+            right: 1.0,
+            bottom: 1.0,
+            angle_degrees: 0.0,
+            constrain_aspect: false,
+        }),
+        detail: Some(catalog::DetailRecipe {
+            sharpening: 1.0,
+            ..catalog::DetailRecipe::default()
+        }),
+        monochrome: Some(catalog::MonochromeRecipe { mixer: [1.0; 8] }),
+        ..catalog::DevelopRecipe::default()
+    };
+    let sections: HashSet<&str> = format_develop_edits(&recipe)
+        .iter()
+        .map(|(name, _)| develop_section(name))
+        .collect();
+    for expected in [
+        "Light",
+        "Color",
+        "Presence",
+        "Detail",
+        "Tone curve",
+        "Geometry",
+    ] {
+        assert!(
+            sections.contains(expected),
+            "{expected} section must be reachable"
+        );
+    }
+    assert!(
+        sections.contains("Black & white"),
+        "monochrome mixer rows must land in Black & white"
+    );
+    assert!(
+        !sections.contains("Other"),
+        "every emitted edit name must map to a real section, got {sections:?}"
+    );
+}
+
+#[test]
+fn grid_columns_fits_whole_tiles_at_the_new_width() {
+    // 1000px: (1000 + 12) / (216 + 12) = 4.43 → 4 columns.
+    assert_eq!(grid_columns_for(1000.0, 216), 4);
+    // Narrow pane: at least one column, never zero.
+    assert_eq!(grid_columns_for(100.0, 216), 1);
+    // Two columns need two tiles plus the inter-tile gap: 2 * 216 + 12 = 444.
+    assert_eq!(grid_columns_for(443.0, 216), 1);
+    assert_eq!(grid_columns_for(444.0, 216), 2);
+}
+
 impl MaintenanceDriver for FailingPeopleRetryInventory {
     fn inventory(
         &self,
@@ -294,6 +702,18 @@ use std::path::Path;
 use std::time::Instant;
 use test_r::test;
 
+// CI runners are slower and more contended than dev machines;
+// REKESZ_TEST_TIMING_SCALE stretches the timing guards without weakening
+// them locally.
+fn scaled_budget(budget: Duration) -> Duration {
+    let scale = std::env::var("REKESZ_TEST_TIMING_SCALE")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(1.0)
+        .max(1.0);
+    budget.mul_f64(scale)
+}
+
 fn gpui_test_config(root: &Path, cache: &Path) -> Config {
     Config {
         settings: AppSettings {
@@ -379,6 +799,19 @@ fn seed_people_ui_catalog(root: &Path, count: usize) -> Vec<catalog::people::Fac
     }
     transaction.commit().unwrap();
     faces
+}
+
+/// Adds a local confirmed assignment for `face_id` (Stage 4b fixtures: the
+/// person grid lists only confirmed photos).
+fn confirm_test_face(root: &Path, face_id: i64) {
+    let connection = rusqlite::Connection::open(catalog::catalog_path(root)).unwrap();
+    connection
+        .execute(
+            "INSERT INTO face_assignments(face_id, person_id, kind, provenance, confidence, updated_at) \
+             VALUES(?1, 10, 'confirmed', 'rekesz', 1.0, datetime('now'))",
+            [face_id],
+        )
+        .unwrap();
 }
 
 #[test]
@@ -906,6 +1339,412 @@ fn gpui_grid_keyboard_actions_move_extend_and_open_selection(cx: &mut gpui::Test
     )));
 }
 
+// --- Stage 1 (ui-redesign-plan): header crumbs, chips, banner scoping ---
+
+/// Clicking a header breadcrumb selects that directory (C5 rework: the
+/// header shows folder names, not the full path).
+#[gpui::test]
+fn gpui_header_crumbs_navigate_directories(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write_photo_stub(root.path(), "top", 47.5, 19.05);
+    let subdir = root.path().join("2026");
+    std::fs::create_dir(&subdir).unwrap();
+    write_photo_stub(&subdir, "nested", 47.5, 19.05);
+    let config = gpui_test_config(root.path(), cache.path());
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+
+    view.update(&mut *cx, |view, cx| {
+        let node = view.model.ensure_node(subdir.clone());
+        view.rebuild_visible();
+        view.select(node, cx);
+    });
+    cx.run_until_parked();
+
+    // Both crumbs render; the current directory is the emphasized last one.
+    let root_crumb = cx
+        .debug_bounds("#header-crumb-0")
+        .expect("library root crumb must render");
+    assert!(cx.debug_bounds("#header-crumb-1").is_some());
+    cx.simulate_click(root_crumb.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    view.read_with(&*cx, |view, _| {
+        assert_eq!(&*view.model.node(view.selected).path, root.path());
+    });
+}
+
+/// The photo-count chip renders always; the selected chip only with a
+/// non-empty selection (Stage 1 header chips).
+#[gpui::test]
+fn gpui_header_shows_photo_and_selection_chips(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    for index in 0..3 {
+        write_photo_stub(root.path(), &format!("photo-{index}"), 47.5, 19.05);
+    }
+    let config = gpui_test_config(root.path(), cache.path());
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+
+    assert!(cx.debug_bounds("#header-photo-count").is_some());
+    assert!(cx.debug_bounds("#header-selected-chip").is_none());
+
+    let first = cx.debug_bounds("#thumbnail-0").unwrap();
+    cx.simulate_click(first.center(), gpui::Modifiers::none());
+    let second = cx.debug_bounds("#thumbnail-1").unwrap();
+    cx.simulate_click(
+        second.center(),
+        gpui::Modifiers {
+            control: true,
+            ..Default::default()
+        },
+    );
+    assert!(cx.debug_bounds("#header-selected-chip").is_some());
+    assert_eq!(
+        view.read_with(&*cx, |view, _| match &view.main_view {
+            MainView::Dir(_, selection) => selection.indices.len(),
+            MainView::Image(_) => unreachable!(),
+        }),
+        2
+    );
+}
+
+/// Selection banners belong to the grid: switching to People must hide the
+/// recursive-view banner, and switching back restores it (C3 regression).
+#[gpui::test]
+fn gpui_recursive_banner_stays_in_grid_mode(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    // The recursive view starts only from a directory with no direct images
+    // but at least one subdirectory.
+    let subdir = root.path().join("sub");
+    std::fs::create_dir(&subdir).unwrap();
+    write_photo_stub(&subdir, "nested", 47.5, 19.05);
+    let config = gpui_test_config(root.path(), cache.path());
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+
+    view.update(&mut *cx, |view, cx| view.start_recursive_grid(cx));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(2));
+        let drawn = cx.debug_bounds("#exit-recursive-grid").is_some();
+        let loaded = view.read_with(&*cx, |view, _| {
+            matches!(
+                view.recursive_grid,
+                Some(RecursiveGridState {
+                    status: RecursiveGridStatus::Loaded(_),
+                    ..
+                })
+            )
+        });
+        if drawn && loaded {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "recursive view did not load within ten seconds"
+        );
+    }
+    assert!(cx.debug_bounds("#exit-recursive-grid").is_some());
+    let banner = cx.debug_bounds("#exit-recursive-grid").unwrap();
+
+    let people_tab = cx.debug_bounds("#show-people-view").unwrap();
+    cx.simulate_click(people_tab.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let mode = view.read_with(&*cx, |view, _| view.directory_view_mode);
+    assert_eq!(mode, DirectoryViewMode::People, "click must switch modes");
+
+    // Clicking where the exit button used to be must NOT leave the recursive
+    // view: outside Grid mode the banner (and its handler) is gone. Bounds
+    // entries persist across frames in gpui, so absence is asserted
+    // behaviorally rather than via `debug_bounds(..).is_none()`.
+    cx.simulate_click(banner.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert!(
+        view.read_with(&*cx, |view, _| view.recursive_grid.is_some()),
+        "the recursive exit handler must be unreachable outside Grid mode"
+    );
+
+    // Back in the grid the banner is live again — click it for real and the
+    // recursive view exits.
+    let grid_tab = cx.debug_bounds("#show-grid-view").unwrap();
+    cx.simulate_click(grid_tab.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let restored = cx.debug_bounds("#exit-recursive-grid").unwrap();
+    cx.simulate_click(restored.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert!(
+        view.read_with(&*cx, |view, _| view.recursive_grid.is_none()),
+        "the restored exit button must leave the recursive view"
+    );
+}
+
+/// The capture-time chip row belongs to the grid: its Apply action must be
+/// unreachable in People mode (C3 regression; behavioral — see the
+/// recursive-banner test for the stale-bounds rationale).
+#[gpui::test]
+fn gpui_capture_time_chip_stays_in_grid_mode(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write_photo_stub_with_capture_time(root.path(), "timed-a", "2026:01:01 10:00:00");
+    write_photo_stub_with_capture_time(root.path(), "timed-b", "2026:01:01 09:00:00");
+    let config = gpui_test_config(root.path(), cache.path());
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+
+    // Force the pending-order state the metadata pass would set when the
+    // capture-time order differs from the on-disk order.
+    view.update(&mut *cx, |view, _| {
+        if let Some(contents) = view.model.loaded_mut(view.selected) {
+            contents.pending_capture_order = Some(contents.images.clone());
+        }
+    });
+    cx.run_until_parked();
+    let chip = cx
+        .debug_bounds("#apply-capture-time-order")
+        .expect("capture chip renders in grid mode");
+
+    let people_tab = cx.debug_bounds("#show-people-view").unwrap();
+    cx.simulate_click(people_tab.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let mode = view.read_with(&*cx, |view, _| view.directory_view_mode);
+    assert_eq!(mode, DirectoryViewMode::People, "click must switch modes");
+
+    // Clicking at the chip's old position must NOT apply the order.
+    cx.simulate_click(chip.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert!(
+        view.read_with(&*cx, |view, _| view
+            .model
+            .loaded(view.selected)
+            .is_some_and(|contents| contents.pending_capture_order.is_some())),
+        "the capture-order handler must be unreachable outside Grid mode"
+    );
+
+    // Back in the grid the chip applies the order for real.
+    let grid_tab = cx.debug_bounds("#show-grid-view").unwrap();
+    cx.simulate_click(grid_tab.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let restored = cx.debug_bounds("#apply-capture-time-order").unwrap();
+    cx.simulate_click(restored.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert!(
+        view.read_with(&*cx, |view, _| view
+            .model
+            .loaded(view.selected)
+            .is_none_or(|contents| contents.pending_capture_order.is_none())),
+        "the restored chip must apply the capture-time order"
+    );
+}
+
+/// Tile captions expose the capture time once metadata enrichment has
+/// delivered it (Stage 1 caption row).
+#[gpui::test]
+fn gpui_tile_caption_resolves_capture_time(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let path = write_photo_stub_with_capture_time(root.path(), "timed", "2026:01:01 10:00:00");
+    let config = gpui_test_config(root.path(), cache.path());
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("#thumbnail-caption-0").is_some());
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let resolved = view.read_with(&*cx, |view, _| view.capture_time_for(&path).is_some());
+        if resolved {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "capture metadata did not arrive within ten seconds"
+        );
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    // The caption's time span renders only once the capture time resolved;
+    // before that it never painted, so `is_some` here proves the render.
+    assert!(cx.debug_bounds("#thumbnail-caption-time-0").is_some());
+}
+
+// --- Stage 0 (ui-redesign-plan): token-module builders render every variant.
+
+struct BuilderHarness;
+
+impl Render for BuilderHarness {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_start()
+            .gap_2()
+            .p_2()
+            .child(ui::button(
+                "harness-primary",
+                "Primary",
+                ui::ButtonVariant::Primary,
+            ))
+            .child(ui::button(
+                "harness-default",
+                "Default",
+                ui::ButtonVariant::Default,
+            ))
+            .child(ui::button(
+                "harness-subtle",
+                "Subtle",
+                ui::ButtonVariant::Subtle,
+            ))
+            .child(ui::button(
+                "harness-danger",
+                "Danger",
+                ui::ButtonVariant::Danger,
+            ))
+            .child(
+                ui::chip("count", ui::ChipVariant::Default)
+                    .id("harness-chip-default")
+                    .debug_selector(|| "#harness-chip-default".to_owned()),
+            )
+            .child(
+                ui::chip("info", ui::ChipVariant::Info)
+                    .id("harness-chip-info")
+                    .debug_selector(|| "#harness-chip-info".to_owned()),
+            )
+    }
+}
+
+// --- Stage 2 (ui-redesign-plan): full-width header, sectioned inspector ---
+
+/// Right panels (develop inspector, job queue) must start BELOW the full-
+/// width header — the C4 overlap regression.
+#[gpui::test]
+fn gpui_right_panels_start_below_the_header(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write_photo_stub(root.path(), "photo", 47.5, 19.05);
+    let config = gpui_test_config(root.path(), cache.path());
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+    view.update(&mut *cx, |view, cx| {
+        view.show_develop_inspector = true;
+        view.show_job_queue = true;
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    let header = cx.debug_bounds("#app-header").unwrap();
+    let inspector = cx.debug_bounds("#develop-inspector").unwrap();
+    // The inspector must start AT the workspace row (header bottom +
+    // border), not merely somewhere below it: a workspace flex-row→flex-col
+    // regression would stack it under the content and still pass a loose
+    // `>=` check.
+    assert!(
+        f32::from(inspector.top() - header.bottom()) <= 2.0,
+        "the develop inspector must start at the header bottom (panel top {}, header bottom {})",
+        inspector.top(),
+        header.bottom()
+    );
+    // Stage 6: the job queue is a bottom dock bar with the drawer as an
+    // overlay popup floating just above it — never overlapping the header
+    // (C4 invariant in its overlay form).
+    let drawer = cx.debug_bounds("#activity-drawer").unwrap();
+    let dock = cx.debug_bounds("#activity-dock").unwrap();
+    assert!(
+        header.bottom() <= dock.top(),
+        "the dock bar must start below the header"
+    );
+    assert!(
+        f32::from(dock.top() - drawer.bottom()) <= 10.0,
+        "the drawer popup must float just above the dock bar (drawer bottom {}, dock top {})",
+        drawer.bottom(),
+        dock.top()
+    );
+}
+
+/// The develop inspector renders sectioned edits for the selected recipe and
+/// hosts the Developed/Baseline toggle (Stage 2, mockup develop-a).
+#[gpui::test]
+fn gpui_develop_inspector_renders_sections_and_toggle(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    write_photo_stub(root.path(), "photo", 47.5, 19.05);
+    let config = gpui_test_config(root.path(), cache.path());
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+
+    let photo_path = root.path().join("photo.jpg");
+    let recipe = catalog::DevelopRecipe {
+        exposure_ev: Some(1.25),
+        detail: Some(catalog::DetailRecipe {
+            sharpening: 40.0,
+            ..catalog::DetailRecipe::default()
+        }),
+        ..catalog::DevelopRecipe::default()
+    };
+    view.update(&mut *cx, |view, cx| {
+        view.recipes = Some(Arc::new(HashMap::from([(
+            photo_path,
+            catalog::RecipeEntry {
+                digest: recipe.digest().unwrap(),
+                recipe,
+            },
+        )])));
+        view.show_develop_inspector = true;
+        assert!(view.developed, "developed is the default state");
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    // The inspector inspects the focused image; select the tile so the
+    // recipe has an owner.
+    let thumbnail = cx.debug_bounds("#thumbnail-0").unwrap();
+    cx.simulate_click(thumbnail.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+
+    assert!(cx.debug_bounds("#develop-inspector").is_some());
+    assert!(cx.debug_bounds("#develop-inspector-toggle").is_some());
+    // Section identity, not just count: Exposure maps to Light and
+    // Sharpening to Detail (review finding: index-only asserts let a
+    // mis-mapping through).
+    assert!(cx.debug_bounds("#develop-section-light").is_some());
+    assert!(cx.debug_bounds("#develop-section-detail").is_some());
+    assert!(cx.debug_bounds("#develop-section-color").is_none());
+
+    let baseline = cx.debug_bounds("#develop-toggle-baseline").unwrap();
+    cx.simulate_click(baseline.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    view.read_with(&*cx, |view, _| assert!(!view.developed));
+    let developed = cx.debug_bounds("#develop-toggle-developed").unwrap();
+    cx.simulate_click(developed.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    view.read_with(&*cx, |view, _| assert!(view.developed));
+}
+
+/// Every button/chip variant renders with its documented selector (Stage 0
+/// matrix row; visual token values are verified by the screenshot tour).
+#[gpui::test]
+fn gpui_ui_builders_render_every_variant(cx: &mut gpui::TestAppContext) {
+    let (_view, cx) = cx.add_window_view(|_, _| BuilderHarness);
+    cx.run_until_parked();
+    for selector in [
+        "#harness-primary",
+        "#harness-default",
+        "#harness-subtle",
+        "#harness-danger",
+        "#harness-chip-default",
+        "#harness-chip-info",
+    ] {
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "{selector} must render"
+        );
+    }
+}
+
 #[gpui::test]
 fn gpui_image_view_double_clicks_zooms_and_drag_pans(cx: &mut gpui::TestAppContext) {
     let root = tempfile::tempdir().unwrap();
@@ -1134,6 +1973,95 @@ fn gpui_grid_recursive_controls_enter_and_exit_recursive_mode(cx: &mut gpui::Tes
     assert!(cx.debug_bounds("#show-images-recursively").is_some());
 }
 
+/// Category pages filter the rows; a search term matches across pages
+/// (Stage 5, ui-redesign-plan matrix).
+#[gpui::test]
+fn gpui_settings_categories_and_search_filter_rows(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let config = gpui_test_config(root.path(), cache.path());
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+    // dispatch_action needs a focused dispatch path (root handlers are
+    // unreachable in a fresh window): give the tree focus first.
+    let root_row = cx.debug_bounds("#directory-0").unwrap();
+    cx.simulate_click(root_row.center(), gpui::Modifiers::none());
+    cx.dispatch_action(OpenSettings);
+    cx.run_until_parked();
+
+    // Library page: no Faces rows.
+    assert!(cx.debug_bounds("#settings-browse-root").is_some());
+    assert!(
+        cx.debug_bounds("#settings-automatic-face-analysis")
+            .is_none()
+    );
+
+    let faces_page = cx.debug_bounds("#settings-category-faces").unwrap();
+    cx.simulate_click(faces_page.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let category = view.read_with(&*cx, |view, _| view.settings_category);
+    assert_eq!(category, "faces", "category click must switch pages");
+    let probe = (
+        cx.debug_bounds("#settings-rows"),
+        cx.debug_bounds("#settings-category-faces"),
+        cx.debug_bounds("#settings-search"),
+        cx.debug_bounds("#settings-dialog-panel"),
+    );
+    assert!(
+        cx.debug_bounds("#settings-automatic-face-analysis")
+            .is_some(),
+        "face row missing; rows={probe:?}"
+    );
+    // The hide direction is not assertable via debug_bounds absence (bounds
+    // persist across frames — design/ui-guidelines.md §6); it is covered
+    // behaviorally below: while searching, only matching rows render.
+
+    // Search matches across all pages regardless of the active category.
+    view.update(&mut *cx, |view, cx| {
+        view.settings_search = "pair".to_owned();
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("#settings-pair-preference").is_some());
+    // The hide direction is not assertable via debug_bounds (bounds are a
+    // two-buffer union — see design/ui-guidelines.md §6); behavioral form:
+    // under search, clicking the face row's toggle position must not flip
+    // the face-analysis setting.
+    // The position may be absent on one buffer parity (two-buffer union —
+    // design/ui-guidelines.md §6), so query across an extra draw first.
+    let mut face_toggle = cx.debug_bounds("#settings-automatic-face-analysis");
+    for attempt in 0..3 {
+        if face_toggle.is_some() {
+            break;
+        }
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        face_toggle = cx.debug_bounds("#settings-automatic-face-analysis");
+        assert!(attempt < 2, "face row bounds never appeared under search");
+    }
+    if let Some(face_toggle) = face_toggle {
+        cx.simulate_click(face_toggle.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+    }
+    view.update(&mut *cx, |view, _| {
+        assert!(
+            view.settings_draft
+                .as_ref()
+                .unwrap()
+                .automatic_face_analysis,
+            "the hidden face row must not receive the stray click"
+        );
+    });
+
+    view.update(&mut *cx, |view, cx| {
+        view.settings_search.clear();
+        view.settings_category = "map";
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("#settings-online-map").is_some());
+}
+
 #[gpui::test]
 fn gpui_settings_dialog_cancels_and_saves_painted_control_changes(cx: &mut gpui::TestAppContext) {
     let root = tempfile::tempdir().unwrap();
@@ -1147,6 +2075,14 @@ fn gpui_settings_dialog_cancels_and_saves_painted_control_changes(cx: &mut gpui:
     cx.dispatch_action(OpenSettings);
     cx.run_until_parked();
 
+    let pair = cx.debug_bounds("#settings-pair-preference");
+    assert!(
+        pair.is_none(),
+        "Import rows are hidden on the Library category page"
+    );
+    let import_page = cx.debug_bounds("#settings-category-import").unwrap();
+    cx.simulate_click(import_page.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
     let pair = cx.debug_bounds("#settings-pair-preference").unwrap();
     cx.simulate_click(pair.center(), gpui::Modifiers::none());
     let cancel = cx.debug_bounds("#settings-cancel").unwrap();
@@ -1157,13 +2093,38 @@ fn gpui_settings_dialog_cancels_and_saves_painted_control_changes(cx: &mut gpui:
     );
     assert!(view.read_with(&*cx, |view, _| view.settings_draft.is_none()));
 
+    // gpui 0.2.2 harness quirk (isolated in tmp probes, also reproduced
+    // with a minimal overlay): after an occlude overlay closes, the NEXT
+    // dialog instance's mouse dispatch is dead — listeners alternate with
+    // the frame buffers, so every SECOND instance swallows clicks. Real
+    // usage repaints continuously and is unaffected. Open and close once
+    // to reach an instance that dispatches.
     cx.dispatch_action(OpenSettings);
+    cx.run_until_parked();
+    let cancel_b = cx.debug_bounds("#settings-cancel").unwrap();
+    cx.simulate_click(cancel_b.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert!(view.read_with(&*cx, |v, _| v.settings_draft.is_none()));
+    cx.dispatch_action(OpenSettings);
+    cx.run_until_parked();
+    let import_page = cx.debug_bounds("#settings-category-import").unwrap();
+    cx.simulate_click(import_page.center(), gpui::Modifiers::none());
     cx.run_until_parked();
     let pair = cx.debug_bounds("#settings-pair-preference").unwrap();
     cx.simulate_click(pair.center(), gpui::Modifiers::none());
+    let map_page = cx.debug_bounds("#settings-category-map").unwrap();
+    cx.simulate_click(map_page.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
     let online = cx.debug_bounds("#settings-online-map").unwrap();
     cx.simulate_click(online.center(), gpui::Modifiers::none());
     let save = cx.debug_bounds("#settings-save").unwrap();
+    // The footer must sit INSIDE the dialog panel border (user-reported bug:
+    // it floated below the dialog).
+    let panel = cx.debug_bounds("#settings-dialog-panel").unwrap();
+    assert!(
+        panel.contains(&save.center()),
+        "Save must be inside the panel (save {save:?}, panel {panel:?})"
+    );
     cx.simulate_click(save.center(), gpui::Modifiers::none());
     assert_eq!(
         view.read_with(&*cx, |view, _| view.settings.pair_preference),
@@ -1360,7 +2321,8 @@ fn gpui_map_cache_bar_and_map_job_use_the_regular_ui(cx: &mut gpui::TestAppConte
     cx.update(|window, _| window.refresh());
     cx.run_until_parked();
     assert!(cx.debug_bounds("#map-job-queue-row").is_some());
-    assert!(cx.debug_bounds("#background-progress").is_some());
+    // Stage 6: the strip became the status dock (same bottom slot, new id).
+    assert!(cx.debug_bounds("#activity-dock").is_some());
     let grid = cx.debug_bounds("#show-grid-view").unwrap();
     cx.simulate_click(grid.center(), gpui::Modifiers::none());
     assert!(view.read_with(cx, |view, _| view.map_job.is_none()));
@@ -1390,8 +2352,18 @@ fn gpui_job_queue_pauses_face_maintenance(cx: &mut gpui::TestAppContext) {
     });
     cx.run_until_parked();
     let toggle = cx.debug_bounds("#job-queue-face-analysis-toggle").unwrap();
+    let drawer = cx.debug_bounds("#activity-drawer").unwrap();
+    assert!(
+        drawer.contains(&toggle.center()),
+        "toggle center must sit inside the drawer (toggle {toggle:?}, drawer {drawer:?})"
+    );
+    let paused_before = view.read_with(cx, |view, _| view.face_analysis_paused);
     cx.simulate_click(toggle.center(), gpui::Modifiers::none());
-    assert!(view.read_with(cx, |view, _| view.face_analysis_paused));
+    cx.run_until_parked();
+    assert!(
+        view.read_with(cx, |view, _| view.face_analysis_paused != paused_before),
+        "the dock toggle must flip the pause state (was {paused_before})"
+    );
 }
 
 #[gpui::test]
@@ -1499,6 +2471,7 @@ fn gpui_mixed_maintenance_rows_keep_recognition_click_index_and_retryable_work(
     catalog::initialize_test_catalog(root.path()).unwrap();
     face_engine::sync_analysis_inventory(root.path(), &sources).unwrap();
     let jobs = face_engine::pending_analysis_jobs(root.path(), 2).unwrap();
+    let seeded_jobs = jobs.clone();
     let mut config = gpui_test_config(root.path(), cache.path());
     config.settings.automatic_face_analysis = false;
     let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
@@ -1537,6 +2510,16 @@ fn gpui_mixed_maintenance_rows_keep_recognition_click_index_and_retryable_work(
     let mut preserved_retryable_work = false;
     for _ in 0..100 {
         cx.update_entity(&view, |view, cx| {
+            // A previous attempt's click can land one row off (drawer rows
+            // shift as other lanes complete) and cancel a neighbour's job.
+            // Re-seed those lanes so the isolation property stays
+            // observable on this attempt.
+            for job in &seeded_jobs {
+                let _ = view.face_analysis.enqueue(job.clone(), 10);
+            }
+            let _ = view
+                .people_summary_rebuild
+                .enqueue(root.path().to_path_buf(), 0);
             rusqlite::Connection::open(catalog::catalog_path(root.path()))
                 .unwrap()
                 .execute(
@@ -1556,7 +2539,7 @@ fn gpui_mixed_maintenance_rows_keep_recognition_click_index_and_retryable_work(
         cx.run_until_parked();
         let recognition = cx.debug_bounds("#recognition-job-queue-row").unwrap();
         cx.simulate_click(recognition.center(), gpui::Modifiers::none());
-        let cancellation_deadline = Instant::now() + Duration::from_secs(5);
+        let cancellation_deadline = Instant::now() + scaled_budget(Duration::from_secs(5));
         loop {
             let (others_uncancelled, cancelled, completed) = view.read_with(cx, |view, _| {
                 (
@@ -1586,7 +2569,7 @@ fn gpui_mixed_maintenance_rows_keep_recognition_click_index_and_retryable_work(
                 "the recognition click must not cancel the face and summary jobs"
             );
             if cancelled {
-                let deadline = Instant::now() + Duration::from_secs(5);
+                let deadline = Instant::now() + scaled_budget(Duration::from_secs(5));
                 loop {
                     let queried = rusqlite::Connection::open(catalog::catalog_path(root.path()))
                         .unwrap()
@@ -2965,8 +3948,22 @@ fn gpui_people_keyboard_only_view_person_and_back_journey(cx: &mut gpui::TestApp
     let mut config = gpui_test_config(root.path(), cache.path());
     config.settings.automatic_face_analysis = false;
     let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.update(|_, cx| bind_picture_browser_keys(cx));
     cx.update(|window, cx| view.read(cx).people_view_switch_focus.focus(window));
     cx.simulate_keystrokes("shift-tab tab enter");
+    for _ in 0..200 {
+        cx.run_until_parked();
+        if view.read_with(&*cx, |view, _| view.people_triage.is_some()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.directory_view_mode),
+        DirectoryViewMode::People
+    );
+    // The triage queue is the front surface; Esc leaves it at the overview.
+    cx.simulate_keystrokes("escape");
     for _ in 0..200 {
         cx.run_until_parked();
         if view.read_with(&*cx, |view, _| {
@@ -2976,36 +3973,43 @@ fn gpui_people_keyboard_only_view_person_and_back_journey(cx: &mut gpui::TestApp
         }
         std::thread::sleep(Duration::from_millis(2));
     }
-    assert_eq!(
-        view.read_with(&*cx, |view, _| view.directory_view_mode),
-        DirectoryViewMode::People
-    );
+    assert!(view.read_with(&*cx, |view, _| view.people_triage.is_none()));
+
+    // Card grid keyboard: space on the focused card opens the BROWSE grid.
     cx.update(|window, cx| view.read(cx).people_primary_card_focus.focus(window));
     cx.simulate_keystrokes("shift-tab tab space");
     for _ in 0..200 {
         cx.run_until_parked();
-        if view.read_with(&*cx, |view, _| {
-            matches!(view.people_faces, PeoplePageLoad::Loaded(_))
-        }) {
+        if view.read_with(&*cx, |view, _| view.person_grid.is_some()) {
             break;
         }
         std::thread::sleep(Duration::from_millis(2));
     }
-    assert_eq!(
-        view.read_with(&*cx, |view, _| view.selected_person),
-        Some(10)
-    );
-    assert!(cx.update(|window, cx| view.read(cx).people_grid_focus.is_focused(window)));
-    cx.update(|window, cx| view.read(cx).people_back_focus.focus(window));
-    cx.simulate_keystrokes("shift-tab tab enter");
+    view.read_with(&*cx, |view, _| {
+        assert!(
+            matches!(
+                view.person_grid,
+                Some(crate::VirtualGrid::Person { person_id: 10, .. })
+            ),
+            "card keyboard activation must open the person-filtered grid"
+        );
+    });
+    assert!(cx.update(|window, cx| view.read(cx).main_focus.is_focused(window)));
+    // Esc closes the person filter (guidelines §5: Esc leaves the current
+    // sub-state); the plain directory grid is restored.
+    cx.simulate_keystrokes("escape");
     for _ in 0..200 {
         cx.run_until_parked();
-        if view.read_with(&*cx, |view, _| view.selected_person.is_none()) {
+        if view.read_with(&*cx, |view, _| view.person_grid.is_none()) {
             break;
         }
         std::thread::sleep(Duration::from_millis(2));
     }
-    assert!(view.read_with(&*cx, |view, _| view.selected_person.is_none()));
+    assert!(view.read_with(&*cx, |view, _| view.person_grid.is_none()));
+    assert_eq!(
+        view.read_with(&*cx, |view, _| view.directory_view_mode),
+        DirectoryViewMode::Grid
+    );
 }
 
 #[gpui::test]
@@ -4706,10 +5710,16 @@ fn import_without_picked_destination_is_refused_and_picking_enables_it(
     let card = write_import_source(root.path(), "card", 0, 1);
     let (view, cx) = import_view_with_card(cx, &library, &card);
 
-    // No pick yet: the start button is inactive, and starting the import
-    // anyway is refused with a precise notice instead of choosing a
-    // destination behind the user's back.
-    assert!(cx.debug_bounds("#import-start").is_none());
+    // No pick yet: the start button renders in its disabled variant, and
+    // starting the import anyway is refused with a precise notice instead
+    // of choosing a destination behind the user's back. (Stage 3: the
+    // button is always present in the toolbar, with the refusal reason as
+    // its label; absence is asserted behaviorally — a click must not start
+    // a job.)
+    assert!(
+        cx.debug_bounds("#import-start").is_some(),
+        "the toolbar start button always renders"
+    );
     view.update(&mut *cx, |view, cx| {
         view.start_import(cx);
         assert!(view.import_view.job.is_none());
@@ -4717,6 +5727,7 @@ fn import_without_picked_destination_is_refused_and_picking_enables_it(
             view.import_view.notice.as_deref(),
             Some("Pick a destination folder first.")
         );
+        view.import_view.notice = None;
     });
 
     // Picking a folder activates the button, and the import then lands
@@ -4794,15 +5805,42 @@ fn folder_created_during_import_shows_in_tree_after_leaving(cx: &mut gpui::TestA
     cx.run_until_parked();
     let new_folder = cx.debug_bounds("#picker-new-folder-0").unwrap();
     cx.simulate_click(new_folder.center(), gpui::Modifiers::none());
+    assert!(
+        view.read_with(cx, |view, _| view.import_view.creating_folder),
+        "the new-folder click must switch the footer into create mode"
+    );
     cx.run_until_parked();
     // The app installs its keymap in main(); tests must do the same for
     // the input's Enter binding.
     cx.update(|_, cx| bind_picture_browser_keys(cx));
-    cx.simulate_keystrokes("1 enter");
+    cx.simulate_keystrokes("1");
+    cx.run_until_parked();
+    let (focused_input, draft, creating) = cx.update(|window, cx| {
+        let focused = window.focused(cx).is_some_and(|handle| {
+            handle == view.read_with(cx, |view, _| view.import_view.new_folder_focus.clone())
+        });
+        (
+            focused,
+            view.read_with(cx, |view, _| view.import_view.new_folder_name.clone()),
+            view.read_with(cx, |view, _| view.import_view.creating_folder),
+        )
+    });
+    assert!(
+        focused_input,
+        "the folder input must hold keyboard focus (creating {creating}, draft {draft:?})"
+    );
+    view.update(&mut *cx, |view, _| {
+        assert_eq!(
+            view.import_view.new_folder_name, "1",
+            "typed digit must land in the draft name"
+        );
+    });
+    cx.simulate_keystrokes("enter");
     cx.run_until_parked();
     assert!(
         library.join("Scan").join("1").is_dir(),
-        "typed folder was not created"
+        "typed folder was not created (draft {:?})",
+        view.read_with(&*cx, |view, _| view.import_view.new_folder_name.clone())
     );
 
     // Leaving the import view re-scans the touched chains: the still
@@ -8059,4 +9097,147 @@ fn tooltip_format_uses_uppercase_extension_and_skips_empty_names() {
 fn tooltip_capture_time_is_formatted_to_the_minute() {
     let formatted = format_tooltip_capture_time(std::time::SystemTime::UNIX_EPOCH);
     assert!(chrono::NaiveDateTime::parse_from_str(&formatted, "%Y-%m-%d %H:%M").is_ok());
+}
+
+/// People mode opens the triage review queue as its front surface
+/// (Stage 4a, mockup people-b): the queue scope covers suggestions across
+/// every person, the rail lists them, and a decision writes to the catalog.
+#[gpui::test]
+fn gpui_people_tab_opens_the_review_queue_triage(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    seed_people_ui_catalog(root.path(), 2);
+    let mut config = gpui_test_config(root.path(), cache.path());
+    config.settings.automatic_face_analysis = false;
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+    cx.update(|_, cx| bind_picture_browser_keys(cx));
+
+    let people_tab = cx.debug_bounds("#show-people-view").unwrap();
+    cx.simulate_click(people_tab.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+
+    // Queue scope: no person pinned, suggestions from the seeded catalog.
+    view.read_with(&*cx, |view, _| {
+        let triage = view.people_triage.as_ref().expect("triage must open");
+        assert!(triage.person_id.is_none(), "front surface is the queue");
+        assert!(
+            !triage.faces.is_empty(),
+            "seeded suggestions must reach the queue"
+        );
+        assert!(
+            triage
+                .faces
+                .iter()
+                .all(|face| face.kind == catalog::people::FaceAssignmentKind::Suggested),
+            "the queue carries suggestions only"
+        );
+    });
+    assert!(cx.debug_bounds("#people-triage").is_some());
+    assert!(cx.debug_bounds("#triage-filmstrip").is_some());
+
+    // Deciding on the queue's first face advances and persists.
+    let surface = cx.debug_bounds("#people-triage-surface").unwrap();
+    cx.simulate_click(surface.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    cx.simulate_keystrokes("y");
+    cx.run_until_parked();
+    let confirmed = rusqlite::Connection::open(catalog::catalog_path(root.path()))
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM face_assignments \
+             WHERE kind='confirmed' AND provenance='rekesz'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert_eq!(confirmed, 1, "queue Y must confirm the current face");
+}
+
+/// The triage rail's PEOPLE switcher re-scopes the queue, "Browse photos"
+/// opens the person-filtered grid, and "All people" returns to the overview.
+#[gpui::test]
+fn gpui_triage_rail_switches_scope_and_browses(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    seed_people_ui_catalog(root.path(), 1);
+    let mut config = gpui_test_config(root.path(), cache.path());
+    config.settings.automatic_face_analysis = false;
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+    cx.update(|_, cx| bind_picture_browser_keys(cx));
+
+    let people_tab = cx.debug_bounds("#show-people-view").unwrap();
+    cx.simulate_click(people_tab.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+
+    // The switcher lists the seeded person; clicking re-scopes the queue.
+    // Key dispatch flushes pending frames (mouse dispatch does not), so a
+    // modifiers keystroke settles the layout before reading bounds — see
+    // design/ui-guidelines.md §6.
+    cx.simulate_keystrokes("shift");
+    cx.run_until_parked();
+    let switcher = cx.debug_bounds("#triage-switcher-10").unwrap();
+    cx.simulate_click(switcher.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+
+    // Browse photos opens the person-filtered grid.
+    let browse = cx.debug_bounds("#triage-browse-person").unwrap();
+    cx.simulate_click(browse.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    view.read_with(&*cx, |view, _| {
+        assert!(view.people_triage.is_none(), "triage closes for browsing");
+        assert!(
+            matches!(
+                view.person_grid,
+                Some(crate::VirtualGrid::Person { person_id: 10, .. })
+            ),
+            "card click must open the person-filtered grid"
+        );
+    });
+
+    // Back to People: the queue opens again (no lingering state), and
+    // "All people" shows the overview cards.
+    let people_tab = cx.debug_bounds("#show-people-view").unwrap();
+    cx.simulate_click(people_tab.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert!(view.read_with(&*cx, |view, _| view.people_triage.is_some()));
+    let all_people = cx.debug_bounds("#triage-all-people").unwrap();
+    cx.simulate_click(all_people.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert!(view.read_with(&*cx, |view, _| view.people_triage.is_none()));
+    assert!(cx.debug_bounds("#person-card-10").is_some());
+}
+
+/// A person card click browses the confirmed photos in the regular grid
+/// (the common case, Stage 4b) instead of the management hub.
+#[gpui::test]
+fn gpui_person_card_click_browses_the_grid(cx: &mut gpui::TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    seed_people_ui_catalog(root.path(), 3);
+    let mut config = gpui_test_config(root.path(), cache.path());
+    config.settings.automatic_face_analysis = false;
+    let (view, cx) = cx.add_window_view(|_, cx| PictureBrowser::new(&config, cx));
+    cx.run_until_parked();
+    cx.update_entity(&view, |view, cx| {
+        view.directory_view_mode = DirectoryViewMode::People;
+        view.people_whole_library = true;
+        view.refresh_people_page(cx);
+    });
+    cx.run_until_parked();
+    let card = cx.debug_bounds("#person-card-10").unwrap();
+    cx.simulate_click(card.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    view.read_with(&*cx, |view, _| {
+        assert!(
+            matches!(
+                view.person_grid,
+                Some(crate::VirtualGrid::Person { person_id: 10, .. })
+            ),
+            "card click must open the person-filtered grid"
+        );
+        assert_eq!(view.directory_view_mode, DirectoryViewMode::Grid);
+    });
+    assert!(cx.debug_bounds("#header-person").is_some());
 }

@@ -18,11 +18,11 @@ use std::{
 use anyhow::Result;
 use gpui::{
     AnyElement, App, AppContext as _, Application, Bounds, ClickEvent, ClipboardItem, Context,
-    CursorStyle, FocusHandle, KeyBinding, ListSizingBehavior, Menu, MenuItem, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Render, ScrollHandle,
-    ScrollStrategy, ScrollWheelEvent, SharedString, StatefulInteractiveElement,
-    UniformListScrollHandle, Window, WindowBounds, WindowOptions, actions, canvas, div, img, point,
-    prelude::*, px, relative, rgb, size, uniform_list,
+    CursorStyle, Div, FocusHandle, FontWeight, KeyBinding, ListSizingBehavior, Menu, MenuItem,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Render,
+    ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, Stateful,
+    StatefulInteractiveElement, UniformListScrollHandle, Window, WindowBounds, WindowOptions,
+    actions, canvas, div, img, point, prelude::*, px, relative, rgb, size, uniform_list,
 };
 
 mod accessibility;
@@ -40,8 +40,11 @@ mod metadata;
 mod preview;
 mod rendering;
 mod scheduler;
+#[path = "main/screenshot_tour.rs"]
+mod screenshot_tour;
 mod sources;
 mod trace;
+mod ui;
 
 static MAP_RENDER_BUSY: AtomicBool = AtomicBool::new(false);
 static MAP_CLUSTER_BUSY: AtomicBool = AtomicBool::new(false);
@@ -97,7 +100,10 @@ actions!(
         OpenSettings,
         ImportLightroom,
         ImportPhotos,
-        ImportNewFolderConfirm
+        ImportNewFolderConfirm,
+        TriageExit,
+        TriageLeft,
+        TriageRight
     ]
 );
 
@@ -121,7 +127,14 @@ actions!(
     ]
 );
 
-const DEFAULT_THUMBNAIL_WIDTH: u32 = 300;
+const DEFAULT_THUMBNAIL_WIDTH: u32 = 216;
+
+/// Whole tiles that fit into `available` width at `thumbnail_width` + gap.
+fn grid_columns_for(available: f32, thumbnail_width: u32) -> usize {
+    ((available + THUMBNAIL_GAP) / (thumbnail_width as f32 + THUMBNAIL_GAP))
+        .floor()
+        .max(1.0) as usize
+}
 const THUMBNAIL_GAP: f32 = 12.0;
 const IMAGE_SCOPE: DemandScopeId = DemandScopeId(1);
 const GRID_SCOPE: DemandScopeId = DemandScopeId(2);
@@ -132,6 +145,7 @@ const IMAGE_PREFETCH_SCOPE: DemandScopeId = DemandScopeId(6);
 const MAP_CARD_SCOPE: DemandScopeId = DemandScopeId(7);
 const PEOPLE_SCOPE: DemandScopeId = DemandScopeId(8);
 const IMPORT_SCOPE: DemandScopeId = DemandScopeId(9);
+const TRIAGE_SCOPE: DemandScopeId = DemandScopeId(10);
 #[cfg(test)]
 static PEOPLE_QUERY_TEST_DELAY: std::sync::Mutex<Option<(PathBuf, Duration)>> =
     std::sync::Mutex::new(None);
@@ -139,7 +153,6 @@ const MAP_GALLERY_PAGE_SIZE: usize = 6;
 const IDLE_PREFETCH_DELAY: Duration = Duration::from_millis(400);
 const IDLE_PREFETCH_BATCH: usize = 64;
 const IMAGE_PREFETCH_COUNT: usize = 4;
-const JOB_QUEUE_PANEL_WIDTH: f32 = 430.0;
 const DEVELOP_PANEL_WIDTH: f32 = 320.0;
 const SCHEDULER_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 const FULL_IDENTITY_VERIFICATION_INTERVAL: u64 = 1_440;
@@ -568,6 +581,110 @@ impl ImageViewState {
 enum MainView {
     Image(ImageViewState),
     Dir(PathBuf, ImageSelection),
+}
+
+/// One breadcrumb segment of the header path; clicking it selects the node.
+struct HeaderCrumb {
+    label: String,
+    node: NodeId,
+}
+
+/// What the header row shows for the current main view (ui-redesign-plan
+/// Stage 1): the viewer shows a filename; a directory shows its breadcrumb
+/// chain with photo/selection chips.
+enum HeaderTitle {
+    Image {
+        filename: String,
+    },
+    Dir {
+        crumbs: Vec<HeaderCrumb>,
+        photos: usize,
+        selected: usize,
+        full_path: PathBuf,
+    },
+    Person {
+        name: String,
+        photos: usize,
+        selected: usize,
+    },
+}
+
+/// Plain-text tooltip (header breadcrumbs).
+struct TextTooltip {
+    text: SharedString,
+}
+
+impl Render for TextTooltip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .text_xs()
+            .text_color(rgb(ui::TEXT))
+            .child(self.text.clone())
+    }
+}
+
+/// A non-directory listing that drives the regular grid with all album
+/// features (ui-redesign-plan Stage 4b). Currently: the confirmed photos of
+/// one person.
+#[derive(Clone, Debug)]
+enum VirtualGrid {
+    Person {
+        person_id: i64,
+        name: String,
+        status: VirtualGridStatus,
+    },
+}
+
+#[derive(Clone, Debug)]
+enum VirtualGridStatus {
+    Loading,
+    Loaded(RecursiveImages),
+    Error(Arc<str>),
+}
+
+/// Keyboard-first face-review work queue (Stage 4a, mockup people-b): one
+/// face at a time, `Y`/`N`/`E` decide and advance, Esc returns to the people
+/// pages. Separate from person *browsing*, which is the regular grid.
+struct PeopleSwitcherEntry {
+    person_id: i64,
+    name: String,
+    suggested: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TriageQueueSource {
+    Person,
+    ReviewQueue,
+}
+
+/// Keyboard-first face-review work queue (Stage 4a, mockup people-b). Scope:
+/// one person's suggestions (`person_id` set) or the whole review queue
+/// (`None`) — the People mode's front surface.
+struct PeopleTriageState {
+    person_id: Option<i64>,
+    person_name: Option<String>,
+    faces: Vec<catalog::people::FaceReviewItem>,
+    cursor: usize,
+    switcher: Vec<PeopleSwitcherEntry>,
+}
+
+impl PeopleTriageState {
+    fn current(&self) -> Option<&catalog::people::FaceReviewItem> {
+        self.faces.get(self.cursor)
+    }
+
+    fn remaining(&self) -> usize {
+        self.faces.len().saturating_sub(self.cursor)
+    }
+
+    fn scope_label(&self) -> String {
+        match (&self.person_name, self.person_id) {
+            (Some(name), _) => format!("for {name}"),
+            _ => "in the review queue".to_owned(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1085,6 +1202,9 @@ struct PictureBrowser {
     settings: AppSettings,
     settings_path: PathBuf,
     settings_draft: Option<AppSettings>,
+    settings_category: &'static str,
+    settings_search: String,
+    settings_search_focus: FocusHandle,
     lightroom_import_dialog: Option<LightroomImportDialog>,
     import_view: import_view::ImportViewState,
     settings_status: Option<String>,
@@ -1101,6 +1221,7 @@ struct PictureBrowser {
     metadata_load: Option<(NodeId, discovery::RequestId, Arc<AtomicBool>)>,
     scrollbar_drag: Option<ScrollbarDrag>,
     settings_scroll: ScrollHandle,
+    triage_switcher_scroll: ScrollHandle,
     pending_import_demand: Option<Range<usize>>,
     import_demand_scheduled: bool,
     recipes: Option<Arc<HashMap<PathBuf, catalog::RecipeEntry>>>,
@@ -1187,6 +1308,20 @@ struct PictureBrowser {
     selection_context_menu: Option<SelectionContextMenu>,
     grid_selection_mode: GridSelectionMode,
     viewer_paths: Option<Vec<PathBuf>>,
+    /// Screenshot tour (REKESZ_SHOT_TOUR): starts the tour on the first
+    /// render pass, where a `&Window` is available for `spawn_in`.
+    tour_start_pending: bool,
+    /// Screenshot tour: index of the grid tile whose tooltip is force-rendered
+    /// (the tour cannot hover, and real tooltips need a pointer).
+    tour_tooltip_index: Option<usize>,
+    /// Person-filtered grid (Stage 4b).
+    person_grid: Option<VirtualGrid>,
+    person_grid_generation: u64,
+    person_grid_cancelled: Arc<AtomicBool>,
+    /// Face-review triage work queue (Stage 4a).
+    people_triage: Option<PeopleTriageState>,
+    people_triage_generation: u64,
+    people_triage_cancelled: Arc<AtomicBool>,
 }
 
 /// UTC timestamp in the SQLite `datetime('now')` textual format, matching the
@@ -1584,6 +1719,41 @@ fn map_job_progress_label(job: &MapJob) -> String {
     }
 }
 
+/// The inspector section an edit name belongs to (Stage 2, mockup
+/// develop-a). Unknown names fall through to "Other" so new recipe fields
+/// always render.
+fn develop_section(name: &str) -> &'static str {
+    // The monochrome mixer rows are emitted as "Monochrome Red", …
+    let mixer = name.strip_prefix("Monochrome ");
+    match name {
+        "Exposure" | "Contrast" | "Highlights" | "Shadows" | "Whites" | "Blacks" => "Light",
+        "Saturation" | "Vibrance" | "White balance" | "White balance offset" => "Color",
+        "Clarity" | "Texture" | "Dehaze" => "Presence",
+        "Sharpening"
+        | "Sharpen radius"
+        | "Sharpen detail"
+        | "Edge masking"
+        | "Luminance noise reduction"
+        | "Luminance detail"
+        | "Luminance contrast"
+        | "Colour noise reduction"
+        | "Colour detail"
+        | "Colour smoothness" => "Detail",
+        "Tone curve" | "Red tone curve" | "Green tone curve" | "Blue tone curve" => "Tone curve",
+        "Crop" => "Geometry",
+        _ if mixer.is_some_and(|channel| {
+            matches!(
+                channel,
+                "Red" | "Orange" | "Yellow" | "Green" | "Aqua" | "Blue" | "Purple" | "Magenta"
+            )
+        }) =>
+        {
+            "Black & white"
+        }
+        _ => "Other",
+    }
+}
+
 fn format_develop_edits(recipe: &catalog::DevelopRecipe) -> Vec<(String, String)> {
     let mut edits = Vec::new();
     macro_rules! push_value {
@@ -1769,6 +1939,7 @@ enum RecursiveGridStatus {
     Error(Arc<str>),
 }
 
+#[derive(Clone, Debug)]
 struct RecursiveImages {
     paths: Vec<PathBuf>,
     coordinates: HashMap<PathBuf, metadata::GeoCoordinate>,
@@ -2018,6 +2189,7 @@ impl PictureBrowser {
             metadata_load: None,
             scrollbar_drag: None,
             settings_scroll: ScrollHandle::new(),
+            triage_switcher_scroll: ScrollHandle::new(),
             pending_import_demand: None,
             import_demand_scheduled: false,
             recipes: None,
@@ -2096,6 +2268,17 @@ impl PictureBrowser {
             selection_context_menu: None,
             grid_selection_mode: GridSelectionMode::Default,
             viewer_paths: None,
+            tour_start_pending: screenshot_tour::tour_enabled(),
+            tour_tooltip_index: None,
+            person_grid: None,
+            person_grid_generation: 0,
+            person_grid_cancelled: Arc::new(AtomicBool::new(false)),
+            people_triage: None,
+            people_triage_generation: 0,
+            people_triage_cancelled: Arc::new(AtomicBool::new(false)),
+            settings_category: "library",
+            settings_search: String::new(),
+            settings_search_focus: cx.focus_handle(),
         };
         let catalog_work = this.work.start("Loading develop catalog…");
         let catalog_root = settings.root.clone();
@@ -2997,6 +3180,13 @@ impl PictureBrowser {
         }
         self.grid_selection_mode = GridSelectionMode::Default;
         self.viewer_paths = None;
+        // Picking a directory leaves the person-filtered listing (Stage 4b):
+        // the tree must win over the filter or the selection looks dead.
+        if directory_changed && self.person_grid.is_some() {
+            self.person_grid_generation = self.person_grid_generation.wrapping_add(1);
+            self.person_grid_cancelled.store(true, Ordering::Release);
+            self.person_grid = None;
+        }
         if directory_changed && let Some(recursive) = self.recursive_grid.take() {
             recursive.cancelled.store(true, Ordering::Release);
         }
@@ -3191,7 +3381,7 @@ impl PictureBrowser {
     }
 
     fn open_selected_image(&mut self, _: &OpenImage, _: &mut Window, cx: &mut Context<Self>) {
-        if self.directory_view_mode == DirectoryViewMode::Import {
+        if self.directory_view_mode == DirectoryViewMode::Import || self.people_triage.is_some() {
             return;
         }
         let index = match &self.main_view {
@@ -3204,7 +3394,7 @@ impl PictureBrowser {
     }
 
     fn move_thumbnail_selection(&mut self, delta: isize, extend: bool, cx: &mut Context<Self>) {
-        if self.directory_view_mode == DirectoryViewMode::Import {
+        if self.directory_view_mode == DirectoryViewMode::Import || self.people_triage.is_some() {
             return;
         }
         let image_count = self.selected_images().len();
@@ -3265,6 +3455,12 @@ impl PictureBrowser {
             self.path_context_menu = None;
             self.selection_context_menu = None;
             self.selections_menu_open = false;
+            // Esc leaves the most recent sub-state first (guidelines §5):
+            // the person-filtered grid closes before selection modes.
+            if self.person_grid.is_some() {
+                self.close_person_grid(cx);
+                return;
+            }
             if self.grid_selection_mode != GridSelectionMode::Default {
                 self.exit_grid_selection_mode(cx);
             }
@@ -3347,11 +3543,7 @@ impl PictureBrowser {
         if let Some(size) = self.image_viewport_measured {
             return (f32::from(size.width), f32::from(size.height));
         }
-        let inspector_width = if self.show_job_queue {
-            JOB_QUEUE_PANEL_WIDTH
-        } else {
-            0.0
-        } + if self.show_develop_inspector {
+        let inspector_width = if self.show_develop_inspector {
             DEVELOP_PANEL_WIDTH
         } else {
             0.0
@@ -3436,6 +3628,13 @@ impl PictureBrowser {
         if let Some(paths) = &self.viewer_paths {
             return paths;
         }
+        if let Some(VirtualGrid::Person {
+            status: VirtualGridStatus::Loaded(images),
+            ..
+        }) = &self.person_grid
+        {
+            return &images.paths;
+        }
         if let Some(RecursiveGridState {
             root,
             status: RecursiveGridStatus::Loaded(images),
@@ -3454,6 +3653,14 @@ impl PictureBrowser {
     /// source precedence of `selected_images`. The recursive grid keeps its
     /// own times because its subdirectories are not loaded model nodes.
     fn capture_time_for(&self, path: &Path) -> Option<std::time::SystemTime> {
+        if let Some(VirtualGrid::Person {
+            status: VirtualGridStatus::Loaded(images),
+            ..
+        }) = &self.person_grid
+            && let Some(time) = images.capture_times.get(path)
+        {
+            return Some(*time);
+        }
         if let Some(RecursiveGridState {
             root,
             status: RecursiveGridStatus::Loaded(images),
@@ -3468,6 +3675,17 @@ impl PictureBrowser {
     }
 
     fn selected_coordinates(&self) -> Vec<metadata::GeoCoordinate> {
+        if let Some(VirtualGrid::Person {
+            status: VirtualGridStatus::Loaded(images),
+            ..
+        }) = &self.person_grid
+        {
+            return images
+                .paths
+                .iter()
+                .filter_map(|path| images.coordinates.get(path).copied())
+                .collect();
+        }
         if let Some(RecursiveGridState {
             root,
             status: RecursiveGridStatus::Loaded(images),
@@ -3488,6 +3706,24 @@ impl PictureBrowser {
     }
 
     fn selected_located_images(&self) -> Vec<(usize, metadata::GeoCoordinate)> {
+        if let Some(VirtualGrid::Person {
+            status: VirtualGridStatus::Loaded(images),
+            ..
+        }) = &self.person_grid
+        {
+            return images
+                .paths
+                .iter()
+                .enumerate()
+                .filter_map(|(index, path)| {
+                    images
+                        .coordinates
+                        .get(path)
+                        .copied()
+                        .map(|value| (index, value))
+                })
+                .collect();
+        }
         if let Some(RecursiveGridState {
             root,
             status: RecursiveGridStatus::Loaded(images),
@@ -3696,7 +3932,19 @@ impl PictureBrowser {
             self.request_map_render(cx);
         }
         if mode == DirectoryViewMode::People {
-            self.refresh_people_page(cx);
+            // The triage work queue is the People mode's front surface
+            // (mockup people-b, user-approved split): entering People with
+            // nothing else open lands in the review queue. Direct field
+            // assignments (tests, tour steps that seed a person first)
+            // bypass this deliberately.
+            if self.people_triage.is_none()
+                && self.selected_person.is_none()
+                && self.people_special_page.is_none()
+            {
+                self.open_people_review_queue(cx);
+            } else {
+                self.refresh_people_page(cx);
+            }
         } else {
             self.people_query_generation = self.people_query_generation.wrapping_add(1);
             self.people_query_cancelled.store(true, Ordering::Release);
@@ -5827,11 +6075,7 @@ impl PictureBrowser {
         const CARD_WIDTH: f32 = 220.0;
         const CARD_GAP: f32 = 12.0;
         const VIEW_PADDING: f32 = 40.0;
-        let inspector_width = if self.show_job_queue {
-            JOB_QUEUE_PANEL_WIDTH
-        } else {
-            0.0
-        } + if self.show_develop_inspector {
+        let inspector_width = if self.show_develop_inspector {
             DEVELOP_PANEL_WIDTH
         } else {
             0.0
@@ -5967,26 +6211,22 @@ impl PictureBrowser {
                                     "{} confirmed · {} suggestions",
                                     person.confirmed_faces, person.suggested_faces
                                 ))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.selected_person = Some(person_id);
-                                    this.people_special_page = None;
-                                    this.selected_person_name = Some(person_name.clone());
-                                    this.people_page = 0;
-                                    this.people_context_mode = false;
-                                    this.people_face_context_overrides.clear();
-                                    this.refresh_people_page(cx);
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_person_grid(person_id, person_name.clone(), cx);
+                                    // Browsing is keyboard-navigable
+                                    // immediately (grid arrows/Enter).
+                                    window.focus(&this.main_focus);
                                 }))
                                 .on_key_down(cx.listener(
-                                    move |this, event: &gpui::KeyDownEvent, _, cx| {
+                                    move |this, event: &gpui::KeyDownEvent, window, cx| {
                                         if matches!(event.keystroke.key.as_str(), "enter" | "space")
                                         {
-                                            this.selected_person = Some(person_id);
-                                            this.people_special_page = None;
-                                            this.selected_person_name = Some(keyboard_name.clone());
-                                            this.people_page = 0;
-                                            this.people_context_mode = false;
-                                            this.people_face_context_overrides.clear();
-                                            this.refresh_people_page(cx);
+                                            this.open_person_grid(
+                                                person_id,
+                                                keyboard_name.clone(),
+                                                cx,
+                                            );
+                                            window.focus(&this.main_focus);
                                             cx.stop_propagation();
                                         }
                                     },
@@ -6039,7 +6279,9 @@ impl PictureBrowser {
                 .child(
                     div()
                         .flex()
+                        .flex_wrap()
                         .items_center()
+                        .gap_y_2()
                         .mb_4()
                         .child(
                             div()
@@ -6164,6 +6406,76 @@ impl PictureBrowser {
                                                 window,
                                                 cx,
                                             );
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id("person-browse")
+                                        .debug_selector(|| "#person-browse".to_owned())
+                                        .tab_index(0)
+                                        .px_3()
+                                        .py_1()
+                                        .rounded_sm()
+                                        .bg(rgb(0x315b8f))
+                                        .hover(|this| this.bg(rgb(0x3d6fa9)))
+                                        .cursor_pointer()
+                                        .child("Browse photos")
+                                        .on_key_down(cx.listener(
+                                            move |this, event: &gpui::KeyDownEvent, _, cx| {
+                                                if matches!(
+                                                    event.keystroke.key.as_str(),
+                                                    "enter" | "space"
+                                                ) {
+                                                    let name = this
+                                                        .selected_person_name
+                                                        .clone()
+                                                        .unwrap_or_default();
+                                                    this.open_person_grid(person_id, name, cx);
+                                                    cx.stop_propagation();
+                                                }
+                                            },
+                                        ))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            let name = this
+                                                .selected_person_name
+                                                .clone()
+                                                .unwrap_or_default();
+                                            this.open_person_grid(person_id, name, cx);
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id("person-review")
+                                        .debug_selector(|| "#person-review".to_owned())
+                                        .tab_index(0)
+                                        .px_3()
+                                        .py_1()
+                                        .rounded_sm()
+                                        .bg(rgb(0x30343d))
+                                        .hover(|this| this.bg(rgb(0x3b4658)))
+                                        .cursor_pointer()
+                                        .child("Review suggestions")
+                                        .on_key_down(cx.listener(
+                                            move |this, event: &gpui::KeyDownEvent, _, cx| {
+                                                if matches!(
+                                                    event.keystroke.key.as_str(),
+                                                    "enter" | "space"
+                                                ) {
+                                                    let name = this
+                                                        .selected_person_name
+                                                        .clone()
+                                                        .unwrap_or_default();
+                                                    this.open_people_triage(person_id, name, cx);
+                                                    cx.stop_propagation();
+                                                }
+                                            },
+                                        ))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            let name = this
+                                                .selected_person_name
+                                                .clone()
+                                                .unwrap_or_default();
+                                            this.open_people_triage(person_id, name, cx);
                                         })),
                                 )
                         }))
@@ -7514,6 +7826,8 @@ impl PictureBrowser {
                             )
                             .child(
                                 div()
+                                    .id(("thumbnail-caption", index))
+                                    .debug_selector(move || format!("#thumbnail-caption-{index}"))
                                     .mt_2()
                                     .w_full()
                                     .flex()
@@ -7532,6 +7846,24 @@ impl PictureBrowser {
                                                 .child("D"),
                                         )
                                     }),
+                            )
+                            .when_some(
+                                self.capture_time_for(&path)
+                                    .map(format_tooltip_capture_time),
+                                |this, time| {
+                                    this.child(
+                                        div()
+                                            .id(("thumbnail-caption-time", index))
+                                            .debug_selector(move || {
+                                                format!("#thumbnail-caption-time-{index}")
+                                            })
+                                            .w_full()
+                                            .text_xs()
+                                            .text_color(rgb(ui::TEXT_DIM))
+                                            .truncate()
+                                            .child(time),
+                                    )
+                                },
                             )
                             .when_some(editor_members.as_ref(), |this, members| {
                                 let member = members.contains(&path);
@@ -8132,6 +8464,12 @@ impl PictureBrowser {
 
     /// The album (directory) whose selections the grid toolbar is showing.
     fn selection_album(&self) -> PathBuf {
+        // The person-filtered grid keys its selections under a virtual album
+        // directory: below the library root so the selections storage's
+        // relative-path encoding works, but never present on disk.
+        if let Some(VirtualGrid::Person { person_id, .. }) = &self.person_grid {
+            return self.settings.root.join(format!("@person-{person_id}"));
+        }
         self.model.node(self.selected).path.to_path_buf()
     }
 
@@ -8792,7 +9130,7 @@ impl PictureBrowser {
                     )
                     .on_click({
                         let click_name = name.clone();
-                        cx.listener(move |this, _, _, cx| {
+                        cx.listener(move |this, _, window, cx| {
                         let viewing_this = matches!(
                             &this.grid_selection_mode,
                             GridSelectionMode::Viewer { name: active } if *active == click_name
@@ -8802,6 +9140,10 @@ impl PictureBrowser {
                         } else {
                             this.enter_viewer_mode(click_name.clone(), cx);
                         }
+                        // The listing is keyboard-navigable after the click:
+                        // hand focus back to the grid instead of leaving it
+                        // on the toolbar swatch.
+                        window.focus(&this.main_focus);
                         })
                     })
                     .when(!merged, |this| {
@@ -9050,7 +9392,9 @@ impl PictureBrowser {
         };
         div()
             .absolute()
-            .top(px(46.0))
+            // Anchored below the header so it never covers the toolbar
+            // button that toggles it (clicking the button again must close).
+            .top(px(74.0))
             .right(px(8.0))
             .w(px(300.0))
             .rounded_md()
@@ -9572,6 +9916,33 @@ impl PictureBrowser {
             self.toggle_selection_membership(path, cx);
             return;
         }
+        // Keyboard-first triage (Stage 4a): Y accepts, N rejects, E marks
+        // not-a-face. Gated behind every modal and text input so typing in
+        // the settings search never writes decisions (the search input
+        // stop_propagates, this guard is the second line of defense).
+        if !modal_open && self.people_triage.is_some() && keystroke.key == "escape" {
+            // Esc leaves the triage regardless of which header control
+            // holds focus (guidelines §5: Esc always means back/out).
+            self.exit_people_triage(cx);
+            return;
+        }
+        if !modal_open && self.people_triage.is_some() {
+            match keystroke.key.as_str() {
+                "y" => {
+                    self.decide_triage_current(PeopleDecision::Confirm, cx);
+                    return;
+                }
+                "n" => {
+                    self.decide_triage_current(PeopleDecision::Reject, cx);
+                    return;
+                }
+                "e" => {
+                    self.decide_triage_current(PeopleDecision::NotFace, cx);
+                    return;
+                }
+                _ => {}
+            }
+        }
         if keystroke.key == "d" {
             self.toggle_developed(&ToggleDeveloped, window, cx);
         }
@@ -9600,7 +9971,7 @@ impl PictureBrowser {
         }
     }
 
-    fn render_develop_inspector(&self) -> AnyElement {
+    fn render_develop_inspector(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let selected = self.inspected_image_path();
         let recipe = selected
             .as_ref()
@@ -9621,7 +9992,10 @@ impl PictureBrowser {
             .p_3()
             .flex()
             .flex_col()
-            .gap_2();
+            .gap_1()
+            // Plain-text children (empty states) must stay readable on the
+            // dark panel; the panel chain sets no inherited text color.
+            .text_color(rgb(ui::TEXT_DIM));
         if self.recipes.is_none() {
             contents = contents.child("Loading catalog…");
         } else if selected.is_none() {
@@ -9631,52 +10005,990 @@ impl PictureBrowser {
         } else if rows.is_empty() {
             contents = contents.child("The imported recipe contains no active edits.");
         } else {
-            for (name, value) in rows {
+            let mut sections: Vec<(&'static str, Vec<&(String, String)>)> = Vec::new();
+            for row in &rows {
+                let section = develop_section(&row.0);
+                match sections.iter_mut().find(|(name, _)| *name == section) {
+                    Some(slot) => slot.1.push(row),
+                    None => sections.push((section, vec![row])),
+                }
+            }
+            for (section_name, rows) in sections {
+                let section_selector = format!(
+                    "#develop-section-{}",
+                    section_name.to_lowercase().replace([' ', '&'], "-")
+                );
                 contents = contents.child(
                     div()
-                        .pb_2()
-                        .border_b_1()
-                        .border_color(rgb(0x292d36))
-                        .child(div().text_xs().text_color(rgb(0x8d96a5)).child(name))
-                        .child(
-                            div()
-                                .mt_1()
-                                .text_sm()
-                                .text_color(rgb(0xd0d5df))
-                                .child(value),
-                        ),
+                        .debug_selector(move || section_selector.clone())
+                        .mt_2()
+                        .text_xs()
+                        .text_color(rgb(ui::TEXT_FAINT))
+                        .child(section_name.to_uppercase()),
                 );
+                for (name, value) in rows {
+                    let bar = value.parse::<f64>().ok().map(|magnitude| {
+                        let fraction = (magnitude.abs() / 100.0).clamp(0.02, 1.0) as f32;
+                        div()
+                            .w(px(64.0))
+                            .h(px(3.0))
+                            .flex_none()
+                            .rounded_sm()
+                            .bg(rgb(ui::BORDER))
+                            .child(
+                                div()
+                                    .w(relative(fraction))
+                                    .h_full()
+                                    .rounded_sm()
+                                    .bg(rgb(ui::ACCENT)),
+                            )
+                    });
+                    contents = contents.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .py_1()
+                            .border_b_1()
+                            .border_color(rgb(ui::BORDER))
+                            .child(
+                                div()
+                                    .w(px(110.0))
+                                    .flex_none()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(rgb(ui::TEXT_DIM))
+                                    .child(name.clone()),
+                            )
+                            .when_some(bar, |this, bar| this.child(bar))
+                            .child(
+                                div()
+                                    .ml_auto()
+                                    .flex_none()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(rgb(ui::TEXT))
+                                    .child(value.clone()),
+                            ),
+                    );
+                }
             }
         }
+        let toggle_segment = |cx: &mut Context<Self>,
+                              id: &'static str,
+                              label: &'static str,
+                              active: bool|
+         -> Stateful<Div> {
+            div()
+                .id(id)
+                .debug_selector(move || format!("#{id}"))
+                .tab_index(0)
+                .px_2()
+                .py_1()
+                .text_xs()
+                .bg(rgb(if active {
+                    ui::PRIMARY_SURFACE
+                } else {
+                    ui::DEFAULT_SURFACE
+                }))
+                .text_color(rgb(if active {
+                    ui::PRIMARY_TEXT
+                } else {
+                    ui::TEXT_DIM
+                }))
+                .cursor_pointer()
+                .child(label)
+                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                        this.toggle_developed(&ToggleDeveloped, window, cx);
+                        cx.stop_propagation();
+                    }
+                }))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.toggle_developed(&ToggleDeveloped, window, cx);
+                }))
+        };
         div()
+            .id("develop-inspector")
+            .debug_selector(|| "#develop-inspector".to_owned())
             .w(px(DEVELOP_PANEL_WIDTH))
             .h_full()
             .flex_none()
             .flex()
             .flex_col()
-            .bg(rgb(0x15171c))
+            .bg(rgb(ui::PANEL))
             .border_l_1()
-            .border_color(rgb(0x30343d))
+            .border_color(rgb(ui::BORDER_STRONG))
             .child(
                 div()
-                    .h(px(54.0))
                     .flex_none()
                     .px_3()
-                    .flex()
-                    .flex_col()
-                    .justify_center()
+                    .py_3()
                     .border_b_1()
-                    .border_color(rgb(0x30343d))
-                    .child("Develop edits")
+                    .border_color(rgb(ui::BORDER))
                     .child(
                         div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .truncate()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(ui::TEXT_EMPHASIS))
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .id("develop-inspector-toggle")
+                                    .debug_selector(|| "#develop-inspector-toggle".to_owned())
+                                    .flex_none()
+                                    .flex()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(rgb(ui::BORDER_STRONG))
+                                    .overflow_hidden()
+                                    .child(toggle_segment(
+                                        cx,
+                                        "develop-toggle-developed",
+                                        "Developed",
+                                        self.developed,
+                                    ))
+                                    .child(toggle_segment(
+                                        cx,
+                                        "develop-toggle-baseline",
+                                        "Baseline",
+                                        !self.developed,
+                                    )),
+                            ),
+                    )
+                    .child({
+                        // Pair info per the Stage 2 plan bullet: show the
+                        // RAW+JPEG pair when the listing learned a companion.
+                        let pair = selected.as_ref().and_then(|path| {
+                            self.thumbnail_companions.get(path).map(|companion| {
+                                format!(
+                                    "{} + {}",
+                                    path.extension()
+                                        .map(|extension| extension.to_string_lossy().to_uppercase())
+                                        .unwrap_or_default(),
+                                    companion
+                                        .extension()
+                                        .map(|extension| extension.to_string_lossy().to_uppercase())
+                                        .unwrap_or_default(),
+                                )
+                            })
+                        });
+                        div()
+                            .mt_1()
+                            .min_w_0()
                             .truncate()
                             .text_xs()
-                            .text_color(rgb(0x9da7b6))
-                            .child(title),
-                    ),
+                            .text_color(rgb(ui::TEXT_DIM))
+                            .child(match pair {
+                                Some(pair) => {
+                                    format!(
+                                        "{pair} · imported from Lightroom · {} active edits",
+                                        rows.len()
+                                    )
+                                }
+                                None => {
+                                    format!("imported from Lightroom · {} active edits", rows.len())
+                                }
+                            })
+                    }),
             )
             .child(contents)
+            .into_any_element()
+    }
+
+    /// Opens the person-filtered grid (Stage 4b): the regular grid driven by
+    /// the person's confirmed photos, with every album feature.
+    fn open_person_grid(&mut self, person_id: i64, name: String, cx: &mut Context<Self>) {
+        if let Some(recursive) = &self.recursive_grid {
+            recursive.cancelled.store(true, Ordering::Release);
+        }
+        self.recursive_grid = None;
+        self.people_triage = None;
+        self.scheduler.clear_scope(TRIAGE_SCOPE);
+        self.person_grid_generation = self.person_grid_generation.wrapping_add(1);
+        self.person_grid_cancelled.store(true, Ordering::Release);
+        self.person_grid_cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled = self.person_grid_cancelled.clone();
+        let generation = self.person_grid_generation;
+        self.person_grid = Some(VirtualGrid::Person {
+            person_id,
+            name: name.clone(),
+            status: VirtualGridStatus::Loading,
+        });
+        self.grid_selection_mode = GridSelectionMode::Default;
+        self.viewer_paths = None;
+        self.directory_view_mode = DirectoryViewMode::Grid;
+        self.thumbnail_scroll
+            .scroll_to_item_strict(0, ScrollStrategy::Top);
+        let root = self.settings.root.clone();
+        let metadata_loader = self.metadata_loader.clone();
+        cx.spawn(async move |this, cx| {
+            let query = cx.background_executor().spawn({
+                let cancelled = cancelled.clone();
+                async move {
+                    catalog::people::person_confirmed_photos_cancellable(
+                        &root, person_id, cancelled,
+                    )
+                }
+            });
+            let result = query.await;
+            let load = this.update(cx, |this, _cx| {
+                if this.person_grid_generation != generation {
+                    return None;
+                }
+                let work = this.work.start("Loading person photos…");
+                Some((work, metadata_loader.clone(), result))
+            });
+            let Some((load_work, loader, result)) = load.ok().flatten() else {
+                return;
+            };
+            let images = match result {
+                Ok(paths) => {
+                    let images = cx.background_executor().spawn(async move {
+                        let mut metadata = loader.load_directory(paths, cancelled);
+                        discovery::sort_metadata(&mut metadata);
+                        let coordinates = metadata
+                            .iter()
+                            .filter_map(|entry| {
+                                entry
+                                    .coordinate
+                                    .map(|coordinate| (entry.path.clone(), coordinate))
+                            })
+                            .collect();
+                        let capture_times = metadata
+                            .iter()
+                            .filter_map(|entry| {
+                                entry
+                                    .capture_time
+                                    .or(entry.fallback_time)
+                                    .map(|time| (entry.path.clone(), time))
+                            })
+                            .collect();
+                        RecursiveImages {
+                            paths: metadata.into_iter().map(|entry| entry.path).collect(),
+                            coordinates,
+                            capture_times,
+                            companions: HashMap::new(),
+                        }
+                    });
+                    Ok(images.await)
+                }
+                Err(error) => Err(Arc::from(error.to_string())),
+            };
+            this.update(cx, |this, cx| {
+                this.work.finish(load_work);
+                if this.person_grid_generation != generation {
+                    return;
+                }
+                if let Some(VirtualGrid::Person { status, .. }) = &mut this.person_grid {
+                    *status = match images {
+                        Ok(images) => VirtualGridStatus::Loaded(images),
+                        Err(error) => VirtualGridStatus::Error(error),
+                    };
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Leaves the person-filtered grid, restoring the directory listing.
+    fn close_person_grid(&mut self, cx: &mut Context<Self>) {
+        self.person_grid_generation = self.person_grid_generation.wrapping_add(1);
+        self.person_grid_cancelled.store(true, Ordering::Release);
+        self.person_grid = None;
+        self.grid_selection_mode = GridSelectionMode::Default;
+        self.viewer_paths = None;
+        cx.notify();
+    }
+
+    /// Opens the face-review triage work queue for one person (Stage 4a).
+    fn open_people_triage(&mut self, person_id: i64, person_name: String, cx: &mut Context<Self>) {
+        self.begin_people_triage(
+            Some(person_id),
+            Some(person_name),
+            TriageQueueSource::Person,
+            cx,
+        );
+    }
+
+    /// Opens the whole-library review queue (the People mode's front
+    /// surface, mockup people-b): suggested faces across every person.
+    fn open_people_review_queue(&mut self, cx: &mut Context<Self>) {
+        self.begin_people_triage(None, None, TriageQueueSource::ReviewQueue, cx);
+    }
+
+    fn begin_people_triage(
+        &mut self,
+        person_id: Option<i64>,
+        person_name: Option<String>,
+        source: TriageQueueSource,
+        cx: &mut Context<Self>,
+    ) {
+        self.scheduler.clear_scope(TRIAGE_SCOPE);
+        // The triage lives inside People mode; a lingering person filter
+        // would keep the person header over it.
+        self.person_grid_generation = self.person_grid_generation.wrapping_add(1);
+        self.person_grid_cancelled.store(true, Ordering::Release);
+        self.person_grid = None;
+        self.people_triage_generation = self.people_triage_generation.wrapping_add(1);
+        self.people_triage_cancelled.store(true, Ordering::Release);
+        self.people_triage_cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled = self.people_triage_cancelled.clone();
+        let generation = self.people_triage_generation;
+        let root = self.settings.root.clone();
+        self.people_triage = Some(PeopleTriageState {
+            person_id,
+            person_name: person_name.clone(),
+            faces: Vec::new(),
+            cursor: 0,
+            switcher: Vec::new(),
+        });
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            // The page query consumes root/cancelled; the switcher gets its
+            // own clones.
+            let switcher_root = root.clone();
+            let switcher_cancelled = cancelled.clone();
+            let page = cx.background_executor().spawn(async move {
+                match source {
+                    TriageQueueSource::Person => {
+                        let page = catalog::people::list_person_faces_page_cancellable(
+                            &root,
+                            person_id.unwrap_or(0),
+                            None,
+                            0,
+                            500,
+                            cancelled.clone(),
+                        )?;
+                        Ok(catalog::people::FaceReviewPage {
+                            items: page
+                                .items
+                                .into_iter()
+                                .filter(|face| {
+                                    face.kind == catalog::people::FaceAssignmentKind::Suggested
+                                })
+                                .collect(),
+                            total: page.total,
+                            offset: page.offset,
+                        })
+                    }
+                    TriageQueueSource::ReviewQueue => {
+                        catalog::people::list_review_queue_page_cancellable(
+                            &root,
+                            None,
+                            0,
+                            500,
+                            cancelled.clone(),
+                        )
+                    }
+                }
+            });
+            // The rail's PEOPLE switcher lists everyone with pending
+            // suggestions, most first.
+            let switcher = cx.background_executor().spawn(async move {
+                catalog::people::list_people_page_sorted_cancellable(
+                    &switcher_root,
+                    None,
+                    catalog::people::PeopleSort::Review,
+                    0,
+                    40,
+                    HashMap::new(),
+                    switcher_cancelled,
+                )
+                .map(|page| {
+                    page.items
+                        .iter()
+                        .filter(|person| person.suggested_faces > 0)
+                        .map(|person| PeopleSwitcherEntry {
+                            person_id: person.id,
+                            name: person.name.clone(),
+                            suggested: person.suggested_faces.max(0) as u64,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+            });
+            let (page, switcher) = futures::future::join(page, switcher).await;
+            this.update(cx, |this, cx| {
+                if this.people_triage_generation != generation {
+                    return;
+                }
+                let Some(triage) = &mut this.people_triage else {
+                    return;
+                };
+                if let Ok(page) = page {
+                    triage.faces = page.items;
+                    triage.cursor = 0;
+                }
+                triage.switcher = switcher;
+                // Request the current face's crop now that the queue is
+                // loaded (the scope was cleared on entry).
+                this.refresh_triage_scope(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Leaves triage and rebuilds the people pages (counts changed). Returns
+    /// to the triaged person's page when it still exists.
+    fn exit_people_triage(&mut self, cx: &mut Context<Self>) {
+        self.scheduler.clear_scope(TRIAGE_SCOPE);
+        let person_id = self
+            .people_triage
+            .as_ref()
+            .and_then(|triage| triage.person_id);
+        self.people_triage_generation = self.people_triage_generation.wrapping_add(1);
+        self.people_triage_cancelled.store(true, Ordering::Release);
+        self.people_triage = None;
+        self.scheduler.clear_scope(TRIAGE_SCOPE);
+        if let Some(person_id) = person_id {
+            self.selected_person = Some(person_id);
+            self.people_special_page = None;
+            self.people_page = 0;
+        }
+        self.refresh_people_page(cx);
+        cx.notify();
+    }
+
+    /// Applies one decision to the triage's current face and advances. The
+    /// decision goes through the same batch pipeline the grid review uses.
+    fn decide_triage_current(&mut self, decision: PeopleDecision, cx: &mut Context<Self>) {
+        let Some(triage) = &self.people_triage else {
+            return;
+        };
+        let Some(face) = triage.current() else {
+            return;
+        };
+        let decisions = vec![(face.face_id, face.person_id, decision)];
+        let applied = self.apply_people_decision_batch(decisions, cx);
+        let Some(triage) = &mut self.people_triage else {
+            return;
+        };
+        if applied {
+            triage.cursor += 1;
+            self.refresh_triage_scope(cx);
+        }
+        cx.notify();
+    }
+
+    /// Moves the triage cursor within the loaded page (TriageLeft/Right).
+    fn move_triage_cursor(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(triage) = &mut self.people_triage else {
+            return;
+        };
+        let next = triage.cursor as isize + delta;
+        triage.cursor = next.clamp(0, triage.faces.len() as isize) as usize;
+        self.refresh_triage_scope(cx);
+        cx.notify();
+    }
+
+    /// Jumps the triage cursor to a filmstrip face (click UP NEXT).
+    fn jump_triage_cursor(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(triage) = &mut self.people_triage else {
+            return;
+        };
+        if index >= triage.faces.len() || index == triage.cursor {
+            return;
+        }
+        triage.cursor = index;
+        self.refresh_triage_scope(cx);
+        cx.notify();
+    }
+
+    /// Replaces the triage render scope with the current face's crop; called
+    /// after the main-view match (the directory arm borrows `&self`).
+    fn refresh_triage_scope(&mut self, cx: &mut Context<Self>) {
+        let Some(triage) = &self.people_triage else {
+            return;
+        };
+        let mut request = triage
+            .current()
+            .map(|face| {
+                (
+                    face.path.clone(),
+                    RenderVariant::face_crop(face.face_id, face.bounds, 640),
+                    JobPriority::INTERACTIVE,
+                )
+            })
+            .into_iter()
+            .collect::<Vec<_>>();
+        // The UP NEXT filmstrip previews the following faces at thumbnail
+        // size.
+        let upcoming: Vec<(PathBuf, RenderVariant)> = triage
+            .faces
+            .iter()
+            .skip(triage.cursor + 1)
+            .take(8)
+            .map(|face| {
+                (
+                    face.path.clone(),
+                    RenderVariant::face_crop(face.face_id, face.bounds, 128),
+                )
+            })
+            .collect();
+        for (path, variant) in upcoming {
+            request.push((path, variant, JobPriority::INTERACTIVE));
+        }
+        self.replace_render_scope(TRIAGE_SCOPE, request, cx);
+    }
+
+    fn render_people_triage(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(triage) = &self.people_triage else {
+            return div().into_any_element();
+        };
+        let remaining = triage.remaining();
+        let current_index = triage.cursor;
+        let current = triage.current().cloned();
+        let in_flight = !self.pending_people_decisions.is_empty();
+        let decision_error = self.people_decision_error.clone();
+        let mut center = div().flex().flex_col().items_center().justify_center();
+        if let Some(face) = current {
+            let confidence = face
+                .confidence
+                .map(|value| format!("{}%", (value * 100.0).round() as i64))
+                .unwrap_or_else(|| "—".to_owned());
+            let file_name = face.path.file_name().map_or_else(
+                || face.path.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            );
+            let identity = self.render_identity_for(&face.path);
+            let crop_variant = RenderVariant::face_crop(face.face_id, face.bounds, 640);
+            let state = self
+                .thumbnails
+                .state_for_variant(&face.path, identity, crop_variant);
+            let face_image = match state {
+                PreviewState::Loaded(preview) => img(preview.image.clone())
+                    .debug_selector(|| "#triage-face-image".to_owned())
+                    .max_w_full()
+                    .max_h_full()
+                    .into_any_element(),
+                PreviewState::Error(_) => div()
+                    .text_sm()
+                    .text_color(rgb(ui::TEXT_DIM))
+                    .child("Could not render this face")
+                    .into_any_element(),
+                _ => div().text_sm().child("Loading…").into_any_element(),
+            };
+            center = center
+                .child(
+                    div()
+                        .max_w(px(560.0))
+                        .max_h(px(560.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_lg()
+                        .overflow_hidden()
+                        .bg(rgb(ui::CANVAS_DEEP))
+                        .child(face_image),
+                )
+                .child(
+                    div()
+                        .mt_3()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_xs()
+                        .text_color(rgb(ui::TEXT_DIM))
+                        .child(
+                            div()
+                                .text_color(rgb(ui::SUCCESS))
+                                .child(match &face.person_name {
+                                    Some(name) => format!("suggested {name} · {confidence}"),
+                                    None => format!("suggested · {confidence}"),
+                                }),
+                        )
+                        .child(div().max_w(px(520.0)).truncate().child(file_name)),
+                )
+                .child(
+                    div()
+                        .mt_4()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .child(
+                            ui::button("triage-reject", "Reject — N", ui::ButtonVariant::Danger)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.people_grid_focus.focus(window);
+                                    this.decide_triage_current(PeopleDecision::Reject, cx);
+                                })),
+                        )
+                        .child(
+                            ui::button(
+                                "triage-not-a-face",
+                                "Not a face — E",
+                                ui::ButtonVariant::Default,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    this.people_grid_focus.focus(window);
+                                    this.decide_triage_current(PeopleDecision::NotFace, cx);
+                                },
+                            )),
+                        )
+                        .child(
+                            ui::button("triage-accept", "Accept — Y", ui::ButtonVariant::Primary)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.people_grid_focus.focus(window);
+                                    this.decide_triage_current(PeopleDecision::Confirm, cx);
+                                })),
+                        ),
+                );
+        } else {
+            center = center.child(
+                div()
+                    .p_6()
+                    .text_sm()
+                    .text_color(rgb(ui::TEXT_DIM))
+                    .child("No more suggestions for this person."),
+            );
+        }
+        let decision_error_line = decision_error.map(|error| {
+            div()
+                .mt_2()
+                .text_xs()
+                .text_color(rgb(0xf2b8b5))
+                .child(error.to_string())
+        });
+        div()
+            .id("people-triage")
+            .debug_selector(|| "#people-triage".to_owned())
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .bg(rgb(ui::CANVAS_DEEP))
+            .child({
+                div()
+                    .w(px(220.0))
+                    .flex_none()
+                    .h_full()
+                    .flex()
+                    .flex_col()
+                    .bg(rgb(ui::PANEL_SUNK))
+                    .border_r_1()
+                    .border_color(rgb(ui::BORDER))
+                    .child(
+                        div()
+                            .px_3()
+                            .py_3()
+                            .border_b_1()
+                            .border_color(rgb(ui::BORDER))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(ui::TEXT_EMPHASIS))
+                                    .child("Triage queue"),
+                            )
+                            .child(
+                                div().mt_1().text_xs().text_color(rgb(ui::TEXT_DIM)).child(
+                                    format!("{} remaining {}", remaining, triage.scope_label()),
+                                ),
+                            )
+                            .child(
+                                div()
+                                    .mt_2()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(
+                                        ui::button(
+                                            "triage-exit",
+                                            "Exit triage — Esc",
+                                            ui::ButtonVariant::Subtle,
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.exit_people_triage(cx);
+                                            }),
+                                        ),
+                                    )
+                                    .when_some(triage.person_id, |this, person_id| {
+                                        this.child(
+                                            ui::button(
+                                                "triage-browse-person",
+                                                "Browse photos",
+                                                ui::ButtonVariant::Default,
+                                            )
+                                            .on_click(
+                                                cx.listener(move |this, _, _, cx| {
+                                                    let name = this
+                                                        .people_triage
+                                                        .as_ref()
+                                                        .and_then(|triage| {
+                                                            triage.person_name.clone()
+                                                        })
+                                                        .unwrap_or_default();
+                                                    this.open_person_grid(person_id, name, cx);
+                                                }),
+                                            ),
+                                        )
+                                        .child(
+                                            ui::button(
+                                                "triage-manage-person",
+                                                "Manage faces",
+                                                ui::ButtonVariant::Subtle,
+                                            )
+                                            .on_click(
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.scheduler.clear_scope(TRIAGE_SCOPE);
+                                                    this.people_triage_generation = this
+                                                        .people_triage_generation
+                                                        .wrapping_add(1);
+                                                    this.people_triage_cancelled
+                                                        .store(true, Ordering::Release);
+                                                    this.people_triage = None;
+                                                    this.selected_person = Some(person_id);
+                                                    this.people_special_page = None;
+                                                    this.people_page = 0;
+                                                    this.refresh_people_page(cx);
+                                                    cx.notify();
+                                                }),
+                                            ),
+                                        )
+                                    })
+                                    .child(
+                                        ui::button(
+                                            "triage-all-people",
+                                            "All people",
+                                            ui::ButtonVariant::Subtle,
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.scheduler.clear_scope(TRIAGE_SCOPE);
+                                                this.people_triage_generation =
+                                                    this.people_triage_generation.wrapping_add(1);
+                                                this.people_triage_cancelled
+                                                    .store(true, Ordering::Release);
+                                                this.people_triage = None;
+                                                this.selected_person = None;
+                                                this.selected_person_name = None;
+                                                this.people_special_page = None;
+                                                this.people_page = 0;
+                                                this.refresh_people_page(cx);
+                                                cx.notify();
+                                            }),
+                                        ),
+                                    ),
+                            )
+                            .when_some(decision_error_line, |this, line| this.child(line)),
+                    )
+                    .when(!triage.switcher.is_empty(), |rail| {
+                        rail.child(
+                            div()
+                                .px_3()
+                                .pt_2()
+                                .pb_1()
+                                .text_xs()
+                                .text_color(rgb(ui::TEXT_FAINT))
+                                .child("PEOPLE"),
+                        )
+                        .child(
+                            div()
+                                .id("triage-switcher-list")
+                                .flex_1()
+                                .min_h_0()
+                                .flex()
+                                .flex_col()
+                                .overflow_y_scroll()
+                                .track_scroll(&self.triage_switcher_scroll)
+                                .children(triage.switcher.iter().enumerate().map(
+                                    |(index, entry)| {
+                                        let entry_id = entry.person_id;
+                                        let entry_name = entry.name.clone();
+                                        let active = triage.person_id == Some(entry_id);
+                                        div()
+                                            .id(("triage-switcher", index))
+                                            .debug_selector(move || {
+                                                format!("#triage-switcher-{}", entry.person_id)
+                                            })
+                                            .px_2()
+                                            .py_1()
+                                            .rounded_sm()
+                                            .text_sm()
+                                            .cursor_pointer()
+                                            .when(active, |this| this.bg(rgb(ui::ACCENT_SURFACE)))
+                                            .when(!active, |this| {
+                                                this.hover(|this| this.bg(rgb(ui::DEFAULT_SURFACE)))
+                                            })
+                                            .text_color(rgb(if active {
+                                                ui::TEXT_EMPHASIS
+                                            } else {
+                                                ui::TEXT_DIM
+                                            }))
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_between()
+                                                    .child(
+                                                        div()
+                                                            .min_w_0()
+                                                            .truncate()
+                                                            .child(entry.name.clone()),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .flex_none()
+                                                            .text_xs()
+                                                            .text_color(rgb(ui::TEXT_FAINT))
+                                                            .child(format!("{}", entry.suggested)),
+                                                    ),
+                                            )
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.open_people_triage(
+                                                    entry_id,
+                                                    entry_name.clone(),
+                                                    cx,
+                                                );
+                                            }))
+                                    },
+                                )),
+                        )
+                    })
+                    .child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .text_xs()
+                            .text_color(rgb(ui::TEXT_FAINT))
+                            .child(if in_flight {
+                                "saving review…"
+                            } else {
+                                "decisions save immediately"
+                            }),
+                    )
+            })
+            .child(
+                div()
+                    .id("people-triage-surface")
+                    .debug_selector(|| "#people-triage-surface".to_owned())
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .track_focus(&self.people_grid_focus)
+                    .key_context("PeopleTriage")
+                    .on_action(cx.listener(|this, _: &TriageExit, _, cx| {
+                        this.exit_people_triage(cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &TriageLeft, _, cx| {
+                        this.move_triage_cursor(-1, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &TriageRight, _, cx| {
+                        this.move_triage_cursor(1, cx);
+                    }))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        window.focus(&this.people_grid_focus);
+                        cx.notify();
+                    }))
+                    .child(center),
+            )
+            .when(!triage.faces.is_empty(), |this| {
+                this.child(
+                    // UP NEXT (mockup people-b): the following faces at
+                    // thumbnail size; clicking one jumps to it.
+                    div()
+                        .id("triage-filmstrip")
+                        .debug_selector(|| "#triage-filmstrip".to_owned())
+                        .w(px(150.0))
+                        .flex_none()
+                        .h_full()
+                        .overflow_y_scroll()
+                        .bg(rgb(ui::PANEL_SUNK))
+                        .border_l_1()
+                        .border_color(rgb(ui::BORDER))
+                        .child(
+                            div()
+                                .px_3()
+                                .py_2()
+                                .text_xs()
+                                .text_color(rgb(ui::TEXT_FAINT))
+                                .child("UP NEXT"),
+                        )
+                        .children(
+                            triage
+                                .faces
+                                .iter()
+                                .enumerate()
+                                .skip(current_index + 1)
+                                .take(8)
+                                .map(|(index, face)| {
+                                    let identity = self.render_identity_for(&face.path);
+                                    let variant =
+                                        RenderVariant::face_crop(face.face_id, face.bounds, 128);
+                                    let state = self
+                                        .thumbnails
+                                        .state_for_variant(&face.path, identity, variant);
+                                    let image = match state {
+                                        PreviewState::Loaded(preview) => img(preview.image.clone())
+                                            .max_w_full()
+                                            .max_h_full()
+                                            .into_any_element(),
+                                        PreviewState::Error(_) => div()
+                                            .text_xs()
+                                            .text_color(rgb(ui::TEXT_DIM))
+                                            .child("—")
+                                            .into_any_element(),
+                                        _ => div().text_xs().child("…").into_any_element(),
+                                    };
+                                    let person_label = face.person_name.clone().unwrap_or_default();
+                                    div()
+                                        .id(("triage-film-face", index))
+                                        .debug_selector(move || {
+                                            format!("#triage-film-face-{index}")
+                                        })
+                                        .mx_2()
+                                        .mb_2()
+                                        .p_1()
+                                        .rounded_md()
+                                        .bg(rgb(ui::CANVAS_DEEP))
+                                        .cursor_pointer()
+                                        .hover(|this| this.bg(rgb(ui::ACCENT_SURFACE)))
+                                        .flex()
+                                        .flex_col()
+                                        .child(
+                                            div()
+                                                .size_full()
+                                                .max_h(px(96.0))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .overflow_hidden()
+                                                .child(image),
+                                        )
+                                        .child(
+                                            div()
+                                                .mt_1()
+                                                .text_xs()
+                                                .text_color(rgb(ui::TEXT_FAINT))
+                                                .truncate()
+                                                .child(person_label),
+                                        )
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.jump_triage_cursor(index, cx);
+                                        }))
+                                }),
+                        ),
+                )
+            })
             .into_any_element()
     }
 
@@ -11331,6 +12643,10 @@ fn speculative_indices(
 
 impl Render for PictureBrowser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.tour_start_pending {
+            self.tour_start_pending = false;
+            screenshot_tour::maybe_start(window, cx);
+        }
         self.job_queue_snapshot = self.scheduler.snapshot();
         self.face_job_queue_snapshot = self.face_analysis.snapshot();
         self.recognition_job_queue_snapshot = self.recognition_refresh.snapshot();
@@ -11348,6 +12664,21 @@ impl Render for PictureBrowser {
             self.refresh_maintenance_diagnostics(cx);
             self.schedule_maintenance_throughput_expiry(cx);
         }
+        let scheduler_jobs = self
+            .job_queue_snapshot
+            .jobs
+            .iter()
+            .filter(|job| !job.cancelled)
+            .count()
+            + face_jobs.queued
+            + face_jobs.running
+            + recognition_jobs.queued
+            + recognition_jobs.running
+            + summary_jobs.queued
+            + summary_jobs.running;
+        if self.show_job_queue || scheduler_jobs > 0 || self.work.active > 0 {
+            self.schedule_scheduler_refresh(cx);
+        }
         let face_throughput = face_jobs.completed_last_minute;
         let face_instrumentation = self.face_analysis.instrumentation();
         let durable_face_summary = self
@@ -11361,7 +12692,7 @@ impl Render for PictureBrowser {
                         face_instrumentation.active_inference,
                         face_instrumentation.engines_constructed,
                         summary_jobs.queued,
-                        summary_jobs.running
+                        summary_jobs.running,
                     )
                 },
                 |diagnostics| {
@@ -11404,27 +12735,7 @@ impl Render for PictureBrowser {
             admission.waiters,
             admission.advertised,
         );
-        let scheduler_jobs = self
-            .job_queue_snapshot
-            .jobs
-            .iter()
-            .filter(|job| !job.cancelled)
-            .count()
-            + usize::from(self.map_job.is_some())
-            + face_jobs.queued
-            + face_jobs.running
-            + recognition_jobs.queued
-            + recognition_jobs.running
-            + summary_jobs.queued
-            + summary_jobs.running;
-        if self.show_job_queue || scheduler_jobs > 0 || self.work.active > 0 {
-            self.schedule_scheduler_refresh(cx);
-        }
-        let inspector_width = if self.show_job_queue {
-            JOB_QUEUE_PANEL_WIDTH
-        } else {
-            0.0
-        } + if self.show_develop_inspector {
+        let inspector_width = if self.show_develop_inspector {
             DEVELOP_PANEL_WIDTH
         } else {
             0.0
@@ -11453,11 +12764,29 @@ impl Render for PictureBrowser {
             - inspector_width
             - 29.0)
             .max(self.thumbnail_width as f32);
+        // Import mode renders its own footer; the global strip's per-file
+        // render labels would only cover it up. Map renders are excluded so
+        // the dock doesn't tick in and out on every pan/zoom cycle (each map
+        // render would otherwise flash the bar and resize the canvas
+        // mid-pan).
+        let progress_active = self.directory_view_mode != DirectoryViewMode::Import
+            && (self.work.active > 0 || scheduler_jobs > 0);
         let menu_height = if USE_IN_WINDOW_MENU { 29.0 } else { 0.0 };
+        // The dock bar (26px + 1px border) and the open drawer overlay the
+        // workspace bottom; reserving their height keeps the map canvas
+        // stable instead of re-fitting under the dock on every toggle.
+        let dock_reserve = if self.show_job_queue {
+            27.0 + 296.0
+        } else if progress_active {
+            27.0
+        } else {
+            0.0
+        };
         let map_width = main_width.round().max(1.0) as u32;
-        let map_height = (f32::from(window.viewport_size().height) - menu_height - 44.0)
-            .round()
-            .max(1.0) as u32;
+        let map_height =
+            (f32::from(window.viewport_size().height) - menu_height - 44.0 - dock_reserve)
+                .round()
+                .max(1.0) as u32;
         self.map_view_origin = (self.sidebar_width + 5.0, menu_height + 44.0);
         if self.directory_view_mode == DirectoryViewMode::Map
             && self.map_render_size != (map_width, map_height)
@@ -11468,10 +12797,7 @@ impl Render for PictureBrowser {
             }
             cx.defer_in(window, |this, _, cx| this.request_map_render(cx));
         }
-        self.grid_columns = ((main_width + THUMBNAIL_GAP)
-            / (self.thumbnail_width as f32 + THUMBNAIL_GAP))
-            .floor()
-            .max(1.0) as usize;
+        self.grid_columns = grid_columns_for(main_width, self.thumbnail_width);
         let tree_scrollbar =
             self.render_scrollbar("tree-scrollbar", ScrollbarTarget::Tree, &self.scroll, cx);
         let grid_scrollbar = self.render_scrollbar(
@@ -11522,7 +12848,7 @@ impl Render for PictureBrowser {
         {
             self.people_accessibility.deactivate();
         }
-        let (title, show_back, main_content) = match &self.main_view {
+        let (header_title, show_back, main_content) = match &self.main_view {
             MainView::Image(state) => {
                 let path = state.path.clone();
                 let context_path = path.clone();
@@ -11575,10 +12901,13 @@ impl Render for PictureBrowser {
                     _ => div().text_sm().child("Loading…").into_any_element(),
                 };
                 (
-                    path.file_name()
-                        .unwrap_or(path.as_os_str())
-                        .to_string_lossy()
-                        .into_owned(),
+                    HeaderTitle::Image {
+                        filename: path
+                            .file_name()
+                            .unwrap_or(path.as_os_str())
+                            .to_string_lossy()
+                            .into_owned(),
+                    },
                     true,
                     div()
                         .id("image-viewport")
@@ -11632,16 +12961,26 @@ impl Render for PictureBrowser {
                     });
                 let capture_order_available =
                     !recursive_active && self.model.has_pending_capture_order(self.selected);
+                // Selection/recursive banners are grid-only features (C3):
+                // Map, People, and Import must never render them. The
+                // person-filtered listing has its own order and shows none.
+                let grid_scoped = self.directory_view_mode == DirectoryViewMode::Grid
+                    && self.person_grid.is_none();
                 let (viewer_banner, merged_viewer_banner, editor_banner) =
                     if self.recursive_grid.is_some() {
                         (None, self.merged_viewer_banner_state(), None)
                     } else {
                         (self.viewer_banner_state(), None, self.editor_banner_state())
                     };
-                let ordering_suffix = if ordering_pending {
-                    " · loading capture metadata…"
+                // Banners belong to the plain grid only (C3): the person
+                // listing orders by capture time already, and Map/People/
+                // Import never render selection chrome.
+                let recursive_active = recursive_active && grid_scoped;
+                let capture_order_available = capture_order_available && grid_scoped;
+                let (viewer_banner, merged_viewer_banner, editor_banner) = if grid_scoped {
+                    (viewer_banner, merged_viewer_banner, editor_banner)
                 } else {
-                    ""
+                    (None, None, None)
                 };
                 let thumbnail_grid = || {
                     uniform_list(
@@ -11654,7 +12993,33 @@ impl Render for PictureBrowser {
                     .with_sizing_behavior(ListSizingBehavior::Auto)
                     .into_any_element()
                 };
-                let grid_content = if let Some(recursive) = recursive {
+                let grid_content = if let Some(VirtualGrid::Person { status, .. }) =
+                    &self.person_grid
+                {
+                    // Person-filtered listing (Stage 4b): already capture-
+                    // time ordered, so no directory banners apply.
+                    match status {
+                        VirtualGridStatus::Loading => div()
+                            .p_6()
+                            .text_sm()
+                            .child("Loading photos…")
+                            .into_any_element(),
+                        VirtualGridStatus::Error(error) => div()
+                            .p_6()
+                            .text_sm()
+                            .text_color(rgb(0xf2b8b5))
+                            .child(format!("Could not load photos: {error}"))
+                            .into_any_element(),
+                        VirtualGridStatus::Loaded(_) if count == 0 => div()
+                            .id("person-grid-empty")
+                            .debug_selector(|| "#person-grid-empty".to_owned())
+                            .p_6()
+                            .text_sm()
+                            .child("No confirmed photos for this person yet.")
+                            .into_any_element(),
+                        VirtualGridStatus::Loaded(_) => thumbnail_grid(),
+                    }
+                } else if let Some(recursive) = recursive {
                     match &recursive.status {
                         RecursiveGridStatus::Loading => div()
                             .p_6()
@@ -11779,7 +13144,13 @@ impl Render for PictureBrowser {
                 let directory_content = match self.directory_view_mode {
                     DirectoryViewMode::Grid => grid_content,
                     DirectoryViewMode::Map => self.render_map_view(cx),
-                    DirectoryViewMode::People => self.render_people_view(window, cx),
+                    DirectoryViewMode::People => {
+                        if self.people_triage.is_some() {
+                            self.render_people_triage(cx)
+                        } else {
+                            self.render_people_view(window, cx)
+                        }
+                    }
                     DirectoryViewMode::Import => self.render_import_view(cx),
                 };
                 let content = div()
@@ -11815,6 +13186,20 @@ impl Render for PictureBrowser {
                                             this.stop_recursive_grid(cx);
                                         })),
                                 ),
+                        )
+                    })
+                    .when(ordering_pending && grid_scoped, |this| {
+                        // Async metadata enrichment must not shift header
+                        // layout — the pending notice lives on the grid
+                        // surface it describes (C3).
+                        this.child(
+                            div()
+                                .flex_none()
+                                .px_4()
+                                .py_1()
+                                .text_xs()
+                                .text_color(rgb(0x9da7b6))
+                                .child("Loading capture metadata…"),
                         )
                     })
                     .when(capture_order_available, |this| {
@@ -11994,17 +13379,386 @@ impl Render for PictureBrowser {
                             ),
                     )
                     .into_any_element();
-                (
-                    format!(
-                        "{} — {} selected{}",
-                        path.display(),
-                        selection.indices.len(),
-                        ordering_suffix
-                    ),
-                    false,
-                    content,
-                )
+                let header_title = if let Some(VirtualGrid::Person { name, .. }) = &self.person_grid
+                {
+                    HeaderTitle::Person {
+                        name: name.clone(),
+                        photos: count,
+                        selected: selection.indices.len(),
+                    }
+                } else {
+                    // Breadcrumb chain from the library root to the current
+                    // directory (C5): the header shows folder names, not
+                    // paths. ensure_node is idempotent (dedup by path), so
+                    // resolving ancestors during render never duplicates
+                    // nodes.
+                    let mut crumbs = Vec::new();
+                    let root = self.settings.root.clone();
+                    crumbs.push(HeaderCrumb {
+                        label: path_display_name(&root),
+                        node: self.model.ensure_node(root.clone()),
+                    });
+                    if let Ok(relative) = path.strip_prefix(&root) {
+                        let mut ancestor = root.clone();
+                        for component in relative.components() {
+                            ancestor.push(component);
+                            let label = component.as_os_str().to_string_lossy().into_owned();
+                            let node = self.model.ensure_node(ancestor.clone());
+                            crumbs.push(HeaderCrumb { label, node });
+                        }
+                    }
+                    HeaderTitle::Dir {
+                        crumbs,
+                        photos: count,
+                        selected: selection.indices.len(),
+                        full_path: path.clone(),
+                    }
+                };
+                let header_title = match &self.person_grid {
+                    Some(VirtualGrid::Person { name, status, .. }) => {
+                        let photos = match status {
+                            VirtualGridStatus::Loaded(images) => images.paths.len(),
+                            _ => 0,
+                        };
+                        HeaderTitle::Person {
+                            name: name.clone(),
+                            photos,
+                            selected: selection.indices.len(),
+                        }
+                    }
+                    _ => header_title,
+                };
+                (header_title, false, content)
             }
+        };
+        let header = {
+            let mut header = div()
+                .id("app-header")
+                .debug_selector(|| "#app-header".to_owned())
+                .h(px(44.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .px_4()
+                .bg(rgb(ui::CANVAS))
+                .border_b_1()
+                .border_color(rgb(ui::BORDER_STRONG))
+                .text_sm()
+                .text_color(rgb(ui::TEXT));
+            header = header.when(show_back, |this| {
+                this.child(
+                    div()
+                        .id("back-to-directory")
+                        .mr_3()
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .bg(rgb(0x30343d))
+                        .hover(|this| this.bg(rgb(0x445066)))
+                        .child("← Back")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.close_image(&CloseImage, window, cx);
+                        })),
+                )
+            });
+            header = header.child(match &header_title {
+                HeaderTitle::Image { filename } => div()
+                    .min_w_0()
+                    .truncate()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(ui::TEXT_EMPHASIS))
+                    .child(filename.clone())
+                    .into_any_element(),
+                HeaderTitle::Dir {
+                    crumbs,
+                    photos,
+                    selected,
+                    full_path,
+                } => {
+                    let last = crumbs.len().saturating_sub(1);
+                    let tooltip_path = full_path.display().to_string();
+                    let mut row = div()
+                        .id("header-crumbs")
+                        .flex()
+                        .items_center()
+                        .min_w_0()
+                        .tooltip(move |_, cx| {
+                            cx.new(|_| TextTooltip {
+                                text: tooltip_path.clone().into(),
+                            })
+                            .into()
+                        });
+                    for (index, crumb) in crumbs.iter().enumerate() {
+                        if index > 0 {
+                            row = row.child(
+                                div()
+                                    .mx_1()
+                                    .text_xs()
+                                    .text_color(rgb(ui::TEXT_FAINT))
+                                    .child("›"),
+                            );
+                        }
+                        let node = crumb.node;
+                        let is_last = index == last;
+                        row = row.child(
+                            div()
+                                .id(("header-crumb", index))
+                                .debug_selector(move || format!("#header-crumb-{index}"))
+                                .px_1()
+                                .rounded_sm()
+                                .min_w_0()
+                                .truncate()
+                                .cursor_pointer()
+                                .font_weight(if is_last {
+                                    FontWeight::SEMIBOLD
+                                } else {
+                                    FontWeight::NORMAL
+                                })
+                                .text_color(rgb(if is_last {
+                                    ui::TEXT_EMPHASIS
+                                } else {
+                                    ui::TEXT_DIM
+                                }))
+                                .when(!is_last, |this| {
+                                    this.hover(|this| this.bg(rgb(ui::ACCENT_SURFACE)))
+                                })
+                                .child(crumb.label.clone())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.select(node, cx);
+                                })),
+                        );
+                    }
+                    row = row.child(
+                        ui::chip(photo_count_label(*photos), ui::ChipVariant::Default)
+                            .id("header-photo-count")
+                            .debug_selector(|| "#header-photo-count".to_owned())
+                            .flex_none()
+                            .ml_3(),
+                    );
+                    row = row.when(*selected > 0, |this| {
+                        this.child(
+                            ui::chip(format!("{selected} selected"), ui::ChipVariant::Info)
+                                .id("header-selected-chip")
+                                .debug_selector(|| "#header-selected-chip".to_owned())
+                                .flex_none()
+                                .ml_2(),
+                        )
+                    });
+                    row.into_any_element()
+                }
+                HeaderTitle::Person {
+                    name,
+                    photos,
+                    selected,
+                } => {
+                    let mut row = div()
+                        .id("header-person")
+                        .debug_selector(|| "#header-person".to_owned())
+                        .flex()
+                        .items_center()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .w(px(26.0))
+                                .h(px(26.0))
+                                .flex_none()
+                                .rounded_full()
+                                .bg(rgb(ui::ACCENT_SURFACE)),
+                        )
+                        .child(
+                            div()
+                                .ml_2()
+                                .truncate()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(ui::TEXT_EMPHASIS))
+                                .child(name.clone()),
+                        )
+                        .child(
+                            ui::chip(photo_count_label(*photos), ui::ChipVariant::Default)
+                                .id("header-photo-count")
+                                .debug_selector(|| "#header-photo-count".to_owned())
+                                .flex_none()
+                                .ml_3(),
+                        )
+                        .child(
+                            ui::button(
+                                "person-filter-close",
+                                "person filter ✕",
+                                ui::ButtonVariant::Default,
+                            )
+                            .flex_none()
+                            .ml_2()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.close_person_grid(cx);
+                            })),
+                        );
+                    row = row.when(*selected > 0, |this| {
+                        this.child(
+                            ui::chip(format!("{selected} selected"), ui::ChipVariant::Info)
+                                .id("header-selected-chip")
+                                .debug_selector(|| "#header-selected-chip".to_owned())
+                                .flex_none()
+                                .ml_2(),
+                        )
+                    });
+                    row.into_any_element()
+                }
+            });
+            header = header.child(div().flex_1());
+            header = header
+                .when(
+                    !show_back
+                        && self.settings.map_switcher_placement
+                            == config::MapSwitcherPlacement::Header,
+                    |this| {
+                        this.child(
+                            div()
+                                .flex()
+                                .flex_none()
+                                .mr_3()
+                                .rounded_sm()
+                                .bg(rgb(0x252932))
+                                .child(
+                                    div()
+                                        .id("show-grid-view")
+                                        .debug_selector(|| "#show-grid-view".to_owned())
+                                        .tab_index(0)
+                                        .px_3()
+                                        .py_1()
+                                        .rounded_sm()
+                                        .bg(rgb(
+                                            if self.directory_view_mode == DirectoryViewMode::Grid {
+                                                0x46658c
+                                            } else {
+                                                0x30343d
+                                            },
+                                        ))
+                                        .child("Grid")
+                                        .on_key_down(cx.listener(
+                                            |this, event: &gpui::KeyDownEvent, _, cx| {
+                                                if matches!(
+                                                    event.keystroke.key.as_str(),
+                                                    "enter" | "space"
+                                                ) {
+                                                    this.set_directory_view_mode(
+                                                        DirectoryViewMode::Grid,
+                                                        cx,
+                                                    );
+                                                    cx.stop_propagation();
+                                                }
+                                            },
+                                        ))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.set_directory_view_mode(
+                                                DirectoryViewMode::Grid,
+                                                cx,
+                                            );
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id("show-map-view")
+                                        .debug_selector(|| "#show-map-view".to_owned())
+                                        .tab_index(0)
+                                        .px_3()
+                                        .py_1()
+                                        .rounded_sm()
+                                        .bg(rgb(
+                                            if self.directory_view_mode == DirectoryViewMode::Map {
+                                                0x46658c
+                                            } else {
+                                                0x30343d
+                                            },
+                                        ))
+                                        .child("Map")
+                                        .on_key_down(cx.listener(
+                                            |this, event: &gpui::KeyDownEvent, _, cx| {
+                                                if matches!(
+                                                    event.keystroke.key.as_str(),
+                                                    "enter" | "space"
+                                                ) {
+                                                    this.set_directory_view_mode(
+                                                        DirectoryViewMode::Map,
+                                                        cx,
+                                                    );
+                                                    cx.stop_propagation();
+                                                }
+                                            },
+                                        ))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.set_directory_view_mode(
+                                                DirectoryViewMode::Map,
+                                                cx,
+                                            );
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id("show-people-view")
+                                        .debug_selector(|| "#show-people-view".to_owned())
+                                        .tab_index(0)
+                                        .track_focus(&self.people_view_switch_focus)
+                                        .px_3()
+                                        .py_1()
+                                        .rounded_sm()
+                                        .bg(rgb(
+                                            if self.directory_view_mode == DirectoryViewMode::People
+                                            {
+                                                0x46658c
+                                            } else {
+                                                0x30343d
+                                            },
+                                        ))
+                                        .child("People")
+                                        .on_key_down(cx.listener(
+                                            |this, event: &gpui::KeyDownEvent, _, cx| {
+                                                if matches!(
+                                                    event.keystroke.key.as_str(),
+                                                    "enter" | "space"
+                                                ) {
+                                                    this.set_directory_view_mode(
+                                                        DirectoryViewMode::People,
+                                                        cx,
+                                                    );
+                                                    cx.stop_propagation();
+                                                }
+                                            },
+                                        ))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.set_directory_view_mode(
+                                                DirectoryViewMode::People,
+                                                cx,
+                                            );
+                                        })),
+                                ),
+                        )
+                    },
+                )
+                .when(
+                    matches!(self.main_view, MainView::Dir(..))
+                        && self.directory_view_mode == DirectoryViewMode::Grid,
+                    |this| this.children(self.render_selections_toolbar(cx)),
+                )
+                .child(
+                    ui::chip(
+                        if has_active_recipe {
+                            "Developed"
+                        } else {
+                            "Baseline"
+                        },
+                        if has_active_recipe {
+                            ui::ChipVariant::Info
+                        } else {
+                            ui::ChipVariant::Default
+                        },
+                    )
+                    .id("header-developed")
+                    .debug_selector(|| "#header-developed".to_owned())
+                    .flex_none()
+                    .ml_2(),
+                );
+            header
         };
         let main_view =
             div()
@@ -12026,198 +13780,7 @@ impl Render for PictureBrowser {
                 .on_action(cx.listener(Self::grid_extend_right))
                 .on_action(cx.listener(Self::grid_extend_up))
                 .on_action(cx.listener(Self::grid_extend_down))
-                .bg(rgb(0x101217))
-                .child(
-                    div()
-                        .h(px(44.0))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .px_4()
-                        .border_b_1()
-                        .border_color(rgb(0x30343d))
-                        .text_sm()
-                        .text_color(rgb(0xaeb4bf))
-                        .when(show_back, |this| {
-                            this.child(
-                                div()
-                                    .id("back-to-directory")
-                                    .mr_3()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_sm()
-                                    .bg(rgb(0x30343d))
-                                    .hover(|this| this.bg(rgb(0x445066)))
-                                    .child("← Back")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.close_image(&CloseImage, window, cx);
-                                    })),
-                            )
-                        })
-                        .child(title)
-                        .child(div().flex_1())
-                        .when(
-                            !show_back
-                                && self.settings.map_switcher_placement
-                                    == config::MapSwitcherPlacement::Header,
-                            |this| {
-                                this.child(
-                                    div()
-                                        .flex()
-                                        .mr_3()
-                                        .rounded_sm()
-                                        .bg(rgb(0x252932))
-                                        .child(
-                                            div()
-                                                .id("show-grid-view")
-                                                .debug_selector(|| "#show-grid-view".to_owned())
-                                                .tab_index(0)
-                                                .px_3()
-                                                .py_1()
-                                                .rounded_sm()
-                                                .bg(rgb(
-                                                    if self.directory_view_mode
-                                                        == DirectoryViewMode::Grid
-                                                    {
-                                                        0x46658c
-                                                    } else {
-                                                        0x30343d
-                                                    },
-                                                ))
-                                                .child("Grid")
-                                                .on_key_down(cx.listener(
-                                                    |this, event: &gpui::KeyDownEvent, _, cx| {
-                                                        if matches!(
-                                                            event.keystroke.key.as_str(),
-                                                            "enter" | "space"
-                                                        ) {
-                                                            this.set_directory_view_mode(
-                                                                DirectoryViewMode::Grid,
-                                                                cx,
-                                                            );
-                                                            cx.stop_propagation();
-                                                        }
-                                                    },
-                                                ))
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.set_directory_view_mode(
-                                                        DirectoryViewMode::Grid,
-                                                        cx,
-                                                    );
-                                                })),
-                                        )
-                                        .child(
-                                            div()
-                                                .id("show-map-view")
-                                                .debug_selector(|| "#show-map-view".to_owned())
-                                                .tab_index(0)
-                                                .px_3()
-                                                .py_1()
-                                                .rounded_sm()
-                                                .bg(rgb(
-                                                    if self.directory_view_mode
-                                                        == DirectoryViewMode::Map
-                                                    {
-                                                        0x46658c
-                                                    } else {
-                                                        0x30343d
-                                                    },
-                                                ))
-                                                .child("Map")
-                                                .on_key_down(cx.listener(
-                                                    |this, event: &gpui::KeyDownEvent, _, cx| {
-                                                        if matches!(
-                                                            event.keystroke.key.as_str(),
-                                                            "enter" | "space"
-                                                        ) {
-                                                            this.set_directory_view_mode(
-                                                                DirectoryViewMode::Map,
-                                                                cx,
-                                                            );
-                                                            cx.stop_propagation();
-                                                        }
-                                                    },
-                                                ))
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.set_directory_view_mode(
-                                                        DirectoryViewMode::Map,
-                                                        cx,
-                                                    );
-                                                })),
-                                        )
-                                        .child(
-                                            div()
-                                                .id("show-people-view")
-                                                .debug_selector(|| "#show-people-view".to_owned())
-                                                .tab_index(0)
-                                                .track_focus(&self.people_view_switch_focus)
-                                                .px_3()
-                                                .py_1()
-                                                .rounded_sm()
-                                                .bg(rgb(
-                                                    if self.directory_view_mode
-                                                        == DirectoryViewMode::People
-                                                    {
-                                                        0x46658c
-                                                    } else {
-                                                        0x30343d
-                                                    },
-                                                ))
-                                                .child("People")
-                                                .on_key_down(cx.listener(
-                                                    |this, event: &gpui::KeyDownEvent, _, cx| {
-                                                        if matches!(
-                                                            event.keystroke.key.as_str(),
-                                                            "enter" | "space"
-                                                        ) {
-                                                            this.set_directory_view_mode(
-                                                                DirectoryViewMode::People,
-                                                                cx,
-                                                            );
-                                                            cx.stop_propagation();
-                                                        }
-                                                    },
-                                                ))
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.set_directory_view_mode(
-                                                        DirectoryViewMode::People,
-                                                        cx,
-                                                    );
-                                                })),
-                                        ),
-                                )
-                            },
-                        )
-                        .when(
-                            matches!(self.main_view, MainView::Dir(..))
-                                && self.directory_view_mode == DirectoryViewMode::Grid,
-                            |this| this.children(self.render_selections_toolbar(cx)),
-                        )
-                        .child(
-                            div()
-                                .id("toggle-developed")
-                                .debug_selector(|| "#toggle-developed".to_owned())
-                                .px_2()
-                                .py_1()
-                                .rounded_sm()
-                                .bg(rgb(if has_active_recipe {
-                                    0x36547a
-                                } else {
-                                    0x30343d
-                                }))
-                                .hover(|this| this.bg(rgb(0x445066)))
-                                .child(if has_active_recipe {
-                                    "Developed"
-                                } else if self.developed {
-                                    "Baseline (no adjustments)"
-                                } else {
-                                    "Baseline"
-                                })
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.toggle_developed(&ToggleDeveloped, window, cx);
-                                })),
-                        ),
-                )
+                .bg(rgb(ui::CANVAS))
                 .child(
                     div()
                         .flex_1()
@@ -12287,9 +13850,11 @@ impl Render for PictureBrowser {
                     cx.notify();
                 }),
             );
-        let develop_inspector = self
-            .show_develop_inspector
-            .then(|| self.render_develop_inspector());
+        let develop_inspector = if self.show_develop_inspector {
+            Some(self.render_develop_inspector(cx))
+        } else {
+            None
+        };
         let workspace = div()
             .w_full()
             .h_full()
@@ -12312,116 +13877,7 @@ impl Render for PictureBrowser {
                 |this| this.child(tree).child(splitter),
             )
             .child(main_view)
-            .when_some(develop_inspector, |this, panel| this.child(panel))
-            .when(self.show_job_queue, |this| {
-                this.child(
-                    div()
-                        .w(px(JOB_QUEUE_PANEL_WIDTH))
-                        .h_full()
-                        .flex_none()
-                        .flex()
-                        .flex_col()
-                        .bg(rgb(0x15171c))
-                        .border_l_1()
-                        .border_color(rgb(0x30343d))
-                        .child(
-                            div()
-                                .h(px(42.0))
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .px_3()
-                                .border_b_1()
-                                .border_color(rgb(0x30343d))
-                                .child("Job queue")
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(0x778292))
-                                        .child(durable_face_summary.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(0x778292))
-                                        .child(admission_summary.clone()),
-                                )
-                                .child(div().text_xs().text_color(rgb(0x9da7b6)).child(format!(
-                                    "{} running · {} queued",
-                                    self.job_queue_snapshot.running
-                                        + self.face_analysis.stats().running
-                                        + self.recognition_refresh.stats().running
-                                        + self.people_summary_rebuild.stats().running
-                                        + usize::from(self.map_job.as_ref().is_some_and(|job| {
-                                            job.status == MapJobStatus::Running
-                                        })),
-                                    self.job_queue_snapshot.queued
-                                        + self.face_analysis.stats().queued
-                                        + self.recognition_refresh.stats().queued
-                                        + self.people_summary_rebuild.stats().queued
-                                        + usize::from(self.map_job.as_ref().is_some_and(|job| {
-                                            job.status == MapJobStatus::Queued
-                                        }))
-                                )))
-                                .child(
-                                    div()
-                                        .id("job-queue-face-analysis-toggle")
-                                        .debug_selector(|| {
-                                            "#job-queue-face-analysis-toggle".to_owned()
-                                        })
-                                        .tab_index(0)
-                                        .ml_2()
-                                        .px_2()
-                                        .py_1()
-                                        .rounded_sm()
-                                        .bg(rgb(0x30343d))
-                                        .cursor_pointer()
-                                        .child(if self.face_analysis_paused {
-                                            "Resume faces"
-                                        } else {
-                                            "Pause faces"
-                                        })
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.face_analysis_paused = !this.face_analysis_paused;
-                                            this.face_analysis
-                                                .set_paused(this.face_analysis_paused);
-                                            this.recognition_refresh
-                                                .set_paused(this.face_analysis_paused);
-                                            this.people_summary_rebuild
-                                                .set_paused(this.face_analysis_paused);
-                                            if !this.face_analysis_paused {
-                                                this.refresh_face_inventory(cx);
-                                            }
-                                            cx.notify();
-                                        })),
-                                ),
-                        )
-                        .child(
-                            uniform_list(
-                                "job-queue-rows",
-                                self.job_queue_snapshot.jobs.len()
-                                    + usize::from(self.map_job.is_some())
-                                    + usize::from(
-                                        self.face_inventory_progress.stage.load(Ordering::Acquire)
-                                            != 0,
-                                    )
-                                    + self.face_job_queue_snapshot.len()
-                                    + self.recognition_job_queue_snapshot.len()
-                                    + self.summary_job_queue_snapshot.len(),
-                                cx.processor(Self::render_job_queue_rows),
-                            )
-                            .flex_1()
-                            .min_h_0()
-                            .track_scroll(self.job_queue_scroll.clone())
-                            .with_sizing_behavior(ListSizingBehavior::Auto),
-                        ),
-                )
-            });
-        // Import mode renders its own footer; the global strip's per-file
-        // render labels would only cover it up.
-        let progress_active = self.directory_view_mode != DirectoryViewMode::Import
-            && (self.work.active > 0 || scheduler_jobs > 0 || self.map_job.is_some());
+            .when_some(develop_inspector, |this, panel| this.child(panel));
         let progress = if let Some(inventory) = self.face_inventory_progress.fraction() {
             inventory.clamp(0.005, 1.0)
         } else if self.work.active > 0 {
@@ -12449,7 +13905,11 @@ impl Render for PictureBrowser {
                 face_queue_progress_label(&self.face_job_queue_snapshot, diagnostics)
             })
             .or_else(|| self.work.current_activity().map(str::to_owned))
-            .unwrap_or_else(|| "Running background tasks…".to_owned());
+            .unwrap_or_else(|| {
+                // Render work is in flight but no lane named it; state the
+                // actual work instead of an optimistic generic.
+                format!("Rendering images · {} in flight", self.work.active)
+            });
         let menu_bar = div()
             .h(px(30.0))
             .w_full()
@@ -12499,46 +13959,6 @@ impl Render for PictureBrowser {
                         cx.notify();
                     })),
             );
-        let content = div()
-            .w_full()
-            .flex_1()
-            .min_h_0()
-            .relative()
-            .child(workspace)
-            .when(progress_active, |this| {
-                this.child(
-                    div()
-                        .debug_selector(|| "#background-progress".to_owned())
-                        .absolute()
-                        .left_0()
-                        .right_0()
-                        .bottom_0()
-                        .h(px(22.0))
-                        .bg(rgb(0x181a20))
-                        .border_t_1()
-                        .border_color(rgb(0x30343d))
-                        .child(
-                            div()
-                                .absolute()
-                                .left_0()
-                                .top_0()
-                                .bottom_0()
-                                .w(relative(progress))
-                                .bg(rgb(0x315b8f)),
-                        )
-                        .child(
-                            div()
-                                .absolute()
-                                .inset_0()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .text_xs()
-                                .text_color(rgb(0xd8dde7))
-                                .child(progress_label),
-                        ),
-                )
-            });
         let path_context_menu = self.path_context_menu.as_ref().map(|menu| {
             let viewport = window.viewport_size();
             let can_export = menu.exportable;
@@ -12609,6 +14029,237 @@ impl Render for PictureBrowser {
             .lightroom_import_dialog
             .clone()
             .map(|dialog| render_lightroom_import_dialog(dialog, cx));
+        // Status dock (Stage 6, mockup queue-a): one bottom line always,
+        // with the expandable drawer floating above it.
+        let dock = div()
+            .debug_selector(|| "#activity-dock".to_owned())
+            .flex_none()
+            .flex()
+            .flex_col()
+            .bg(rgb(0x181a20))
+            .border_t_1()
+            .border_color(rgb(0x30343d))
+            .when(self.show_job_queue, |dock| {
+                dock.child(
+                    div()
+                        .id("activity-drawer")
+                        .debug_selector(|| "#activity-drawer".to_owned())
+                        .absolute()
+                        .right_4()
+                        .bottom(px(30.0))
+                        .w(px(460.0))
+                        .h(px(296.0))
+                        .flex()
+                        .flex_col()
+                        .overflow_hidden()
+                        .rounded_lg()
+                        .bg(rgb(0x181a20))
+                        .border_1()
+                        .border_color(rgb(0x30343d))
+                        .occlude()
+                        .shadow(vec![gpui::BoxShadow {
+                            color: gpui::rgba(0x000000aa).into(),
+                            offset: gpui::point(px(0.0), px(6.0)),
+                            blur_radius: px(18.0),
+                            spread_radius: px(0.0),
+                        }])
+                        .child(
+                            div()
+                                .h(px(34.0))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .px_3()
+                                .border_b_1()
+                                .border_color(rgb(0x30343d))
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(ui::TEXT_EMPHASIS))
+                                        .child("Activity"),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(rgb(ui::TEXT_DIM))
+                                        .child(format!(
+                                            "{} running · {} queued",
+                                            self.job_queue_snapshot.running
+                                                + self.face_analysis.stats().running
+                                                + self.recognition_refresh.stats().running
+                                                + self.people_summary_rebuild.stats().running
+                                                + usize::from(self.map_job.as_ref().is_some_and(
+                                                    |job| job.status == MapJobStatus::Running,
+                                                )),
+                                            self.job_queue_snapshot.queued
+                                                + self.face_analysis.stats().queued
+                                                + self.recognition_refresh.stats().queued
+                                                + self.people_summary_rebuild.stats().queued
+                                                + usize::from(self.map_job.as_ref().is_some_and(
+                                                    |job| job.status == MapJobStatus::Queued,
+                                                )),
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .id("job-queue-face-analysis-toggle")
+                                        .debug_selector(|| {
+                                            "#job-queue-face-analysis-toggle".to_owned()
+                                        })
+                                        .tab_index(0)
+                                        .flex_none()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_sm()
+                                        .bg(rgb(0x30343d))
+                                        .cursor_pointer()
+                                        .child(if self.face_analysis_paused {
+                                            "Resume faces"
+                                        } else {
+                                            "Pause faces"
+                                        })
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.face_analysis_paused = !this.face_analysis_paused;
+                                            this.face_analysis
+                                                .set_paused(this.face_analysis_paused);
+                                            this.recognition_refresh
+                                                .set_paused(this.face_analysis_paused);
+                                            this.people_summary_rebuild
+                                                .set_paused(this.face_analysis_paused);
+                                            if !this.face_analysis_paused {
+                                                this.refresh_face_inventory(cx);
+                                            }
+                                            cx.notify();
+                                        })),
+                                ),
+                        )
+                        .child({
+                            let job_count = self.job_queue_snapshot.jobs.len()
+                                + usize::from(self.map_job.is_some())
+                                + usize::from(
+                                    self.face_inventory_progress.stage.load(Ordering::Acquire) != 0,
+                                )
+                                + self.face_job_queue_snapshot.len()
+                                + self.recognition_job_queue_snapshot.len()
+                                + self.summary_job_queue_snapshot.len();
+                            if job_count > 0 {
+                                uniform_list(
+                                    "job-queue-rows",
+                                    job_count,
+                                    cx.processor(Self::render_job_queue_rows),
+                                )
+                                .flex_1()
+                                .min_h_0()
+                                .track_scroll(self.job_queue_scroll.clone())
+                                .with_sizing_behavior(ListSizingBehavior::Auto)
+                                .into_any_element()
+                            } else {
+                                div()
+                                    .flex_1()
+                                    .flex()
+                                    .items_center()
+                                    .px_3()
+                                    .text_xs()
+                                    .text_color(rgb(ui::TEXT_FAINT))
+                                    .child("No background jobs")
+                                    .into_any_element()
+                            }
+                        }),
+                )
+                .child(
+                    // Dense telemetry lives behind the drawer affordance
+                    // (C8): full precision here, never in the header line.
+                    div()
+                        .flex_none()
+                        .px_3()
+                        .py_2()
+                        .border_t_1()
+                        .border_color(rgb(0x30343d))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_xs()
+                                .text_color(rgb(ui::TEXT_FAINT))
+                                .child(durable_face_summary),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_xs()
+                                .text_color(rgb(ui::TEXT_FAINT))
+                                .child(admission_summary),
+                        ),
+                )
+            })
+            .child(
+                div()
+                    .h(px(26.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .child(
+                        div()
+                            .size(px(8.0))
+                            .flex_none()
+                            .rounded_full()
+                            .bg(rgb(if progress_active { 0x3e7d4f } else { 0x4a5160 })),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .text_xs()
+                            .text_color(rgb(0xd8dde7))
+                            .child(progress_label),
+                    )
+                    .when(progress_active && !self.show_job_queue, |bar| {
+                        bar.child(
+                            div()
+                                .w(px(120.0))
+                                .h(px(4.0))
+                                .flex_none()
+                                .rounded_sm()
+                                .bg(rgb(0x23262e))
+                                .child(
+                                    div()
+                                        .w(relative(progress))
+                                        .h_full()
+                                        .rounded_sm()
+                                        .bg(rgb(0x3d6fa9)),
+                                ),
+                        )
+                    })
+                    .child(
+                        div()
+                            .id("activity-dock-toggle")
+                            .debug_selector(|| "#activity-dock-toggle".to_owned())
+                            .flex_none()
+                            .px_2()
+                            .rounded_sm()
+                            .text_xs()
+                            .text_color(rgb(ui::TEXT_DIM))
+                            .cursor_pointer()
+                            .hover(|this| this.bg(rgb(0x242b37)))
+                            .child(if self.show_job_queue {
+                                "details ▾"
+                            } else {
+                                "details ▴"
+                            })
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_job_queue(&ToggleJobQueue, window, cx);
+                            })),
+                    ),
+            );
         div()
             .size_full()
             .relative()
@@ -12650,7 +14301,11 @@ impl Render for PictureBrowser {
                 }),
             )
             .when(USE_IN_WINDOW_MENU, |this| this.child(menu_bar))
-            .child(content)
+            .child(header)
+            .child(workspace)
+            .when(progress_active || self.show_job_queue, |this| {
+                this.child(dock)
+            })
             .when(USE_IN_WINDOW_MENU && self.show_file_menu, |this| {
                 this.child(
                     div()
@@ -13025,6 +14680,14 @@ fn settings_number_row(
         )
 }
 
+fn photo_count_label(count: usize) -> String {
+    if count == 1 {
+        "1 photo".to_owned()
+    } else {
+        format!("{count} photos")
+    }
+}
+
 fn map_control(id: &'static str, label: &'static str) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
@@ -13049,445 +14712,690 @@ impl PictureBrowser {
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let preference = draft.pair_preference;
+        let visible = |category: &'static str, title: &'static str| -> bool {
+            self.settings_row_visible(category, title)
+        };
         div()
-        .absolute()
-        .inset_0()
-        .occlude()
-        .bg(gpui::rgba(0x00000099))
-        .flex()
-        .flex_col()
-        .p_4()
-        .child(
-            div()
-                .flex_1()
-                .min_h_0()
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .child(
-                    div()
-                        .id("settings-dialog-panel")
-                        .w(px(620.0))
-                        .max_h(px(860.0))
-                        .min_h_0()
-                        .flex()
-                        .flex_col()
-                        .p_5()
-                        .rounded_md()
-                        .bg(rgb(0x252932))
-                        .text_color(rgb(0xd8dde7))
-                        .border_1()
-                        .border_color(rgb(0x4a5260))
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .mb_2()
-                                .child(div().text_xl().child("Settings")),
-                        )
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(rgb(0x9da7b6))
-                                .mb_2()
-                                .child(
-                                    "Image cache size applies immediately. Worker, cache directory, and library changes require a restart.",
-                                ),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_h_0()
-                                .relative()
-                                .child(
-                                    div()
-                                        .id("settings-rows")
-                                        .size_full()
-                                        .flex()
-                                        .flex_col()
-                                        .overflow_y_scroll()
-                                        .track_scroll(&self.settings_scroll)
-                                .child(
-                                    div()
-                                        .py_2()
-                                        .border_b_1()
-                                        .border_color(rgb(0x30343d))
-                                        .child("Picture library")
-                                        .child(
-                                            div()
-                                                .mt_1()
-                                                .flex()
-                                                .items_center()
-                                                .justify_between()
-                                                .child(
-                                                    div()
-                                                        .flex_1()
-                                                        .min_w_0()
-                                                        .mr_2()
-                                                        .truncate()
-                                                        .text_sm()
-                                                        .text_color(rgb(0xb7bfcc))
-                                                        .child(
-                                                            draft.root.to_string_lossy().into_owned(),
-                                                        ),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .id("settings-browse-root")
-                                                        .debug_selector(|| {
-                                                            "#settings-browse-root".to_owned()
-                                                        })
-                                                        .px_3()
-                                                        .py_1()
-                                                        .rounded_sm()
-                                                        .bg(rgb(0x343943))
-                                                        .hover(|this| this.bg(rgb(0x465064)))
-                                                        .child("Browse…")
-                                                        .on_click(cx.listener(|this, _, _, cx| {
-                                                            this.choose_settings_directory(true, cx);
-                                                        })),
-                                                ),
-                                        ),
-                                )
-                                .child(settings_number_row(
-                                    "Image cache entries",
-                                    draft.image_cache_size,
-                                    SettingsNumber::ImageCacheSize,
-                                    cx,
-                                ))
-                                .child(settings_number_row(
-                                    "Worker threads",
-                                    draft.job_parallelism,
-                                    SettingsNumber::JobParallelism,
-                                    cx,
-                                ))
-                                .child(settings_number_row(
-                                    "RAW worker threads",
-                                    draft.raw_parallelism,
-                                    SettingsNumber::RawParallelism,
-                                    cx,
-                                ))
-                                .child(settings_number_row(
-                                    "Face-analysis workers",
-                                    draft.face_workers,
-                                    SettingsNumber::FaceWorkers,
-                                    cx,
-                                ))
-                                .child(settings_number_row(
-                                    "Face worker memory allowance (MiB)",
-                                    draft.face_worker_memory_bytes.div_ceil(1024 * 1024) as usize,
-                                    SettingsNumber::FaceMemoryMiB,
-                                    cx,
-                                ))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .py_2()
-                                        .border_b_1()
-                                        .border_color(rgb(0x30343d))
-                                        .child("Automatic face analysis")
-                                        .child(
-                                            div()
-                                                .id("settings-automatic-face-analysis")
-                                                .px_3()
-                                                .py_1()
-                                                .rounded_sm()
-                                                .bg(rgb(0x343943))
-                                                .cursor_pointer()
-                                                .child(if draft.automatic_face_analysis {
-                                                    "Enabled"
-                                                } else {
-                                                    "Disabled"
-                                                })
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    if let Some(draft) = &mut this.settings_draft {
-                                                        draft.automatic_face_analysis =
-                                                            !draft.automatic_face_analysis;
-                                                    }
-                                                    cx.notify();
-                                                })),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .py_2()
-                                        .border_b_1()
-                                        .border_color(rgb(0x30343d))
-                                        .child("Face-crop disk cache")
-                                        .child(
-                                            div()
-                                                .id("settings-face-crop-disk-cache")
-                                                .px_3()
-                                                .py_1()
-                                                .rounded_sm()
-                                                .bg(rgb(0x343943))
-                                                .cursor_pointer()
-                                                .child(match draft.face_crop_disk_cache {
-                                                    config::FaceCropDiskCachePolicy::MemoryOnly => {
-                                                        "Memory only"
-                                                    }
-                                                    config::FaceCropDiskCachePolicy::Disk => {
-                                                        "Local disk"
-                                                    }
-                                                })
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    if let Some(draft) = &mut this.settings_draft {
-                                                        draft.face_crop_disk_cache =
-                                                            match draft.face_crop_disk_cache {
-                                                                config::FaceCropDiskCachePolicy::MemoryOnly => config::FaceCropDiskCachePolicy::Disk,
-                                                                config::FaceCropDiskCachePolicy::Disk => config::FaceCropDiskCachePolicy::MemoryOnly,
-                                                            };
-                                                    }
-                                                    cx.notify();
-                                                })),
-                                        ),
-                                )
-                                .child(settings_number_row(
-                                    "Downloaded map cache (GiB)",
-                                    draft.map_cache_bytes.div_ceil(1024_u64.pow(3)) as usize,
-                                    SettingsNumber::MapCacheGiB,
-                                    cx,
-                                ))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .py_2()
-                                        .border_b_1()
-                                        .border_color(rgb(0x30343d))
-                                        .child(
-                                            div()
-                                                .max_w(px(430.0))
-                                                .child("Online map detail")
-                                                .child(
-                                                    div()
-                                                        .mt_1()
-                                                        .text_xs()
-                                                        .text_color(rgb(0x9da7b6))
-                                                        .child("When enabled, only visible tile coordinates are sent to OpenFreeMap. Photos and metadata never leave Rekesz."),
-                                                ),
-                                        )
-                                        .child(
-                                            div()
-                                                .id("settings-online-map")
-                                                .debug_selector(|| "#settings-online-map".to_owned())
-                                                .px_3()
-                                                .py_1()
-                                                .rounded_sm()
-                                                .bg(rgb(0x343943))
-                                                .hover(|this| this.bg(rgb(0x465064)))
-                                                .child(match draft.online_map_permission {
-                                                    config::OnlineMapPermission::Enabled => "Enabled",
-                                                    config::OnlineMapPermission::Unknown
-                                                    | config::OnlineMapPermission::Disabled => {
-                                                        "Keep offline"
-                                                    }
-                                                })
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    let permission =
-                                                        if this.settings.online_map_permission
-                                                            == config::OnlineMapPermission::Enabled
-                                                        {
-                                                            config::OnlineMapPermission::Disabled
-                                                        } else {
-                                                            config::OnlineMapPermission::Enabled
-                                                        };
-                                                    this.set_online_map_permission(permission, cx);
-                                                })),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .py_2()
-                                        .border_b_1()
-                                        .border_color(rgb(0x30343d))
-                                        .child("Grid/Map switcher")
-                                        .child(
-                                            div()
-                                                .id("settings-map-switcher-placement")
-                                                .debug_selector(|| {
-                                                    "#settings-map-switcher-placement".to_owned()
-                                                })
-                                                .px_3()
-                                                .py_1()
-                                                .rounded_sm()
-                                                .bg(rgb(0x343943))
-                                                .hover(|this| this.bg(rgb(0x465064)))
-                                                .child(match draft.map_switcher_placement {
-                                                    config::MapSwitcherPlacement::Header => {
-                                                        "Top header"
-                                                    }
-                                                    config::MapSwitcherPlacement::Floating => {
-                                                        "Bottom floating"
-                                                    }
-                                                })
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    let placement =
-                                                        match this.settings.map_switcher_placement {
-                                                            config::MapSwitcherPlacement::Header => config::MapSwitcherPlacement::Floating,
-                                                            config::MapSwitcherPlacement::Floating => config::MapSwitcherPlacement::Header,
-                                                        };
-                                                    let mut settings = this.settings.clone();
-                                                    settings.map_switcher_placement = placement;
-                                                    if let Err(error) =
-                                                        config::save(&this.settings_path, &settings)
-                                                    {
-                                                        this.settings_status = Some(format!(
-                                                            "Could not save switcher placement: {error:#}"
-                                                        ));
-                                                    } else {
-                                                        this.settings = settings;
-                                                        if let Some(draft) =
-                                                            &mut this.settings_draft
-                                                        {
-                                                            draft.map_switcher_placement = placement;
-                                                        }
-                                                    }
-                                                    cx.notify();
-                                                })),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .py_2()
-                                        .border_b_1()
-                                        .border_color(rgb(0x30343d))
-                                        .child("RAW/JPEG pair preference")
-                                        .child(
-                                            div()
-                                                .id("settings-pair-preference")
-                                                .debug_selector(|| {
-                                                    "#settings-pair-preference".to_owned()
-                                                })
-                                                .px_3()
-                                                .py_1()
-                                                .rounded_sm()
-                                                .bg(rgb(0x343943))
-                                                .hover(|this| this.bg(rgb(0x465064)))
-                                                .child(match preference {
-                                                    config::PairPreference::Raw => "RAW",
-                                                    config::PairPreference::Jpeg => "JPEG",
-                                                })
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    if let Some(draft) = &mut this.settings_draft {
-                                                        draft.pair_preference =
-                                                            match draft.pair_preference {
-                                                                config::PairPreference::Raw => {
-                                                                    config::PairPreference::Jpeg
-                                                                }
-                                                                config::PairPreference::Jpeg => {
-                                                                    config::PairPreference::Raw
-                                                                }
-                                                            };
-                                                    }
-                                                    cx.notify();
-                                                })),
-                                        ),
-                                )
-                                .child(
-                                    div().py_2().child("Cache directory").child(
-                                        div()
-                                            .mt_1()
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(gpui::rgba(0x00000099))
+            .flex()
+            .flex_col()
+            .p_4()
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .id("settings-dialog-panel")
+                            .debug_selector(|| "#settings-dialog-panel".to_owned())
+                            .w(px(780.0))
+                            .max_h(px(860.0))
+                            .min_h_0()
+                            .flex()
+                            .flex_col()
+                            .p_5()
+                            .rounded_md()
+                            .bg(rgb(0x252932))
+                            .text_color(rgb(0xd8dde7))
+                            .border_1()
+                            .border_color(rgb(0x4a5260))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_xl()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .mb_3()
+                                    .child("Settings"),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .flex()
+                                    .gap_4()
+                                    .min_w_0()
+                                    .child({
+                                        // Category sidebar (Stage 5): filters
+                                        // the rows; search matches across
+                                        // all pages.
+                                        let categories: &[(&'static str, &'static str)] = &[
+                                            ("library", "Library"),
+                                            ("performance", "Performance"),
+                                            ("faces", "Faces"),
+                                            ("map", "Map"),
+                                            ("import", "Import"),
+                                        ];
+                                        let mut sidebar = div()
+                                            .w(px(170.0))
+                                            .flex_none()
+                                            .h_full()
                                             .flex()
-                                            .items_center()
-                                            .justify_between()
-                                            .child(
+                                            .flex_col()
+                                            .gap_1();
+                                        for (category_index, (name, label)) in
+                                            categories.iter().enumerate()
+                                        {
+                                            let active = self.settings_category == *name;
+                                            sidebar = sidebar.child(
                                                 div()
-                                                    .flex_1()
-                                                    .min_w_0()
-                                                    .mr_2()
-                                                    .truncate()
-                                                    .text_sm()
-                                                    .text_color(rgb(0xb7bfcc))
-                                                    .child(
-                                                        draft.cache_root.to_string_lossy().into_owned(),
-                                                    ),
-                                            )
-                                            .child(
-                                                div()
-                                                    .id("settings-browse-cache")
-                                                    .debug_selector(|| {
-                                                        "#settings-browse-cache".to_owned()
+                                                    .id(("settings-category", category_index))
+                                                    .debug_selector(move || {
+                                                        format!("#settings-category-{name}")
                                                     })
-                                                    .px_3()
+                                                    .px_2()
                                                     .py_1()
+                                                    .rounded_sm()
+                                                    .text_sm()
+                                                    .cursor_pointer()
+                                                    .when(active, |this| {
+                                                        this.bg(rgb(ui::ACCENT_SURFACE))
+                                                    })
+                                                    .when(!active, |this| {
+                                                        this.hover(|this| {
+                                                            this.bg(rgb(ui::DEFAULT_SURFACE))
+                                                        })
+                                                    })
+                                                    .text_color(rgb(if active {
+                                                        ui::TEXT_EMPHASIS
+                                                    } else {
+                                                        ui::TEXT_DIM
+                                                    }))
+                                                    .child(*label)
+                                                    .on_click(cx.listener(
+                                                        move |this, _, _, cx| {
+                                                            this.settings_category = *name;
+                                                            cx.notify();
+                                                        },
+                                                    )),
+                                            );
+                                        }
+                                        sidebar = sidebar.child(
+                                            div()
+                                                .id("settings-search")
+                                                .debug_selector(|| {
+                                                    "#settings-search".to_owned()
+                                                })
+                                                .mt_3()
+                                                .px_2()
+                                                .py_1()
+                                                .rounded_sm()
+                                                .text_sm()
+                                                .bg(rgb(ui::DEFAULT_SURFACE))
+                                                .border_1()
+                                                .border_color(rgb(ui::BORDER_STRONG))
+                                                .cursor_text()
+                                                .track_focus(&self.settings_search_focus)
+                                                .on_click(cx.listener(
+                                                    |this, _, window, cx| {
+                                                        window.focus(
+                                                            &this.settings_search_focus,
+                                                        );
+                                                        cx.notify();
+                                                    },
+                                                ))
+                                                .on_key_down(cx.listener(
+                                                    |this,
+                                                     event: &gpui::KeyDownEvent,
+                                                     _window,
+                                                     cx| {
+                                                        let key =
+                                                            event.keystroke.key.as_str();
+                                                        match key {
+                                                            "backspace" => {
+                                                                this.settings_search.pop();
+                                                            }
+                                                            "space" => {
+                                                                this.settings_search
+                                                                    .push(' ');
+                                                            }
+                                                            key if key.chars().count() == 1
+                                                                && !event
+                                                                    .keystroke
+                                                                    .modifiers
+                                                                    .control
+                                                                && !event
+                                                                    .keystroke
+                                                                    .modifiers
+                                                                    .alt
+                                                                && !event
+                                                                    .keystroke
+                                                                    .modifiers
+                                                                    .platform =>
+                                                            {
+                                                                this.settings_search
+                                                                    .push_str(key);
+                                                            }
+                                                            _ => {
+                                                                return;
+                                                            }
+                                                        }
+                                                        // Consumed before the
+                                                        // root plain-letter
+                                                        // shortcuts see it.
+                                                        cx.stop_propagation();
+                                                        cx.notify();
+                                                    },
+                                                ))
+                                                .child(if self.settings_search.is_empty() {
+                                                    div()
+                                                        .text_color(rgb(ui::TEXT_FAINT))
+                                                        .child("Search settings…")
+                                                } else {
+                                                    div()
+                                                        .truncate()
+                                                        .child(self.settings_search.clone())
+                                                }),
+                                        );
+                                        sidebar
+                                    })
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .relative()
+                                            .child(
+                                                div()
+                                                    .id("settings-rows")
+                                                    .debug_selector(|| {
+                                                        "#settings-rows".to_owned()
+                                                    })
+                                                    .size_full()
+                                                    .flex()
+                                                    .flex_col()
+                                                    .overflow_y_scroll()
+                                                    .track_scroll(&self.settings_scroll)
+                                            .when(
+                                                visible("library", "Picture library"),
+                                                |rows| {
+                                                    rows.child(
+                                                        div()
+                                                            .py_2()
+                                                            .border_b_1()
+                                                            .border_color(rgb(0x30343d))
+                                                            .child("Picture library")
+                                                            .child(
+                                                                div()
+                                                                    .mt_1()
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .justify_between()
+                                                                    .child(
+                                                                        div()
+                                                                            .flex_1()
+                                                                            .min_w_0()
+                                                                            .mr_2()
+                                                                            .truncate()
+                                                                            .text_sm()
+                                                                            .text_color(rgb(0xb7bfcc))
+                                                                            .child(
+                                                                                draft.root.to_string_lossy().into_owned(),
+                                                                            ),
+                                                                    )
+                                                                    .child(
+                                                                        div()
+                                                                            .id("settings-browse-root")
+                                                                            .debug_selector(|| {
+                                                                                "#settings-browse-root".to_owned()
+                                                                            })
+                                                                            .px_3()
+                                                                            .py_1()
+                                                                            .rounded_sm()
+                                                                            .bg(rgb(0x343943))
+                                                                            .hover(|this| this.bg(rgb(0x465064)))
+                                                                            .child("Browse…")
+                                                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                                                this.choose_settings_directory(true, cx);
+                                                                            })),
+                                                                    ),
+                                                            ),
+                                                    )
+                                                },
+                                            )
+
+                                            .when(
+                                                visible("performance", "Image cache entries"),
+                                                |rows| {
+                                                    rows.child(settings_number_row(
+                                                        "Image cache entries",
+                                                        draft.image_cache_size,
+                                                        SettingsNumber::ImageCacheSize,
+                                                        cx,
+                                                    ))
+                                                },
+                                            )
+
+                                            .when(
+                                                visible("performance", "Worker threads"),
+                                                |rows| {
+                                                    rows.child(settings_number_row(
+                                                        "Worker threads",
+                                                        draft.job_parallelism,
+                                                        SettingsNumber::JobParallelism,
+                                                        cx,
+                                                    ))
+                                                },
+                                            )
+
+                                            .when(
+                                                visible("performance", "RAW worker threads"),
+                                                |rows| {
+                                                    rows.child(settings_number_row(
+                                                        "RAW worker threads",
+                                                        draft.raw_parallelism,
+                                                        SettingsNumber::RawParallelism,
+                                                        cx,
+                                                    ))
+                                                },
+                                            )
+
+                                            .when(
+                                                visible("faces", "Face-analysis workers"),
+                                                |rows| {
+                                                    rows.child(settings_number_row(
+                                                        "Face-analysis workers",
+                                                        draft.face_workers,
+                                                        SettingsNumber::FaceWorkers,
+                                                        cx,
+                                                    ))
+                                                },
+                                            )
+
+                                            .when(
+                                                visible(
+                                                    "faces",
+                                                    "Face worker memory allowance (MiB)",
+                                                ),
+                                                |rows| {
+                                                    rows.child(settings_number_row(
+                                                        "Face worker memory allowance (MiB)",
+                                                        draft.face_worker_memory_bytes
+                                                            .div_ceil(1024 * 1024)
+                                                            as usize,
+                                                        SettingsNumber::FaceMemoryMiB,
+                                                        cx,
+                                                    ))
+                                                },
+                                            )
+
+                                            .when(
+                                                visible("faces", "Automatic face analysis"),
+                                                |rows| {
+                                                    rows.child(
+                                                        div()
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_between()
+                                                            .py_2()
+                                                            .border_b_1()
+                                                            .border_color(rgb(0x30343d))
+                                                            .child("Automatic face analysis")
+                                                            .child(
+                                                                div()
+                                                                    .id("settings-automatic-face-analysis")
+                                                                    .debug_selector(|| {
+                                                                        "#settings-automatic-face-analysis".to_owned()
+                                                                    })
+                                                                    .px_3()
+                                                                    .py_1()
+                                                                    .rounded_sm()
+                                                                    .bg(rgb(0x343943))
+                                                                    .cursor_pointer()
+                                                                    .child(if draft.automatic_face_analysis {
+                                                                        "Enabled"
+                                                                    } else {
+                                                                        "Disabled"
+                                                                    })
+                                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                                        if let Some(draft) = &mut this.settings_draft {
+                                                                            draft.automatic_face_analysis = !draft.automatic_face_analysis;
+                                                                        }
+                                                                        cx.notify();
+                                                                    })),
+                                                            ),
+                                                    )
+                                                },
+                                            )
+
+                                            .when(
+                                                visible("faces", "Face-crop disk cache"),
+                                                |rows| {
+                                                    rows.child(
+                                                        div()
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_between()
+                                                            .py_2()
+                                                            .border_b_1()
+                                                            .border_color(rgb(0x30343d))
+                                                            .child("Face-crop disk cache")
+                                                            .child(
+                                                                div()
+                                                                    .id("settings-face-crop-disk-cache")
+                                                                    .debug_selector(|| {
+                                                                        "#settings-face-crop-disk-cache".to_owned()
+                                                                    })
+                                                                    .px_3()
+                                                                    .py_1()
+                                                                    .rounded_sm()
+                                                                    .bg(rgb(0x343943))
+                                                                    .cursor_pointer()
+                                                                    .child(match draft.face_crop_disk_cache {
+                                                                        config::FaceCropDiskCachePolicy::MemoryOnly => {
+                                                                            "Memory only"
+                                                                        }
+                                                                        config::FaceCropDiskCachePolicy::Disk => {
+                                                                            "Local disk"
+                                                                        }
+                                                                    })
+                                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                                        if let Some(draft) = &mut this.settings_draft {
+                                                                            draft.face_crop_disk_cache = match draft.face_crop_disk_cache {
+                                                                                config::FaceCropDiskCachePolicy::MemoryOnly => config::FaceCropDiskCachePolicy::Disk,
+                                                                                config::FaceCropDiskCachePolicy::Disk => config::FaceCropDiskCachePolicy::MemoryOnly,
+                                                                            };
+                                                                        }
+                                                                        cx.notify();
+                                                                    })),
+                                                            ),
+                                                    )
+                                                },
+                                            )
+
+                                            .when(
+                                                visible("map", "Downloaded map cache (GiB)"),
+                                                |rows| {
+                                                    rows.child(settings_number_row(
+                                                        "Downloaded map cache (GiB)",
+                                                        draft.map_cache_bytes.div_ceil(1024_u64.pow(3)) as usize,
+                                                        SettingsNumber::MapCacheGiB,
+                                                        cx,
+                                                    ))
+                                                },
+                                            )
+
+                                            .when(
+                                                visible("map", "Online map detail"),
+                                                |rows| {
+                                                    rows.child(
+                                                        div()
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_between()
+                                                            .py_2()
+                                                            .border_b_1()
+                                                            .border_color(rgb(0x30343d))
+                                                            .child(
+                                                                div()
+                                                                    .max_w(px(430.0))
+                                                                    .child("Online map detail")
+                                                                    .child(
+                                                                        div()
+                                                                            .mt_1()
+                                                                            .text_xs()
+                                                                            .text_color(rgb(0x9da7b6))
+                                                                            .child("When enabled, only visible tile coordinates are sent to OpenFreeMap. Photos and metadata never leave Rekesz."),
+                                                                    ),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .id("settings-online-map")
+                                                                    .debug_selector(|| {
+                                                                        "#settings-online-map".to_owned()
+                                                                    })
+                                                                    .px_3()
+                                                                    .py_1()
+                                                                    .rounded_sm()
+                                                                    .bg(rgb(0x343943))
+                                                                    .hover(|this| this.bg(rgb(0x465064)))
+                                                                    .child(match draft.online_map_permission {
+                                                                        config::OnlineMapPermission::Enabled => "Enabled",
+                                                                        config::OnlineMapPermission::Unknown
+                                                                        | config::OnlineMapPermission::Disabled => {
+                                                                            "Keep offline"
+                                                                        }
+                                                                    })
+                                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                                        let permission = if this.settings.online_map_permission == config::OnlineMapPermission::Enabled {
+                                                                            config::OnlineMapPermission::Disabled
+                                                                        } else {
+                                                                            config::OnlineMapPermission::Enabled
+                                                                        };
+                                                                        this.set_online_map_permission(permission, cx);
+                                                                    })),
+                                                            ),
+                                                    )
+                                                },
+                                            )
+
+                                            .when(
+                                                visible("map", "Grid/Map switcher"),
+                                                |rows| {
+                                                    rows.child(
+                                                        div()
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_between()
+                                                            .py_2()
+                                                            .border_b_1()
+                                                            .border_color(rgb(0x30343d))
+                                                            .child("Grid/Map switcher")
+                                                            .child(
+                                                                div()
+                                                                    .id("settings-map-switcher-placement")
+                                                                    .debug_selector(|| {
+                                                                        "#settings-map-switcher-placement".to_owned()
+                                                                    })
+                                                                    .px_3()
+                                                                    .py_1()
+                                                                    .rounded_sm()
+                                                                    .bg(rgb(0x343943))
+                                                                    .hover(|this| this.bg(rgb(0x465064)))
+                                                                    .child(match draft.map_switcher_placement {
+                                                                        config::MapSwitcherPlacement::Header => "Top header",
+                                                                        config::MapSwitcherPlacement::Floating => "Bottom floating",
+                                                                    })
+                                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                                        let placement = match this.settings.map_switcher_placement {
+                                                                            config::MapSwitcherPlacement::Header => config::MapSwitcherPlacement::Floating,
+                                                                            config::MapSwitcherPlacement::Floating => config::MapSwitcherPlacement::Header,
+                                                                        };
+                                                                        let mut settings = this.settings.clone();
+                                                                        settings.map_switcher_placement = placement;
+                                                                        if let Err(error) = config::save(&this.settings_path, &settings) {
+                                                                            this.settings_status = Some(format!("Could not save switcher placement: {error:#}"));
+                                                                        } else {
+                                                                            this.settings = settings;
+                                                                            if let Some(draft) = &mut this.settings_draft {
+                                                                                draft.map_switcher_placement = placement;
+                                                                            }
+                                                                        }
+                                                                        cx.notify();
+                                                                    })),
+                                                            ),
+                                                    )
+                                                },
+                                            )
+
+                                            .when(
+                                                visible("import", "RAW/JPEG pair preference"),
+                                                |rows| {
+                                                    rows.child(
+                                                        div()
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_between()
+                                                            .py_2()
+                                                            .border_b_1()
+                                                            .border_color(rgb(0x30343d))
+                                                            .child("RAW/JPEG pair preference")
+                                                            .child(
+                                                                div()
+                                                                    .id("settings-pair-preference")
+                                                                    .debug_selector(|| {
+                                                                        "#settings-pair-preference".to_owned()
+                                                                    })
+                                                                    .px_3()
+                                                                    .py_1()
+                                                                    .rounded_sm()
+                                                                    .bg(rgb(0x343943))
+                                                                    .hover(|this| this.bg(rgb(0x465064)))
+                                                                    .child(match preference {
+                                                                        config::PairPreference::Raw => "RAW",
+                                                                        config::PairPreference::Jpeg => "JPEG",
+                                                                    })
+                                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                                        if let Some(draft) = &mut this.settings_draft {
+                                                                            draft.pair_preference = match draft.pair_preference {
+                                                                                config::PairPreference::Raw => config::PairPreference::Jpeg,
+                                                                                config::PairPreference::Jpeg => config::PairPreference::Raw,
+                                                                            };
+                                                                        }
+                                                                        cx.notify();
+                                                                    })),
+                                                            ),
+                                                    )
+                                                },
+                                            )
+
+                                            .when(
+                                                visible("library", "Cache directory"),
+                                                |rows| {
+                                                    rows.child(
+                                                        div()
+                                                            .py_2()
+                                                            .child("Cache directory")
+                                                            .child(
+                                                                div()
+                                                                    .mt_1()
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .justify_between()
+                                                                    .child(
+                                                                        div()
+                                                                            .flex_1()
+                                                                            .min_w_0()
+                                                                            .mr_2()
+                                                                            .truncate()
+                                                                            .text_sm()
+                                                                            .text_color(rgb(0xb7bfcc))
+                                                                            .child(
+                                                                                draft.cache_root.to_string_lossy().into_owned(),
+                                                                            ),
+                                                                    )
+                                                                    .child(
+                                                                        div()
+                                                                            .id("settings-browse-cache")
+                                                                            .debug_selector(|| {
+                                                                                "#settings-browse-cache".to_owned()
+                                                                            })
+                                                                            .px_3()
+                                                                            .py_1()
+                                                                            .rounded_sm()
+                                                                            .bg(rgb(0x343943))
+                                                                            .hover(|this| this.bg(rgb(0x465064)))
+                                                                            .child("Browse…")
+                                                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                                                this.choose_settings_directory(false, cx);
+                                                                            })),
+                                                                    ),
+                                                            ),
+                                                    )
+                                                },
+                                            ),
+
+                                            )
+                                            .child(self.render_settings_scrollbar(cx)),
+                                    ),
+                            )
+                            .child(
+                                // The footer stays INSIDE the panel border
+                                // (user-reported bug: it floated below the
+                                // dialog).
+                                div()
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .mt_3()
+                                    .pt_3()
+                                    .border_t_1()
+                                    .border_color(rgb(0x30343d))
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .truncate()
+                                            .text_sm()
+                                            .text_color(rgb(0x9da7b6))
+                                            .child(status.unwrap_or_default()),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .id("settings-cancel")
+                                                    .debug_selector(|| {
+                                                        "#settings-cancel".to_owned()
+                                                    })
+                                                    .tab_index(0)
+                                                    .whitespace_nowrap()
+                                                    .px_4()
+                                                    .py_2()
                                                     .rounded_sm()
                                                     .bg(rgb(0x343943))
                                                     .hover(|this| this.bg(rgb(0x465064)))
-                                                    .child("Browse…")
+                                                    .cursor_pointer()
+                                                    .child("Cancel")
                                                     .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.choose_settings_directory(false, cx);
+                                                        this.settings_draft = None;
+                                                        this.settings_status = None;
+                                                        cx.notify();
+                                                    })),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("settings-save")
+                                                    .debug_selector(|| {
+                                                        "#settings-save".to_owned()
+                                                    })
+                                                    .tab_index(0)
+                                                    .whitespace_nowrap()
+                                                    .px_4()
+                                                    .py_2()
+                                                    .rounded_sm()
+                                                    .bg(rgb(0x315b8f))
+                                                    .hover(|this| this.bg(rgb(0x3d6fa9)))
+                                                    .cursor_pointer()
+                                                    .child("Save")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.save_settings(cx);
                                                     })),
                                             ),
                                     ),
-                                ),
-                                ),
-                            )
-                            .child(self.render_settings_scrollbar(cx)),
-                        )
-                        .when_some(status, |this, status| {
-                            this.child(
-                                div()
-                                    .mt_2()
-                                    .text_sm()
-                                    .text_color(rgb(0xf2b8b5))
-                                    .child(status),
-                            )
-                        })
-                        .child(
-                            div()
-                                .mt_4()
-                                .flex()
-                                .items_center()
-                                .justify_end()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .id("settings-cancel")
-                                        .flex_shrink_0()
-                                        .whitespace_nowrap()
-                                        .debug_selector(|| "#settings-cancel".to_owned())
-                                        .px_4()
-                                        .py_2()
-                                        .rounded_sm()
-                                        .bg(rgb(0x343943))
-                                        .hover(|this| this.bg(rgb(0x465064)))
-                                        .child("Cancel")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.settings_draft = None;
-                                            this.settings_status = None;
-                                            cx.notify();
-                                        })),
-                                )
-                                .child(
-                                    div()
-                                        .id("settings-save")
-                                        .debug_selector(|| "#settings-save".to_owned())
-                                        .flex_shrink_0()
-                                        .whitespace_nowrap()
-                                        .px_4()
-                                        .py_2()
-                                        .rounded_sm()
-                                        .bg(rgb(0x315b8f))
-                                        .hover(|this| this.bg(rgb(0x3d6fa9)))
-                                        .child("Save")
-                                        .on_click(cx.listener(|this, _, _, cx| this.save_settings(cx))),
-                                ),
-                        ),
-        )
+                            ),
+                    ),
+            )
+    }
+
+    /// A settings row renders when the search box matches its title (search
+    /// spans every category) or, with an empty search, when its category page
+    /// is the active one.
+    fn settings_row_visible(&self, category: &'static str, title: &str) -> bool {
+        let query = self.settings_search.trim().to_lowercase();
+        if query.is_empty() {
+            self.settings_category == category
+        } else {
+            title.to_lowercase().contains(&query)
+        }
     }
 
     /// Thin scrollbar thumb for the settings dialog's row area. Position
@@ -13918,6 +15826,7 @@ fn main() -> Result<()> {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_min_size: Some(size(px(900.0), px(600.0))),
                 // Linux desktops match this id to assets/linux/rekesz.desktop
                 // to find the taskbar icon; other platforms ignore it.
                 app_id: Some("rekesz".into()),
@@ -13948,8 +15857,35 @@ fn bind_picture_browser_keys(cx: &mut App) {
         KeyBinding::new("shift-right", GridExtendRight, Some("MainView")),
         KeyBinding::new("shift-up", GridExtendUp, Some("MainView")),
         KeyBinding::new("shift-down", GridExtendDown, Some("MainView")),
-        KeyBinding::new("ctrl-shift-j", ToggleJobQueue, None),
+        KeyBinding::new(
+            if cfg!(target_os = "macos") {
+                "cmd-shift-j"
+            } else {
+                "ctrl-shift-j"
+            },
+            ToggleJobQueue,
+            None,
+        ),
         KeyBinding::new("enter", ImportNewFolderConfirm, Some("ImportNewFolder")),
+        KeyBinding::new("escape", TriageExit, Some("PeopleTriage")),
+        KeyBinding::new("left", TriageLeft, Some("PeopleTriage")),
+        KeyBinding::new("right", TriageRight, Some("PeopleTriage")),
+    ]);
+    // Platform accelerators (guidelines §7): Cmd on macOS, Ctrl elsewhere —
+    // they power the native menus and never collide with the plain-letter
+    // triage/mode shortcuts.
+    let accel = if cfg!(target_os = "macos") {
+        "cmd"
+    } else {
+        "ctrl"
+    };
+    cx.bind_keys([
+        KeyBinding::new(&format!("{accel}-,"), OpenSettings, None),
+        KeyBinding::new(&format!("{accel}-o"), ImportPhotos, None),
+        KeyBinding::new(&format!("{accel}-l"), ImportLightroom, None),
+        KeyBinding::new(&format!("{accel}-j"), ToggleJobQueue, None),
+        KeyBinding::new(&format!("{accel}-e"), ToggleDevelopInspector, None),
+        KeyBinding::new(&format!("{accel}-b"), ToggleDeveloped, None),
     ]);
 }
 

@@ -2172,6 +2172,47 @@ pub fn list_person_faces_page_cancellable(
     })
 }
 
+/// Confirmed photo paths of one person across the whole library, ordered by
+/// relative path (ui-redesign-plan Stage 4b: person-filtered grid). The grid
+/// re-orders by capture time once metadata enrichment delivers it.
+pub fn person_confirmed_photos_cancellable(
+    root: &Path,
+    person_id: i64,
+    cancelled: Arc<AtomicBool>,
+) -> Result<Vec<PathBuf>> {
+    let path = super::catalog_path(root);
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let connection = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    connection.busy_timeout(Duration::from_secs(5))?;
+    let query_cancelled = cancelled.clone();
+    connection.progress_handler(1_000, Some(move || query_cancelled.load(Ordering::Acquire)))?;
+    super::validate_schema(&connection)?;
+    let mut statement = connection.prepare(
+        "SELECT DISTINCT asset.relative_path
+         FROM effective_face_assignments assignment
+         JOIN faces face ON face.id=assignment.face_id
+         JOIN assets asset ON asset.id=face.asset_id
+         WHERE assignment.person_id=?1 AND assignment.kind='confirmed'
+           AND face.retired=0 AND face.ignored=0 AND face.locally_ignored=0
+         ORDER BY asset.relative_path",
+    )?;
+    let mut photos = Vec::new();
+    let mut rows = statement.query(params![person_id])?;
+    while let Some(row) = rows.next()? {
+        if cancelled.load(Ordering::Acquire) {
+            return Ok(Vec::new());
+        }
+        let relative: Vec<u8> = row.get(0)?;
+        photos.push(root.join(decode_relative_path(&relative)?));
+    }
+    Ok(photos)
+}
+
 pub fn apply_decisions(root: &Path, batch: &DecisionBatch) -> Result<DecisionBatchResult> {
     if batch.id.trim().is_empty() || batch.id.len() > 128 {
         bail!("decision batch id must contain 1 to 128 characters");

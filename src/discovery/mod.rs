@@ -174,7 +174,10 @@ pub struct LoadedDirectory {
     pub metadata_status: DirectoryMetadataStatus,
     metadata_pending: Vec<PathBuf>,
     ordering_metadata: HashMap<PathBuf, OrderingMetadata>,
-    pending_capture_order: Option<Vec<PathBuf>>,
+    /// Set when the capture-time ordering differs from the on-disk order and
+    /// the header's "order by capture time" offer is live. `pub(crate)` so
+    /// UI tests can seed it deterministically.
+    pub(crate) pending_capture_order: Option<Vec<PathBuf>>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -453,7 +456,7 @@ impl DirectoryModel {
         true
     }
 
-    fn loaded_mut(&mut self, id: NodeId) -> Option<&mut LoadedDirectory> {
+    pub(crate) fn loaded_mut(&mut self, id: NodeId) -> Option<&mut LoadedDirectory> {
         match &mut self.nodes[id.0].contents {
             DirectoryContents::Loaded(contents) => Some(contents),
             _ => None,

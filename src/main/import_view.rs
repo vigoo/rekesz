@@ -116,9 +116,9 @@ pub(crate) struct ImportViewState {
 }
 
 pub(crate) struct ImportJobHandle {
-    progress: Arc<Mutex<import::ImportProgress>>,
-    cancel: Arc<AtomicBool>,
-    work_id: u64,
+    pub(crate) progress: Arc<Mutex<import::ImportProgress>>,
+    pub(crate) cancel: Arc<AtomicBool>,
+    pub(crate) work_id: u64,
 }
 
 #[derive(Clone)]
@@ -499,7 +499,7 @@ impl PictureBrowser {
         self.open_import_view(window, cx);
     }
 
-    fn open_import_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_import_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.main_view, MainView::Image(_)) {
             self.close_image(&CloseImage, window, cx);
         }
@@ -1124,7 +1124,11 @@ impl PictureBrowser {
             .unwrap_or_else(|| self.settings.root.clone())
     }
 
-    fn toggle_destination_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_destination_picker(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.import_view.destination_picker_open = !self.import_view.destination_picker_open;
         if self.import_view.destination_picker_open {
             self.import_view.creating_folder = false;
@@ -1140,6 +1144,10 @@ impl PictureBrowser {
     }
 
     fn navigate_picker(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        eprintln!(
+            "debug-navigate: {} (backtrace via caller not needed)",
+            dir.display()
+        );
         self.import_view.picker_dir = dir;
         self.import_view.creating_folder = false;
         window.blur();
@@ -1185,6 +1193,11 @@ impl PictureBrowser {
     }
 
     fn create_destination_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The screenshot tour against the real library must not create
+        // folders in it; the scratch suite may.
+        if crate::screenshot_tour::real_suite_tour_active() {
+            return;
+        }
         let name = self.import_view.new_folder_name.trim().to_owned();
         if name.is_empty() || name.contains(['/', '\\']) || name.chars().all(|c| c == '.') {
             return;
@@ -1245,6 +1258,11 @@ impl PictureBrowser {
     }
 
     pub(crate) fn start_import(&mut self, cx: &mut Context<Self>) {
+        // The screenshot tour against the real library must not copy files
+        // into it; the scratch suite performs its real import there.
+        if crate::screenshot_tour::real_suite_tour_active() {
+            return;
+        }
         if self.import_view.job.is_some() || self.import_view.current().is_none() {
             return;
         }
@@ -1573,7 +1591,29 @@ impl PictureBrowser {
                             })),
                     ),
             );
+        // Sources grouped by kind with section labels (Stage 3, mockup
+        // import-a); per-row capacity renders as a bar, the GiB text moves
+        // to the row tooltip.
+        let mut last_section = None;
         for (index, entry) in self.import_view.sources.iter().enumerate() {
+            let section = match &entry.kind {
+                sources::SourceKind::Volume { .. } => "Volumes",
+                sources::SourceKind::Device { .. } => "Devices",
+                sources::SourceKind::Scanner { .. } => "Scanners",
+                sources::SourceKind::Folder => "Folders",
+            };
+            if last_section != Some(section) {
+                rail = rail.child(
+                    div()
+                        .px_3()
+                        .pt_2()
+                        .pb_1()
+                        .text_xs()
+                        .text_color(rgb(crate::ui::TEXT_FAINT))
+                        .child(section.to_uppercase()),
+                );
+                last_section = Some(section);
+            }
             let selected = self
                 .import_view
                 .selected
@@ -1583,21 +1623,25 @@ impl PictureBrowser {
             let kind_label: SharedString = match &entry.kind {
                 sources::SourceKind::Volume { removable: true } => "Removable volume".into(),
                 sources::SourceKind::Volume { .. } => "Volume".into(),
-                sources::SourceKind::Device { .. } => "Device".into(),
-                sources::SourceKind::Scanner { .. } => "Scanner".into(),
+                sources::SourceKind::Device { vendor, model } => format!("{vendor} {model}").into(),
+                sources::SourceKind::Scanner { vendor, model } => {
+                    format!("{vendor} {model}").into()
+                }
                 sources::SourceKind::Folder => "Folder".into(),
             };
-            let capacity: SharedString = entry
+            let capacity_tooltip = entry.capacity.map(|capacity| {
+                format!(
+                    "{} free of {}",
+                    format_byte_size(capacity.available),
+                    format_byte_size(capacity.total)
+                )
+            });
+            let fill = entry
                 .capacity
+                .filter(|capacity| capacity.total > 0)
                 .map(|capacity| {
-                    format!(
-                        "{} free of {}",
-                        format_byte_size(capacity.available),
-                        format_byte_size(capacity.total)
-                    )
-                    .into()
-                })
-                .unwrap_or_else(|| kind_label.clone());
+                    (1.0 - capacity.available as f32 / capacity.total as f32).clamp(0.0, 1.0)
+                });
             rail = rail.child(
                 div()
                     .id(("import-source", index))
@@ -1606,13 +1650,72 @@ impl PictureBrowser {
                     .cursor_pointer()
                     .when(selected, |this| this.bg(rgb(0x334b6e)))
                     .hover(|this| this.bg(rgb(0x292d36)))
-                    .child(div().text_sm().truncate().child(entry.label.clone()))
+                    .when_some(capacity_tooltip.clone(), |this, tooltip| {
+                        this.tooltip(move |_, cx| {
+                            cx.new(|_| crate::TextTooltip {
+                                text: tooltip.clone().into(),
+                            })
+                            .into()
+                        })
+                    })
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(rgb(0x9da7b6))
-                            .truncate()
-                            .child(capacity),
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_sm()
+                                    .text_color(rgb(crate::ui::TEXT_DIM))
+                                    .child(match &entry.kind {
+                                        sources::SourceKind::Volume { .. } => "💾",
+                                        sources::SourceKind::Device { .. } => "📷",
+                                        sources::SourceKind::Scanner { .. } => "🖨",
+                                        sources::SourceKind::Folder => "📁",
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .truncate()
+                                    .text_sm()
+                                    .child(entry.label.clone()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .mt_1()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .when_some(fill, |this, fraction| {
+                                this.child(
+                                    div()
+                                        .w(px(64.0))
+                                        .h(px(4.0))
+                                        .flex_none()
+                                        .rounded_sm()
+                                        .bg(rgb(0x23262e))
+                                        .child(
+                                            div().w(relative(fraction)).h_full().rounded_sm().bg(
+                                                rgb(if fraction > 0.9 {
+                                                    0xa04b42
+                                                } else {
+                                                    0x3e7d4f
+                                                }),
+                                            ),
+                                        ),
+                                )
+                            })
+                            .child(
+                                div().text_xs().text_color(rgb(0x9da7b6)).truncate().child(
+                                    capacity_tooltip
+                                        .clone()
+                                        .unwrap_or_else(|| kind_label.to_string()),
+                                ),
+                            ),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.select_import_source(id.clone(), cx);
@@ -1651,6 +1754,7 @@ impl PictureBrowser {
         let mut header = div()
             .flex_none()
             .flex()
+            .flex_wrap()
             .items_center()
             .gap_2()
             .px_3()
@@ -1697,23 +1801,28 @@ impl PictureBrowser {
                 },
                 |this, cx| this.import_toggle_recursive(cx),
             ));
+            header = header
+                .child(self.render_import_toggle(
+                    cx,
+                    "import-select-all",
+                    "Select all",
+                    |this, cx| this.import_select_all(cx),
+                ))
+                .child(self.render_import_toggle(
+                    cx,
+                    "import-select-new",
+                    "Select new",
+                    |this, cx| this.import_select_new_only(cx),
+                ))
+                .child(
+                    self.render_import_toggle(cx, "import-select-none", "None", |this, cx| {
+                        this.import_select_none(cx)
+                    }),
+                );
         }
-        header = header
-            .child(
-                self.render_import_toggle(cx, "import-select-all", "Select all", |this, cx| {
-                    this.import_select_all(cx)
-                }),
-            )
-            .child(
-                self.render_import_toggle(cx, "import-select-new", "Select new", |this, cx| {
-                    this.import_select_new_only(cx)
-                }),
-            )
-            .child(
-                self.render_import_toggle(cx, "import-select-none", "None", |this, cx| {
-                    this.import_select_none(cx)
-                }),
-            );
+        // The primary action lives in the module toolbar (Stage 3, mockup
+        // import-a); the options rail keeps the status line.
+        header = header.child(self.render_import_start_button(cx));
         if has_selection && scanner_source {
             // Branch BEFORE the generic arms: an empty scan batch must not
             // read "No importable photos here", and a running copy job must
@@ -2149,38 +2258,58 @@ impl PictureBrowser {
                     .flex_col()
                     .gap_2()
                     .child(div().text_sm().child("Destination folder"))
+                    // Destination card (Stage 3, mockup import-a): path +
+                    // Change… affordance instead of a bare toggle line.
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(if destination_picked {
-                                rgb(0x9da7b6)
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(if destination_picked {
+                                crate::ui::BORDER_STRONG
                             } else {
-                                // Unpicked destinations are refused on
-                                // import; make the missing pick visible.
-                                rgb(0xf2b8b5)
-                            })
-                            .truncate()
-                            .child(base_display),
-                    )
-                    .child(
-                        div()
-                            .id("import-destination-picker")
-                            .debug_selector(|| "#import-destination-picker".to_owned())
-                            .px_2()
-                            .py_1()
-                            .rounded_sm()
-                            .text_xs()
-                            .bg(rgb(0x30343d))
-                            .hover(|this| this.bg(rgb(0x3b4658)))
-                            .cursor_pointer()
-                            .child(if self.import_view.destination_picker_open {
-                                "Hide folder picker"
+                                0x7c3f36
+                            }))
+                            .bg(rgb(if destination_picked {
+                                crate::ui::INFO_SURFACE
                             } else {
-                                "Choose or create folder…"
-                            })
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.toggle_destination_picker(window, cx);
-                            })),
+                                0x3d292d
+                            }))
+                            .p_2()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(if destination_picked {
+                                        rgb(crate::ui::INFO_TEXT)
+                                    } else {
+                                        rgb(0xf2b8b5)
+                                    })
+                                    .child(base_display.clone()),
+                            )
+                            .child(
+                                div()
+                                    .id("import-destination-picker")
+                                    .debug_selector(|| "#import-destination-picker".to_owned())
+                                    .mt_1()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .text_xs()
+                                    .bg(rgb(0x30343d))
+                                    .hover(|this| this.bg(rgb(0x3b4658)))
+                                    .cursor_pointer()
+                                    .child(if self.import_view.destination_picker_open {
+                                        "Hide folder picker"
+                                    } else if destination_picked {
+                                        "Change…"
+                                    } else {
+                                        "Choose folder…"
+                                    })
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.toggle_destination_picker(window, cx);
+                                    })),
+                            ),
                     )
                     .when(self.import_view.destination_picker_open, |this| {
                         this.child(self.render_destination_picker(cx))
@@ -2208,45 +2337,81 @@ impl PictureBrowser {
                     ),
             )
             .child(div().flex_1())
-            .child(if count > 0 && !running && destination_picked {
-                div()
-                    .id("import-start")
-                    .debug_selector(|| "#import-start".to_owned())
-                    .px_4()
-                    .py_2()
-                    .rounded_sm()
-                    .bg(rgb(0x315b8f))
-                    .hover(|this| this.bg(rgb(0x3d6fa9)))
-                    .cursor_pointer()
-                    .text_sm()
-                    .child(format!(
-                        "Import {} photo{} ({})",
+            .child({
+                let status = if running {
+                    "Import running…".to_owned()
+                } else if count == 0 {
+                    "Nothing selected for import".to_owned()
+                } else if !destination_picked {
+                    "Pick a destination folder to import".to_owned()
+                } else {
+                    format!(
+                        "Ready: {} photo{} ({})",
                         count,
                         if count == 1 { "" } else { "s" },
                         format_byte_size(bytes)
-                    ))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.start_import(cx);
-                    }))
-                    .into_any_element()
-            } else {
+                    )
+                };
                 div()
-                    .px_4()
-                    .py_2()
-                    .rounded_sm()
-                    .bg(rgb(0x242b37))
-                    .text_color(rgb(0x59637a))
-                    .text_sm()
-                    .child(if running {
-                        "Import running…".to_owned()
-                    } else if count == 0 {
-                        "Import 0 photos".to_owned()
-                    } else {
-                        "Pick a destination folder".to_owned()
-                    })
-                    .into_any_element()
+                    .text_xs()
+                    .text_color(rgb(crate::ui::TEXT_DIM))
+                    .child(status)
             })
             .into_any_element()
+    }
+
+    /// The primary Import action for the module toolbar. The disabled
+    /// variants keep the precise refusal reasons (guidelines §4).
+    fn render_import_start_button(&self, cx: &mut Context<Self>) -> AnyElement {
+        let running = self.import_view.job.is_some();
+        let destination_picked = self.import_view.destination_base.is_some();
+        let include_duplicates = self.import_view.include_duplicates;
+        let eligible = |photo: &import::ScannedPhoto| {
+            self.import_view.selection.contains(&photo.key())
+                && (include_duplicates || !self.import_view.duplicates.contains(&photo.key()))
+        };
+        let count = self
+            .import_view
+            .photos
+            .iter()
+            .filter(|p| eligible(p))
+            .count();
+        let bytes: u64 = self
+            .import_view
+            .photos
+            .iter()
+            .filter(|p| eligible(p))
+            .map(|photo| photo.primary.size + photo.companion.as_ref().map_or(0, |f| f.size))
+            .sum();
+        if count > 0 && !running && destination_picked {
+            ui::button(
+                "import-start",
+                format!(
+                    "Import {} photo{} ({}) →",
+                    count,
+                    if count == 1 { "" } else { "s" },
+                    format_byte_size(bytes)
+                ),
+                crate::ui::ButtonVariant::Primary,
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.start_import(cx);
+            }))
+            .into_any_element()
+        } else {
+            ui::button(
+                "import-start",
+                if running {
+                    "Import running…".to_owned()
+                } else if count == 0 {
+                    "Import 0 photos".to_owned()
+                } else {
+                    "Pick a destination folder".to_owned()
+                },
+                crate::ui::ButtonVariant::Default,
+            )
+            .into_any_element()
+        }
     }
 
     /// Inline folder picker constrained to the library root, with creation
@@ -2276,40 +2441,56 @@ impl PictureBrowser {
             .p_2()
             .flex()
             .flex_col()
-            .gap_1()
+            .gap_1();
+        // Header: current location + an explicit Up control (the old
+        // ".."/"Library root" rows mixed navigation into the listing).
+        panel = panel
             .child(
                 div()
-                    .text_xs()
-                    .text_color(rgb(0x9da7b6))
-                    .truncate()
-                    .child(if at_root {
-                        "Library root".to_owned()
-                    } else {
-                        relative
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .text_sm()
+                            .text_color(rgb(0xe1e5ec))
+                            .child(if at_root {
+                                "Library root".to_owned()
+                            } else {
+                                relative
+                            }),
+                    )
+                    .when(!at_root, |header| {
+                        header.child(self.render_picker_row(
+                            cx,
+                            "picker-up",
+                            "↑ Up",
+                            |this, window, cx| {
+                                let parent = this
+                                    .import_view
+                                    .picker_dir
+                                    .parent()
+                                    .unwrap_or(&this.settings.root)
+                                    .to_path_buf();
+                                this.navigate_picker(parent, window, cx);
+                            },
+                        ))
                     }),
-            );
+            )
+            .child(div().my_1().border_t_1().border_color(rgb(0x30343d)));
         if !at_root {
-            panel = panel
-                .child(
-                    self.render_picker_row(cx, "picker-up", "..", |this, window, cx| {
-                        let parent = this
-                            .import_view
-                            .picker_dir
-                            .parent()
-                            .unwrap_or(&this.settings.root)
-                            .to_path_buf();
-                        this.navigate_picker(parent, window, cx);
-                    }),
-                )
-                .child(self.render_picker_row(
-                    cx,
-                    "picker-root",
-                    "Library root",
-                    |this, window, cx| {
-                        let root = this.settings.root.clone();
-                        this.navigate_picker(root, window, cx);
-                    },
-                ));
+            panel = panel.child(self.render_picker_row(
+                cx,
+                "picker-root",
+                "Library root",
+                |this, window, cx| {
+                    let root = this.settings.root.clone();
+                    this.navigate_picker(root, window, cx);
+                },
+            ));
         }
         match &self.import_view.picker_entries {
             None => {
@@ -2329,7 +2510,7 @@ impl PictureBrowser {
                     panel = panel.child(self.render_picker_row_id(
                         cx,
                         ("picker-entry", index),
-                        name,
+                        &format!("📁 {name}"),
                         move |this, window, cx| {
                             this.navigate_picker(child_dir.clone(), window, cx);
                         },
@@ -2389,36 +2570,47 @@ impl PictureBrowser {
                             })),
                     ),
             );
-        } else {
-            panel = panel.child(self.render_picker_row(
-                cx,
-                "picker-new-folder",
-                "New folder…",
-                |this, window, cx| {
-                    this.import_view.creating_folder = true;
-                    this.import_view.new_folder_name.clear();
-                    window.focus(&this.import_view.new_folder_focus);
-                    cx.notify();
-                },
-            ));
         }
-        panel = panel.child(
-            div()
-                .id("picker-use-folder")
-                .debug_selector(|| "#picker-use-folder".to_owned())
-                .mt_1()
-                .px_2()
-                .py_1()
-                .rounded_sm()
-                .text_xs()
-                .bg(rgb(0x315b8f))
-                .hover(|this| this.bg(rgb(0x3d6fa9)))
-                .cursor_pointer()
-                .child("Use this folder")
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.pick_destination(window, cx);
-                })),
-        );
+        panel = panel
+            .child(div().my_1().border_t_1().border_color(rgb(0x30343d)))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .when(!self.import_view.creating_folder, |footer| {
+                        footer.child(self.render_picker_row(
+                            cx,
+                            "picker-new-folder",
+                            "📁 New folder…",
+                            |this, window, cx| {
+                                this.import_view.creating_folder = true;
+                                this.import_view.new_folder_name.clear();
+                                window.focus(&this.import_view.new_folder_focus);
+                                cx.notify();
+                            },
+                        ))
+                    })
+                    .child(
+                        div()
+                            .id("picker-use-folder")
+                            .debug_selector(|| "#picker-use-folder".to_owned())
+                            .px_3()
+                            .py_1()
+                            .rounded_sm()
+                            .text_xs()
+                            .bg(rgb(0x2c4a7c))
+                            .border_1()
+                            .border_color(rgb(0x3c5f9e))
+                            .hover(|this| this.bg(rgb(0x3d6fa9)))
+                            .cursor_pointer()
+                            .child("Use this folder")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.pick_destination(window, cx);
+                            })),
+                    ),
+            );
         panel.into_any_element()
     }
 

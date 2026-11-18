@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags, params};
 
 use super::{
-    CATALOG_DIR, catalog_path, decode_relative_path, encode_relative_path, initialize_schema,
+    catalog_dir, catalog_path, decode_relative_path, encode_relative_path, initialize_schema,
     validate_schema,
 };
 
@@ -109,7 +109,7 @@ pub(crate) fn save_album_selections_with_busy_timeout(
 ) -> Result<()> {
     validate_selections(selections)?;
     let relative_dir = relative_album_path(root, dir)?;
-    let directory = root.join(CATALOG_DIR);
+    let directory = catalog_dir(root);
     std::fs::create_dir_all(&directory)?;
     let mut connection = Connection::open(catalog_path(root))?;
     connection.busy_timeout(busy_timeout)?;

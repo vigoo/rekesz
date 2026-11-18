@@ -465,7 +465,7 @@ pub(crate) fn prepare_existing_catalog(root: &Path) -> Result<()> {
 }
 
 pub fn save_hidden_subtrees(root: &Path, hidden_subtrees: &HashSet<PathBuf>) -> Result<()> {
-    let directory = root.join(CATALOG_DIR);
+    let directory = catalog_dir(root);
     fs::create_dir_all(&directory)?;
     let mut connection = Connection::open(catalog_path(root))?;
     initialize_schema(&mut connection)?;
@@ -637,14 +637,6 @@ fn import_lightroom_inner(
         // catalog merely to record that every Lightroom image is unedited.
         return Ok(report);
     } else {
-        let temporary = tempfile::NamedTempFile::new_in(&root)?;
-        let temporary = temporary.into_temp_path();
-        {
-            let mut rekesz = Connection::open(&temporary)?;
-            initialize_schema(&mut rekesz)?;
-            write_lightroom_import(&mut rekesz, &planned, &people)?;
-            rekesz.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")?;
-        }
         let parent = destination.parent().expect("catalog path has a parent");
         fs::create_dir_all(parent).with_context(|| {
             format!(
@@ -652,6 +644,14 @@ fn import_lightroom_inner(
                 parent.display()
             )
         })?;
+        let temporary = tempfile::NamedTempFile::new_in(parent)?;
+        let temporary = temporary.into_temp_path();
+        {
+            let mut rekesz = Connection::open(&temporary)?;
+            initialize_schema(&mut rekesz)?;
+            write_lightroom_import(&mut rekesz, &planned, &people)?;
+            rekesz.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")?;
+        }
         temporary
             .persist(&destination)
             .map_err(|error| error.error)
@@ -746,8 +746,28 @@ fn write_lightroom_import(
     Ok(())
 }
 
+/// Directory holding the catalog database, normally `<library root>/.rekesz`.
+///
+/// `REKESZ_CATALOG_DIR` overrides the location (absolute, or resolved relative
+/// to the library root) so dev harnesses — e.g. the screenshot tour — can point
+/// every catalog read and write at a scratch copy and leave the real catalog
+/// untouched.
+pub(crate) fn catalog_dir(root: &Path) -> PathBuf {
+    match std::env::var_os("REKESZ_CATALOG_DIR") {
+        Some(value) if !value.is_empty() => {
+            let configured = PathBuf::from(value);
+            if configured.is_absolute() {
+                configured
+            } else {
+                root.join(configured)
+            }
+        }
+        _ => root.join(CATALOG_DIR),
+    }
+}
+
 pub(crate) fn catalog_path(root: &Path) -> PathBuf {
-    root.join(CATALOG_DIR).join(CATALOG_FILE)
+    catalog_dir(root).join(CATALOG_FILE)
 }
 
 pub(crate) fn scope_key(path: &Path) -> Result<Vec<u8>> {
@@ -1202,7 +1222,7 @@ pub(crate) fn sync_asset_inventory_with_progress(
     mut progress: impl FnMut(usize, usize, &Path),
     mut checkpoint: impl FnMut() -> bool,
 ) -> Result<AssetInventorySync> {
-    fs::create_dir_all(root.join(CATALOG_DIR))?;
+    fs::create_dir_all(catalog_dir(root))?;
     let mut connection = Connection::open(catalog_path(root))?;
     initialize_schema(&mut connection)?;
     let mut stored = HashMap::<Vec<u8>, (i64, i64, [u8; 32])>::new();
@@ -2088,7 +2108,7 @@ fn ensure_foreign_keys_valid(transaction: &Transaction<'_>) -> Result<()> {
 
 #[cfg(test)]
 pub(crate) fn initialize_test_catalog(root: &Path) -> Result<()> {
-    let directory = root.join(CATALOG_DIR);
+    let directory = catalog_dir(root);
     fs::create_dir_all(&directory)?;
     let mut connection = Connection::open(directory.join(CATALOG_FILE))?;
     initialize_schema(&mut connection)

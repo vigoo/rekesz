@@ -12,7 +12,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use super::{CATALOG_DIR, CATALOG_FILE};
+use super::catalog_path;
 use crate::scheduler::MaintenanceAdmission;
 use anyhow::{Context, Result, bail};
 use hnsw_rs::prelude::{DistCosine, Hnsw};
@@ -536,7 +536,7 @@ struct Candidate {
 type CertifiedBestTwo = (Option<(usize, f32)>, Option<(usize, f32)>, usize);
 
 fn writable_connection(root: &Path) -> Result<Connection> {
-    let connection = Connection::open(root.join(CATALOG_DIR).join(CATALOG_FILE))?;
+    let connection = Connection::open(catalog_path(root))?;
     connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")?;
     Ok(connection)
 }

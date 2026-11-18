@@ -12,3 +12,11 @@ Do not consider the work complete while any required command fails. If formattin
 needed, run `cargo fmt --all` and then rerun the formatting check. Fix Clippy
 warnings in the code; do not suppress them with broad `#[allow]` attributes unless
 the exception is necessary and documented.
+
+## UI work
+
+UI changes follow `design/ui-guidelines.md` — design tokens, control idioms,
+layout rules, keyboard conventions, `debug_selector` coverage, and the testing
+requirements for every surface you touch (per-area matrix in
+`ui-redesign-plan.md` § "UI testing strategy"). A UI change without tests for
+the surfaces it modifies is incomplete.

@@ -6896,7 +6896,7 @@ fn losing_service_setup_failure_cannot_clobber_an_active_analysis_claim() {
     );
     *release.0.lock().unwrap() = true;
     release.1.notify_all();
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + scaled_budget(Duration::from_secs(20));
     while service_a.stats().completed == 0 && Instant::now() < deadline {
         std::thread::yield_now();
     }

@@ -4,3 +4,6 @@ __pycache__/
 # Personal Lightroom catalog export (photo album metadata; not for the repo).
 # The phase-D inventory guard test skips itself when this file is absent.
 /lightroom-inventory.json
+
+# Screenshot tour captures contain personal photos and names; keep them local.
+/design/screenshots/
